@@ -60,6 +60,21 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "file names with the right extension (.md, .txt, .csv, .py, .html, ...).")
     else:
         parts.append("\nFile access is turned off in this chat.")
+    if toolbox.files and toolbox.commands:
+        parts.append(
+            "\n## Programs\n"
+            "You can run bash commands in the workspace with run_command, for example to convert "
+            "images or documents, make or merge PDFs, run OCR, process data or run Python scripts. "
+            "The user approves every command, so combine steps into one command or script and say "
+            "why in `why`. Use check_programs to see what is installed. If a task needs a program "
+            "or Python package that is missing, ask for it with install_packages (Debian packages "
+            "with apt, Python packages with pip) and explain why. Don't tell the user a task is "
+            "impossible just because a tool is missing. If the user says no to a command or "
+            "install, don't try a workaround: stop and ask what they'd like instead. You can't see "
+            "images: when a task depends on what images show (text, page or question numbers, "
+            "order), read them first with OCR (`tesseract IMAGE -`; ask to install tesseract-ocr "
+            "if it's missing). Never guess the order or contents from file names. Commands get "
+            "no keyboard input, so use non-interactive options, and keep files in the workspace.")
     parts.append(
         "\n## Style\nAnswer in Markdown. Be direct and helpful; use headings, lists, tables and "
         "fenced code blocks (with a language) when they make the answer clearer.")
@@ -132,7 +147,8 @@ def repair_history(messages: list[dict]) -> None:
 
 
 _DRAFTING = {"write_file": "Drafting the file", "web_search": "Choosing what to search",
-             "fetch_url": "Choosing a page", "download_file": "Choosing a download"}
+             "fetch_url": "Choosing a page", "download_file": "Choosing a download",
+             "run_command": "Writing a command", "install_packages": "Choosing software"}
 
 
 def _drafting(name: str, chars: int) -> str:
@@ -155,6 +171,9 @@ class Agent:
                 thinking: bool = False) -> None:
         """Runs until the model gives a final answer. Appends assistant/tool messages to `messages`."""
         self.server.ensure_running(events.status, cancel)
+        self.toolbox.cancel = cancel
+        self.toolbox.status = events.status
+        self.toolbox.declined = False
         seen: dict[str, str] = {}
         tools = self.toolbox.schemas()
         sys_msg = {"role": "system", "content": system_prompt(self.toolbox, self.server.model_name)}
@@ -181,6 +200,13 @@ class Agent:
             }
             if use_tools:
                 payload["tools"] = tools
+                if self.toolbox.declined:
+                    # The user said no: the model has to answer in words now. The tools stay in
+                    # the request so the cached prompt is reused; calling them is switched off.
+                    payload["tool_choice"] = "none"
+                    tid = self.server.token_id("<tool_call>")
+                    if tid is not None:
+                        payload["logit_bias"] = [[tid, False]]
             events.round_begin()
             events.status("Thinking…" if thinking else "Writing…")
             self.stream = ChatStream(self.server.url)

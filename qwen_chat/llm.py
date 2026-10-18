@@ -52,6 +52,7 @@ class ServerManager:
         self.model_name = "Qwen"
         self.log_path = CACHE_DIR / "server.log"
         self._lock = threading.Lock()
+        self._token_ids: dict[str, int | None] = {}
 
     @property
     def owned(self) -> bool:
@@ -112,6 +113,7 @@ class ServerManager:
             self._read_props()
 
     def _read_props(self) -> None:
+        self._token_ids.clear()
         try:
             with urllib.request.urlopen(self.url + "/props", timeout=5) as r:
                 props = json.loads(r.read())
@@ -126,6 +128,23 @@ class ServerManager:
             if len(parts) > 2 and parts[-1][:1] in "QIF" and "_" in parts[-1]:
                 name = "-".join(parts[:-1])
             self.model_name = name
+
+    def token_id(self, text: str) -> int | None:
+        """Id of a special token such as <tool_call>, or None if the model has no such token."""
+        if text not in self._token_ids:
+            tid = None
+            req = urllib.request.Request(
+                self.url + "/tokenize", data=json.dumps({"content": text}).encode(),
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    toks = json.loads(r.read()).get("tokens") or []
+                if len(toks) == 1:
+                    tid = int(toks[0]["id"] if isinstance(toks[0], dict) else toks[0])
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            self._token_ids[text] = tid
+        return self._token_ids[text]
 
     def stop(self) -> None:
         proc, self.proc = self.proc, None

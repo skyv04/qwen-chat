@@ -24,7 +24,11 @@ def run(question: str, web: bool, files: bool, think: bool, keep_server: bool, y
 
     ws = Workspace(settings.workspace_path, confirm=confirm)
     server = ServerManager(settings)
-    toolbox = ToolBox(ws, web=web, files=files)
+
+    def approve(title: str, detail: str, code: str, action: str) -> bool:
+        return confirm(title, f"{detail}\n\n    {code}\n\n{action}?")
+
+    toolbox = ToolBox(ws, web=web, files=files, commands=settings["commands"], approve=approve)
     agent = Agent(server, toolbox)
     out = sys.stdout
 

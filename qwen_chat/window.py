@@ -87,7 +87,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self.store = ChatStore()
         self.workspace = Workspace(settings.workspace_path, confirm=self._confirm)
         settings.workspace_path.mkdir(parents=True, exist_ok=True)
-        self.toolbox = ToolBox(self.workspace, web=settings["web"], files=settings["files"])
+        self.toolbox = ToolBox(self.workspace, web=settings["web"], files=settings["files"],
+                               commands=settings["commands"], approve=self._approve)
         self.agent = Agent(server, self.toolbox)
         self.chat: dict | None = None
         self.running = False
@@ -235,7 +236,8 @@ class ChatWindow(Adw.ApplicationWindow):
         page.add_css_class("empty-page")
         page.set_description(
             "Qwen runs privately on this phone's GPU. It can search and read the web, "
-            f"and create and edit files in {_home(self.settings.workspace_path)}.")
+            f"create and edit files in {_home(self.settings.workspace_path)}, and run or "
+            "install programs there when you allow it.")
         grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
                            max_children_per_line=2, min_children_per_line=1,
                            column_spacing=10, row_spacing=10, halign=Gtk.Align.CENTER)
@@ -296,6 +298,11 @@ class ChatWindow(Adw.ApplicationWindow):
                                        f"Let Qwen read and write files in {_home(self.settings.workspace_path)}")
         self.files_toggle.connect("toggled", self._on_files_toggled)
         row.append(self.files_toggle)
+        self.run_toggle = self._pill("utilities-terminal-symbolic", "Run", self.settings["commands"],
+                                     "Let Qwen run programs and install software it needs "
+                                     "(it asks you before every command or install)")
+        self.run_toggle.connect("toggled", self._on_run_toggled)
+        row.append(self.run_toggle)
         self.think_toggle = self._pill("emoji-objects-symbolic", "Think", self.settings["thinking"],
                                        "Reason step by step before answering (slower, better for hard questions)")
         self.think_toggle.connect("toggled", self._on_think_toggled)
@@ -423,6 +430,10 @@ class ChatWindow(Adw.ApplicationWindow):
         self.settings["files"] = self.toolbox.files = btn.get_active()
         self.settings.save()
         self._update_composer()
+
+    def _on_run_toggled(self, btn) -> None:
+        self.settings["commands"] = self.toolbox.commands = btn.get_active()
+        self.settings.save()
 
     def _on_think_toggled(self, btn) -> None:
         self.settings["thinking"] = btn.get_active()
@@ -676,6 +687,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self.action_stack.set_visible_child_name("stop" if self.running else "send")
         self.stop_action.set_enabled(self.running)
         self.attach_btn.set_sensitive(self.files_toggle.get_active())
+        # Commands run in the workspace, so they go together with file access.
+        self.run_toggle.set_sensitive(self.files_toggle.get_active())
         self.new_btn.set_sensitive(not self.running)
         self.chat_list.set_sensitive(not self.running)
 
@@ -963,7 +976,8 @@ class ChatWindow(Adw.ApplicationWindow):
     def _ev_tool_begin(self, turn, call_id, name, args) -> None:
         self._flush(turn)
         turn.add_tool(call_id, name, args)
-        msg = ToolBox.describe(name, args, running=True) + "…"
+        msg = ToolBox.describe(name, args, running=True)
+        msg = msg if msg.endswith("…") else msg + "…"
         turn.set_status(msg)
         self._set_status(msg)
 
@@ -976,8 +990,14 @@ class ChatWindow(Adw.ApplicationWindow):
         turn.end_round(message)
 
     # ---------------------------------------------------------------- confirmations (worker thread)
-    def _confirm(self, title: str, detail: str) -> bool:
-        if not self.settings["confirm_changes"]:
+    def _approve(self, title: str, detail: str, code: str, action: str) -> bool:
+        """Commands and installs: always asked, whatever the file-change setting says."""
+        icon = "system-software-install-symbolic" if action == "Install" else "utilities-terminal-symbolic"
+        return self._confirm(title, detail, code=code, allow_label=action, icon=icon, always=True)
+
+    def _confirm(self, title: str, detail: str, code: str | None = None, allow_label: str = "Allow",
+                 icon: str = "dialog-warning-symbolic", always: bool = False) -> bool:
+        if not always and not self.settings["confirm_changes"]:
             return True
         answered = threading.Event()
         result = {"ok": False}
@@ -992,7 +1012,7 @@ class ChatWindow(Adw.ApplicationWindow):
             if turn is None:
                 on_answer(False)
                 return False
-            card = ConfirmCard(title, detail, on_answer)
+            card = ConfirmCard(title, detail, on_answer, code=code, allow_label=allow_label, icon=icon)
             self._pending_confirm = card
             turn.add_widget(card)
             turn.set_status("Waiting for your answer…")
@@ -1000,7 +1020,7 @@ class ChatWindow(Adw.ApplicationWindow):
             if not self.is_active():
                 app = self.get_application()
                 n = Gio.Notification.new("Qwen is asking permission")
-                n.set_body(detail)
+                n.set_body(f"{title} {code}" if code else detail)
                 app.send_notification("confirm", n)
             return False
 

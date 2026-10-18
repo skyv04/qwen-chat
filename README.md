@@ -7,7 +7,8 @@ Adreno GPU through llama.cpp (Vulkan). Built for Debian in PRoot on Termux with 
 
 - Desktop icon or the **Qwen Chat** menu entry
 - `qwen-chat` in a terminal
-- `qwen-chat --ask "question"` for a one-off answer in the terminal
+- `qwen-chat --ask "question"` for a one-off answer in the terminal (commands and
+  installs ask `[y/N]` first; `--yes` allows them without asking)
 
 When the app opens, it starts the model server (`~/.local/bin/qwen-server`) if one isn't
 already running. When you close the app, it stops the server again, but only if the app
@@ -21,6 +22,11 @@ started it.
   list of links, so answers can link to the exact article.
 - **Files**: list, read, write, move and delete files, plus create folders, all inside the
   workspace folder only.
+- **Run** (needs Files on): Qwen can run shell commands in the workspace, for example to
+  convert images, merge PDFs, run OCR or a Python script. When a task needs a program it
+  doesn't have, it asks to install it: Debian packages with apt, or Python packages with
+  pip. Every command and install shows a card with the exact command (and, for apt, the
+  download and disk size) and waits for **Run**/**Install** or **Don't allow**.
 - **Think**: optional step-by-step reasoning, shown in a collapsible "Thoughts" section.
 - Attach files with the paperclip button or drag and drop. They're copied into
   `workspace/attachments`.
@@ -36,6 +42,17 @@ started it.
   `..`, absolute paths or symlinks are refused.
 - By default, overwriting or deleting a file needs your approval (menu → *Ask Before
   Replacing or Deleting Files*).
+- Commands and installs always need your approval, whatever that setting says. There is
+  no sandbox beyond that: an approved command runs in the workspace with your account's
+  access, so read the command before you click **Run**. Commands have no keyboard input
+  and are stopped after 5 minutes (Qwen can ask for up to 30), or when you click Stop.
+- If you click **Don't allow**, Qwen isn't allowed to call any more tools in that reply.
+  It has to answer in words, so it can't try a workaround behind your back.
+- A command that starts a program that isn't installed is refused before you're asked,
+  and Qwen is told which Debian package provides it.
+- apt installs run as PRoot's fake root (`proot -0`), or `sudo -n` outside Termux. pip
+  installs go into Qwen's own environment, `~/.local/share/qwen-chat/qwen-chat/venv`
+  (it can still use the system's Python packages), so the system Python isn't changed.
 - The web tools only fetch `http`/`https` URLs. Local and private addresses are refused,
   including through redirects.
 - The model server listens on `127.0.0.1` only. It has no API key and allows any web
@@ -52,6 +69,7 @@ started it.
 | `server_command` | `["~/.local/bin/qwen-server"]` | How to start the server |
 | `context_size` | `16384` | Context window for a server the app starts |
 | `confirm_changes` | `true` | Ask before overwriting or deleting |
+| `commands` | `true` | Let Qwen ask to run commands and install programs (the **Run** button) |
 | `stop_server_on_exit` | `true` | Stop the server on quit, if the app started it (menu → *Unload Model When Closing*) |
 
 Chats are stored in `~/.local/share/qwen-chat/chats`. The server log is
@@ -65,8 +83,8 @@ Chats are stored in `~/.local/share/qwen-chat/chats`. The server log is
   as fast and stable.
 - Speeds: reading runs at about 30 tokens/s and writing at 5–10 tokens/s. Writing slows
   down when the phone gets hot and lowers the GPU clock.
-- The first message after the server starts takes about 40 s, because the instructions
-  and tool descriptions (about 1,400 tokens) are read once. Later messages reuse them
+- The first message after the server starts takes about 70 s, because the instructions
+  and tool descriptions (about 2,100 tokens) are read once. Later messages reuse them
   from the cache.
 
 ## Development

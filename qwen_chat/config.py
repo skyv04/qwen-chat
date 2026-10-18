@@ -24,6 +24,8 @@ DEFAULTS = {
     "context_size": 16384,
     "web": True,
     "files": True,
+    # Lets the model run programs and install software; each command/install is approved.
+    "commands": True,
     "thinking": False,
     "confirm_changes": True,
     "stop_server_on_exit": True,

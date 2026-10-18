@@ -37,6 +37,9 @@ class QwenChatApp(Adw.Application):
         self.settings = Settings()
         apply_color_scheme(self.settings["color_scheme"])
         display = Gdk.Display.get_default()
+        # libadwaita's UI uses Adwaita's symbolic icons; desktop themes such as Tango (XFCE
+        # here) lack many of them, which left blank header buttons.
+        Gtk.Settings.get_for_display(display).props.gtk_icon_theme_name = "Adwaita"
         Gtk.IconTheme.get_for_display(display).add_search_path(str(HERE / "data" / "icons"))
         css = Gtk.CssProvider()
         css.load_from_path(str(HERE / "data" / "style.css"))

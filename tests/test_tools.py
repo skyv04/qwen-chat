@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,6 +126,194 @@ class HtmlExtractTest(unittest.TestCase):
         self.assertEqual(p.results[0]["url"], "https://example.com/a")
         self.assertEqual(p.results[0]["snippet"], "Snippet A")
         self.assertEqual(tools._unwrap_ddg("//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.org%2F"), "https://x.org/")
+
+
+class ProgramToolsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Workspace(Path(self.tmp.name) / "ws")
+        self.asked = []
+        self.allow = True
+        self.box = ToolBox(self.ws, web=False, files=True, commands=True, approve=self._approve)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _approve(self, title, detail, code, action):
+        self.asked.append((title, detail, code, action))
+        return self.allow
+
+    def run_tool(self, name, **args):
+        return self.box.run(name, json.dumps(args))
+
+    def test_offered_only_with_files_and_commands_on(self):
+        names = lambda box: {t["function"]["name"] for t in box.schemas()}
+        self.assertIn("run_command", names(self.box))
+        self.assertNotIn("run_command", names(ToolBox(self.ws, web=True, files=True)))
+        self.assertNotIn("install_packages", names(ToolBox(self.ws, files=False, commands=True)))
+
+    def test_command_runs_only_when_approved(self):
+        self.allow = False
+        cmd = "touch should-not-exist"
+        ok, out = self.run_tool("run_command", command=cmd, why="test")
+        self.assertFalse(ok)
+        self.assertIn("said no", out)
+        self.assertEqual(self.asked[0][2], cmd)
+        self.assertFalse((self.ws.root / "should-not-exist").exists())
+        # Approval is required even without a GUI callback.
+        ok, _ = ToolBox(self.ws, files=True, commands=True).run(
+            "run_command", json.dumps({"command": cmd, "why": "x"}))
+        self.assertFalse(ok)
+        self.assertFalse((self.ws.root / "should-not-exist").exists())
+
+    def test_nothing_more_is_asked_after_a_no_in_the_same_turn(self):
+        self.allow = False
+        self.run_tool("run_command", command="touch a", why="test")
+        self.allow = True
+        ok, out = self.run_tool("run_command", command="touch b", why="workaround")
+        self.assertFalse(ok)
+        self.assertIn("already said no", out)
+        self.assertEqual(len(self.asked), 1)
+        self.assertFalse((self.ws.root / "b").exists())
+        self.box.declined = False  # the agent resets this for each new turn
+        ok, _ = self.run_tool("run_command", command="touch b", why="next turn")
+        self.assertTrue(ok)
+
+    def test_missing_program_is_reported_without_asking(self):
+        ok, out = self.run_tool("run_command", command="cd . && qc-no-such-prog-1 x", why="test")
+        self.assertFalse(ok)
+        self.assertIn("Not installed: qc-no-such-prog-1", out)
+        self.assertIn("install_packages", out)
+        self.assertEqual(self.asked, [])
+        # Builtins, shell functions and redirections are not mistaken for programs.
+        ok, _ = self.run_tool("run_command", why="test",
+                              command="f() { echo hi; }; f &> log.txt; [ -f log.txt ] && cd .")
+        self.assertTrue(ok)
+        # Neither are arithmetic, arrays or [[ ]] patterns.
+        for cmd in ("n=$((n+1)); echo $n", "for ((i=0;i<2;i++)); do :; done",
+                    "arr=(one two)", "[[ x =~ ^(foo|bar)$ ]] || true",
+                    "case x in a|b) qc-no-such-prog-2;; esac"):
+            self.assertEqual(tools._missing_programs(cmd), [], cmd)
+
+    def test_runs_in_workspace_and_reports_new_files(self):
+        cmd = "pwd; printf hello > out.txt"
+        ok, out = self.run_tool("run_command", command=cmd, why="test")
+        self.assertTrue(ok, out)
+        self.assertIn(str(self.ws.root), out)
+        self.assertIn("out.txt", out)
+        self.assertEqual(self.box.result_path("run_command", {"command": cmd}), self.ws.root / "out.txt")
+
+    def test_failures_are_errors_with_hints(self):
+        ok, out = self.run_tool("run_command", command="echo partial; exit 3", why="t")
+        self.assertFalse(ok)
+        self.assertIn("exit code 3", out)
+        self.assertIn("partial", out)
+        ok, out = self.run_tool("run_command", command="no-such-program-qwen-xyz", why="t")
+        self.assertFalse(ok)
+        self.assertIn("install_packages", out)
+        self.assertIn("Tried to run", ToolBox.describe("run_command", {"command": "x"}, ok=False))
+
+    def test_stop_kills_the_whole_process_group(self):
+        import threading
+        import time
+        self.box.cancel = threading.Event()
+        threading.Timer(0.6, self.box.cancel.set).start()
+        start = time.monotonic()
+        ok, out = self.run_tool("run_command", command="sleep 30 & sleep 30", why="t")
+        self.assertLess(time.monotonic() - start, 8)
+        self.assertFalse(ok)
+        self.assertIn("Stopped by the user", out)
+
+    def test_timeout_stops_the_command(self):
+        import time
+        start = time.monotonic()
+        rc, out, reason = tools.run_streaming(["bash", "-c", "echo started; sleep 30"],
+                                              self.ws.root, tools.child_env(), 1)
+        self.assertEqual(reason, "timeout")
+        self.assertIn("started", out)
+        self.assertLess(time.monotonic() - start, 8)
+
+    def test_long_output_keeps_start_and_end(self):
+        ok, out = self.run_tool("run_command", command="echo FIRST; seq 1 50000; echo LAST", why="t")
+        self.assertTrue(ok)
+        self.assertIn("FIRST", out)
+        self.assertIn("LAST", out)
+        self.assertIn("skipped", out)
+        self.assertLess(len(out), 10000)
+
+    def test_clean_output_keeps_final_progress_state(self):
+        self.assertEqual(tools.clean_output("\x1b[32m10%\r50%\r100%\x1b[0m\nDone\r\n"), "100%\nDone")
+
+    def test_bad_package_names_are_refused_before_asking(self):
+        for name, mgr in (("foo; rm -rf ~", "apt"), ("Tesseract", "apt"), ("x && y", "pip"),
+                          ("--index-url=http://evil", "pip")):
+            ok, out = self.run_tool("install_packages", packages=[name], manager=mgr, why="t")
+            self.assertFalse(ok, name)
+        self.assertEqual(self.asked, [])
+
+    def test_apt_install_shows_plan_and_respects_no(self):
+        self.allow = False
+        with mock.patch.object(tools, "apt_installed", return_value=set()), \
+             mock.patch.object(tools, "apt_candidates", return_value={"foo"}), \
+             mock.patch.object(tools, "apt_plan", return_value={"count": 3, "download": "1.2 MB",
+                                                                "disk": "4 MB"}), \
+             mock.patch.object(tools, "run_streaming") as run:
+            ok, out = self.run_tool("install_packages", packages=["foo"], why="OCR the scans")
+        self.assertFalse(ok)
+        self.assertIn("said no", out)
+        run.assert_not_called()
+        title, detail, code, action = self.asked[0]
+        self.assertEqual((code, action), ("apt install foo", "Install"))
+        self.assertIn("OCR the scans", detail)
+        self.assertIn("3 packages including 2 it depends on, 1.2 MB download, 4 MB of space", detail)
+
+    def test_apt_plan_cannot_install(self):
+        # apt skips its yes/no prompt (and installs) when nothing extra is needed, so the
+        # plan must use a mode that never installs, and must not run as root.
+        with mock.patch.object(tools, "_query") as q:
+            q.return_value = subprocess.CompletedProcess([], 0, "0 upgraded, 1 newly installed, "
+                                                         "0 to remove\nNeed to get 52.1 kB of "
+                                                         "archives.\n", "")
+            plan = tools.apt_plan(["bc"])
+        argv = q.call_args.args[0]
+        self.assertIn("--print-uris", argv)
+        self.assertNotIn("proot", argv)
+        self.assertNotIn("sudo", argv)
+        self.assertEqual((plan["count"], plan["download"]), (1, "52.1 KB"))
+
+    def test_no_apt_work_after_a_no(self):
+        self.box.declined = True
+        with mock.patch.object(tools, "apt_plan") as plan, \
+             mock.patch.object(tools, "run_streaming") as run:
+            ok, out = self.run_tool("install_packages", packages=["no-such-pkg-qc"], why="t")
+        self.assertFalse(ok)
+        self.assertIn("already said no", out)
+        plan.assert_not_called()
+        run.assert_not_called()
+
+    def test_pip_refuses_file_names(self):
+        ok, out = self.run_tool("install_packages", packages=["evil-1.0.tar.gz"], manager="pip",
+                                why="t")
+        self.assertFalse(ok)
+        self.assertIn("not file names", out)
+        self.assertEqual(self.asked, [])
+
+    def test_already_installed_needs_no_approval(self):
+        ok, out = self.run_tool("install_packages", packages=["bash"], why="t")
+        self.assertTrue(ok, out)
+        self.assertIn("Already installed", out)
+        self.assertEqual(self.asked, [])
+
+    def test_check_programs(self):
+        with mock.patch.object(tools, "apt_candidates", return_value={"tesseract-ocr"}):
+            ok, out = self.run_tool("check_programs", programs=["bash", "tesseract"],
+                                    python_modules=["json", "no_such_module_qwen"])
+        self.assertTrue(ok, out)
+        self.assertRegex(out, r"bash: installed")
+        if "tesseract: not installed" in out:
+            self.assertIn("Debian package: tesseract-ocr", out)
+        self.assertIn("python module json: installed", out)
+        self.assertIn("python module no_such_module_qwen: not installed", out)
 
 
 if __name__ == "__main__":

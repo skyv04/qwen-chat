@@ -10,7 +10,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-web", action="store_true", help="with --ask: disable internet tools")
     ap.add_argument("--no-files", action="store_true", help="with --ask: disable workspace file tools")
     ap.add_argument("--think", action="store_true", help="with --ask: enable thinking mode")
-    ap.add_argument("--yes", action="store_true", help="with --ask: allow overwrites/deletes without asking")
+    ap.add_argument("--yes", action="store_true",
+                    help="with --ask: allow overwrites, deletes, commands and installs without asking")
     ap.add_argument("--keep-server", action="store_true", help="with --ask: leave the model loaded")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args, gtk_args = ap.parse_known_args(argv)

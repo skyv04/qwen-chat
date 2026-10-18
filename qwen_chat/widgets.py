@@ -27,6 +27,9 @@ TOOL_ICONS = {
     "make_directory": "folder-new-symbolic",
     "move_path": "go-next-symbolic",
     "delete_path": "user-trash-symbolic",
+    "run_command": "utilities-terminal-symbolic",
+    "install_packages": "system-software-install-symbolic",
+    "check_programs": "system-search-symbolic",
 }
 
 _LANG_ALIASES = {"py": "python3", "python": "python3", "js": "js", "javascript": "js",
@@ -358,8 +361,9 @@ class ToolCard(Gtk.Box):
         icon = Gtk.Image(icon_name=TOOL_ICONS.get(name, "applications-science-symbolic"))
         icon.add_css_class("tool-icon")
         row.append(icon)
-        self.title = Gtk.Label(label=describe(name, args, True) + "…", xalign=0, hexpand=True,
-                               ellipsize=Pango.EllipsizeMode.END)
+        running = describe(name, args, True)
+        self.title = Gtk.Label(label=running if running.endswith("…") else running + "…", xalign=0,
+                               hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         row.append(self.title)
         self.state = Gtk.Stack()
         self.spinner = Gtk.Spinner(spinning=True)
@@ -395,7 +399,7 @@ class ToolCard(Gtk.Box):
         self.arrow.set_from_icon_name("pan-down-symbolic" if btn.get_active() else "pan-end-symbolic")
 
     def finish(self, ok: bool, result: str) -> None:
-        self.title.set_label(self._describe(self.name, self.args, False))
+        self.title.set_label(self._describe(self.name, self.args, False, ok))
         self.state.set_visible_child_name("ok" if ok else "error")
         self.spinner.set_spinning(False)
         text = result.strip()
@@ -424,24 +428,35 @@ class ToolCard(Gtk.Box):
 
 
 class ConfirmCard(Gtk.Box):
-    """Asks the user to allow a file change. `on_answer(bool)` runs once."""
+    """Asks the user to allow a file change, command or install. `on_answer(bool)` runs once."""
 
-    def __init__(self, title: str, detail: str, on_answer):
+    def __init__(self, title: str, detail: str, on_answer, code: str | None = None,
+                 allow_label: str = "Allow", icon: str = "dialog-warning-symbolic"):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.add_css_class("confirm-card")
         self._on_answer = on_answer
         head = Gtk.Box(spacing=8)
-        head.append(Gtk.Image(icon_name="dialog-warning-symbolic"))
+        head.append(Gtk.Image(icon_name=icon))
         t = Gtk.Label(label=title, xalign=0)
         t.add_css_class("heading")
         head.append(t)
         self.append(head)
         d = Gtk.Label(label=detail, xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
         self.append(d)
+        if code:
+            # The exact command, so what runs is what the user read.
+            sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                    propagate_natural_height=True, max_content_height=260)
+            sw.add_css_class("confirm-code")
+            c = Gtk.Label(label=code, xalign=0, yalign=0, wrap=True, wrap_mode=Pango.WrapMode.CHAR,
+                          selectable=True)
+            c.add_css_class("monospace")
+            sw.set_child(c)
+            self.append(sw)
         self.buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         deny = Gtk.Button(label="Don't allow")
         deny.connect("clicked", lambda *_: self.answer(False))
-        allow = Gtk.Button(label="Allow")
+        allow = Gtk.Button(label=allow_label)
         allow.add_css_class("suggested-action")
         allow.connect("clicked", lambda *_: self.answer(True))
         self.buttons.append(deny)
