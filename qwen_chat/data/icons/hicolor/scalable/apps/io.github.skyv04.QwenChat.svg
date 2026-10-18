@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7b6cf6"/>
+      <stop offset="0.55" stop-color="#5b5be8"/>
+      <stop offset="1" stop-color="#3f8cf2"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)"/>
+  <rect x="8" y="8" width="112" height="56" rx="28" fill="url(#shine)"/>
+  <!-- speech bubble -->
+  <path d="M36 34h56a14 14 0 0 1 14 14v26a14 14 0 0 1-14 14H62l-15 13c-2 1.7-5 .3-5-2.3V88h-6a14 14 0 0 1-14-14V48a14 14 0 0 1 14-14z"
+        fill="#ffffff"/>
+  <!-- friendly face -->
+  <circle cx="52" cy="58" r="6" fill="#4b4fd6"/>
+  <circle cx="76" cy="58" r="6" fill="#4b4fd6"/>
+  <circle cx="54" cy="56" r="1.8" fill="#ffffff"/>
+  <circle cx="78" cy="56" r="1.8" fill="#ffffff"/>
+  <path d="M55 71q9 7 18 0" fill="none" stroke="#4b4fd6" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="44" cy="68" r="4" fill="#ff8fb1" opacity="0.7"/>
+  <circle cx="84" cy="68" r="4" fill="#ff8fb1" opacity="0.7"/>
+  <!-- spark -->
+  <path d="M100 18l3.2 8.3 8.3 3.2-8.3 3.2-3.2 8.3-3.2-8.3-8.3-3.2 8.3-3.2z" fill="#ffe27a"/>
+</svg>
