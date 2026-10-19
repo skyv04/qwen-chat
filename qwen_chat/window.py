@@ -1,6 +1,7 @@
 """The main window: chat list, conversation view and composer."""
 from __future__ import annotations
 
+import datetime
 import os
 import shutil
 import threading
@@ -18,8 +19,8 @@ from . import APP_ID, APP_NAME  # noqa: E402
 from .agent import Agent, repair_history, salvage_args  # noqa: E402
 from .llm import Cancelled, LLMError, ServerError, gpu_busy_percent  # noqa: E402
 from .store import ChatStore, title_from  # noqa: E402
-from .tools import ToolBox, Workspace  # noqa: E402
-from .widgets import AssistantTurn, ConfirmCard, UserMessage, open_uri  # noqa: E402
+from .tools import ToolBox, ToolError, Workspace  # noqa: E402
+from .widgets import AssistantTurn, ConfirmCard, UserMessage, fmt_duration, open_uri  # noqa: E402
 
 SUGGESTIONS = [
     ("system-search-symbolic", "What's in the news today?",
@@ -37,10 +38,10 @@ BIDI = GObject.BindingFlags.BIDIRECTIONAL
 SYNC = GObject.BindingFlags.SYNC_CREATE
 INVERT = GObject.BindingFlags.INVERT_BOOLEAN
 
-RUN_TIP_ASK = ("Let Qwen run programs and install software it needs "
-               "(it asks you before every command or install)")
-RUN_TIP_AUTO = ("Let Qwen run programs and install software it needs. In this chat, commands "
-                "run without asking (installs still ask); change it in the main menu")
+RUN_TIP_AUTO = ("Let Qwen run programs and install software in the workspace. Routine commands "
+                "and small installs run right away; it asks first before anything risky or big")
+RUN_TIP_ASK = ("Let Qwen run programs and install software in the workspace. It asks before "
+               "every command and install (change this in the main menu)")
 
 
 def _k(n: int) -> str:
@@ -51,6 +52,18 @@ def _home(path: Path) -> str:
     home = str(Path.home())
     s = str(path)
     return "~" + s[len(home):] if s == home or s.startswith(home + "/") else s
+
+
+def _age_group(ts) -> str:
+    try:
+        days = (datetime.date.today() - datetime.date.fromtimestamp(float(ts))).days
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "Older"
+    if days <= 0:
+        return "Today"
+    if days == 1:
+        return "Yesterday"
+    return "Previous 7 Days" if days < 7 else "Previous 30 Days" if days < 30 else "Older"
 
 
 class _UiEvents:
@@ -91,9 +104,11 @@ class ChatWindow(Adw.ApplicationWindow):
         self.server = server
         self.store = ChatStore()
         self.workspace = Workspace(settings.workspace_path, confirm=self._confirm)
+        self.workspace.on_trash = self._on_trash
         settings.workspace_path.mkdir(parents=True, exist_ok=True)
         self.toolbox = ToolBox(self.workspace, web=settings["web"], files=settings["files"],
-                               commands=settings["commands"], approve=self._approve)
+                               commands=settings["commands"], approve=self._approve,
+                               auto_approve=self._auto_approve)
         self.agent = Agent(server, self.toolbox)
         self.chat: dict | None = None
         self.running = False
@@ -108,7 +123,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self._loading_list = False
         self._deleted: dict | None = None
         self._pending_confirm: ConfirmCard | None = None
-        self._auto_run_new = False   # "run without asking" chosen before this chat's first message
+        self._queued: tuple[str, list[str]] | None = None   # sent when the current answer ends
+        self._turn_started = 0.0
 
         w, h = (settings["window_size"] + [1180, 820])[:2]
         self.set_default_size(int(w), int(h))
@@ -146,6 +162,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.chat_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.chat_list.add_css_class("navigation-sidebar")
         self.chat_list.connect("row-selected", self._on_row_selected)
+        self.chat_list.set_header_func(self._row_header)
         placeholder = Gtk.Label(label="No chats yet", margin_top=24)
         placeholder.add_css_class("dim-label")
         self.chat_list.set_placeholder(placeholder)
@@ -243,7 +260,7 @@ class ChatWindow(Adw.ApplicationWindow):
         page.set_description(
             "Qwen runs privately on this phone's GPU. It can search and read the web, "
             f"create and edit files in {_home(self.settings.workspace_path)}, and run or "
-            "install programs there when you allow it.")
+            "install programs there. It asks you first before anything risky.")
         grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
                            max_children_per_line=2, min_children_per_line=1,
                            column_spacing=10, row_spacing=10, halign=Gtk.Align.CENTER)
@@ -264,6 +281,34 @@ class ChatWindow(Adw.ApplicationWindow):
     def _build_composer(self) -> Gtk.Widget:
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.add_css_class("composer-area")
+
+        # A message written while Qwen works waits here and goes out when the answer ends.
+        self.queue_bar = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
+        qbox = Gtk.Box(spacing=8)
+        qbox.add_css_class("queue-bar")
+        qbox.append(Gtk.Image(icon_name="mail-send-symbolic"))
+        q_title = Gtk.Label(label="Next:")
+        q_title.add_css_class("heading")
+        qbox.append(q_title)
+        self.queue_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        qbox.append(self.queue_label)
+        q_hint = Gtk.Label(label="sends when Qwen finishes")
+        q_hint.add_css_class("dim-label")
+        q_hint.add_css_class("caption")
+        qbox.append(q_hint)
+        q_edit = Gtk.Button(label="Edit", action_name="win.queue-edit", valign=Gtk.Align.CENTER,
+                            tooltip_text="Put it back in the message box")
+        q_edit.add_css_class("pill-small")
+        qbox.append(q_edit)
+        q_drop = Gtk.Button(icon_name="window-close-symbolic", action_name="win.queue-discard",
+                            valign=Gtk.Align.CENTER, tooltip_text="Don't send it")
+        q_drop.add_css_class("flat")
+        q_drop.add_css_class("circular")
+        q_drop.add_css_class("small-button")
+        qbox.append(q_drop)
+        self.queue_bar.set_child(Adw.Clamp(maximum_size=820, tightening_threshold=640, child=qbox))
+        outer.append(self.queue_bar)
+
         clamp = Adw.Clamp(maximum_size=820, tightening_threshold=640)
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card.add_css_class("composer")
@@ -305,8 +350,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.files_toggle.connect("toggled", self._on_files_toggled)
         row.append(self.files_toggle)
         self.run_toggle = self._pill("utilities-terminal-symbolic", "Run", self.settings["commands"],
-                                     RUN_TIP_ASK)
-        self.run_label = self.run_toggle.get_child().get_last_child()
+                                     RUN_TIP_AUTO)
         self.run_toggle.connect("toggled", self._on_run_toggled)
         row.append(self.run_toggle)
         self.think_toggle = self._pill("emoji-objects-symbolic", "Think", self.settings["thinking"],
@@ -381,8 +425,8 @@ class ChatWindow(Adw.ApplicationWindow):
         look.append("Dark", "win.color-scheme::dark")
         s2 = Gio.Menu()
         s2.append_submenu("Appearance", look)
-        s2.append("Ask Before Replacing or Deleting Files", "win.confirm-changes")
-        s2.append("Run Commands Without Asking (This Chat)", "win.auto-run")
+        s2.append("Ask Before Every Command", "win.ask-commands")
+        s2.append("Ask Before Replacing or Deleting Files", "win.ask-file-changes")
         s2.append("Unload Model When Closing", "win.stop-on-exit")
         menu.append_section(None, s2)
         s3 = Gio.Menu()
@@ -411,13 +455,13 @@ class ChatWindow(Adw.ApplicationWindow):
                                                GLib.Variant("s", self.settings["color_scheme"]))
         scheme.connect("activate", self._on_color_scheme)
         self.add_action(scheme)
-        for name, key in (("confirm-changes", "confirm_changes"), ("stop-on-exit", "stop_server_on_exit")):
+        for name, key in (("ask-commands", "ask_commands"), ("ask-file-changes", "ask_file_changes"),
+                          ("stop-on-exit", "stop_server_on_exit")):
             act = Gio.SimpleAction.new_stateful(name, None, GLib.Variant("b", bool(self.settings[key])))
             act.connect("activate", self._on_bool_setting, key)
             self.add_action(act)
-        self.auto_run_action = Gio.SimpleAction.new_stateful("auto-run", None, GLib.Variant("b", False))
-        self.auto_run_action.connect("activate", self._on_auto_run)
-        self.add_action(self.auto_run_action)
+        add("queue-edit", lambda *_: self._edit_queued())
+        add("queue-discard", lambda *_: self._discard_queued())
 
     # ================================================================== settings
     def _on_color_scheme(self, action, value) -> None:
@@ -431,32 +475,40 @@ class ChatWindow(Adw.ApplicationWindow):
         action.set_state(GLib.Variant("b", new))
         self.settings[key] = new
         self.settings.save()
+        if key == "ask_commands":
+            if new and self.chat is not None and self.chat.get("auto_run"):
+                self.chat["auto_run"] = False  # the menu wins over "Allow All in This Chat"
+                self.store.save(self.chat)
+            self._sync_run_tip()
+            self.toast("Qwen will ask before every command and install." if new else
+                       "Routine commands and small installs now run without asking. "
+                       "Risky ones still ask.")
+            if not new:
+                self._answer_routine_card()
+        elif key == "ask_file_changes":
+            self.toast("Qwen will ask before replacing or deleting files." if new else
+                       "Replaced and deleted files go to the Trash, so you can get them back.")
 
-    # Commands without asking: a per-chat choice, saved with the chat. Installs always ask.
-    def _auto_run_on(self) -> bool:
-        return bool(self.chat.get("auto_run")) if self.chat is not None else self._auto_run_new
+    # Routine commands and small installs run without asking unless "Ask Before Every Command"
+    # is on; "Allow All in This Chat" on a question card turns that off again for one chat.
+    def _auto_approve(self) -> bool:
+        return not self.settings["ask_commands"] or bool(self.chat and self.chat.get("auto_run"))
 
-    def _sync_auto_run(self) -> None:
-        on = self._auto_run_on()
-        self.auto_run_action.set_state(GLib.Variant("b", on))
-        self.run_label.set_label("Auto-run" if on else "Run")
-        self.run_toggle.set_tooltip_text(RUN_TIP_AUTO if on else RUN_TIP_ASK)
+    def _sync_run_tip(self) -> None:
+        self.run_toggle.set_tooltip_text(RUN_TIP_AUTO if self._auto_approve() else RUN_TIP_ASK)
 
-    def _on_auto_run(self, action, _param) -> None:
-        on = not action.get_state().get_boolean()
+    def _allow_all_in_chat(self) -> None:
         if self.chat is not None:
-            self.chat["auto_run"] = on
+            self.chat["auto_run"] = True
             self.store.save(self.chat)
-        else:
-            self._auto_run_new = on
-        self._sync_auto_run()
-        if on:
-            self.toast("Commands in this chat now run without asking. Installs still ask.")
-            card = self._pending_confirm
-            if card is not None and getattr(card, "kind", "") == "Run":
-                card.answer(True)
-        else:
-            self.toast("Qwen will ask before each command again.")
+        self._sync_run_tip()
+        self.toast("Commands and small installs in this chat now run without asking. "
+                   "Risky ones still ask.")
+
+    def _answer_routine_card(self) -> None:
+        card = self._pending_confirm
+        if card is not None and getattr(card, "routine", False) and getattr(card, "kind", "") in ("Run", "Install"):
+            card.answer(True)
 
     def _on_web_toggled(self, btn) -> None:
         self.settings["web"] = self.toolbox.web = btn.get_active()
@@ -538,6 +590,8 @@ class ChatWindow(Adw.ApplicationWindow):
         if not self.running:
             self.gpu_label.set_visible(False)
             return False
+        if self.turn is not None:
+            self.turn.set_elapsed(time.monotonic() - self._turn_started)
         pct = gpu_busy_percent()
         if pct is not None:
             self.gpu_label.set_label(f"GPU {pct}%")
@@ -553,6 +607,7 @@ class ChatWindow(Adw.ApplicationWindow):
             for info in self.store.list():
                 row = Gtk.ListBoxRow()
                 row.chat_id = info["id"]
+                row.group = _age_group(info.get("updated"))
                 row.add_css_class("chat-row")
                 box = Gtk.Box(spacing=6)
                 lbl = Gtk.Label(label=info["title"], xalign=0, hexpand=True,
@@ -571,6 +626,18 @@ class ChatWindow(Adw.ApplicationWindow):
                     self.chat_list.select_row(row)
         finally:
             self._loading_list = False
+
+    @staticmethod
+    def _row_header(row, before) -> None:
+        group = getattr(row, "group", "")
+        if before is not None and getattr(before, "group", "") == group:
+            row.set_header(None)
+            return
+        current = row.get_header()
+        if current is None or current.get_label() != group:
+            label = Gtk.Label(label=group, xalign=0)
+            label.add_css_class("chat-group-header")
+            row.set_header(label)
 
     def _on_row_selected(self, _list, row) -> None:
         if self._loading_list or row is None:
@@ -631,15 +698,13 @@ class ChatWindow(Adw.ApplicationWindow):
         self._clear_messages()
         self.stack.set_visible_child_name("empty")
         self.title.set_title(APP_NAME)
-        if self.chat is None:
-            self._auto_run_new = False
-        self._sync_auto_run()
+        self._sync_run_tip()
         self._update_context()
 
     def _new_turn(self) -> AssistantTurn:
         if self.last_turn is not None:
             self.last_turn.regen_btn.set_visible(False)
-        turn = AssistantTurn(self.server.model_name, ToolBox.describe, self.toolbox.result_path)
+        turn = AssistantTurn(self.server.model_name, self.toolbox.label, self.toolbox.result_paths)
         turn.regen_btn.connect("clicked", lambda *_: self.regenerate())
         self.msg_box.append(turn)
         self.last_turn = turn
@@ -653,10 +718,11 @@ class ChatWindow(Adw.ApplicationWindow):
             self._show_empty()
             return
         self.stack.set_visible_child_name("chat")
-        self._sync_auto_run()
+        self._sync_run_tip()
         turn = None
-        turns: list[tuple[AssistantTurn, dict | None]] = []
+        turns: list[list] = []   # [turn, last assistant message, when it was asked]
         error = None
+        asked_at = None
 
         def show_error(last: bool):
             # A turn that failed is saved as an error on its user message, so it stays visible.
@@ -665,7 +731,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 return
             if turn is None:
                 turn = self._new_turn()
-                turns.append([turn, None])
+                turns.append([turn, None, None])
             turn.show_error(error, retry=self.regenerate if last else None)
 
         for m in msgs:
@@ -675,10 +741,11 @@ class ChatWindow(Adw.ApplicationWindow):
                 self.msg_box.append(UserMessage(m.get("content") or ""))
                 turn = None
                 error = (m.get("_meta") or {}).get("error")
+                asked_at = (m.get("_meta") or {}).get("time")
             elif role == "assistant":
                 if turn is None:
                     turn = self._new_turn()
-                    turns.append([turn, None])
+                    turns.append([turn, None, asked_at])
                 turn.begin_round()
                 if m.get("reasoning_content"):
                     turn.add_reasoning(m["reasoning_content"], live=False)
@@ -696,19 +763,23 @@ class ChatWindow(Adw.ApplicationWindow):
                 turn.end_tool(m.get("tool_call_id"), bool(m.get("_meta", {}).get("ok", True)),
                               m.get("content") or "")
         show_error(True)
-        for i, (t, last) in enumerate(turns):
-            t.finish(self._stats_text(last), can_regenerate=(i == len(turns) - 1 and t is self.last_turn))
+        for i, (t, last, start) in enumerate(turns):
+            end = ((last or {}).get("_meta") or {}).get("time")
+            took = end - start if start and end and 0 < end - start < 86400 else None
+            t.finish(self._stats_text(last, took),
+                     can_regenerate=(i == len(turns) - 1 and t is self.last_turn))
         self._update_context()
         self._stick = True
         GLib.idle_add(lambda: (self.scroll_to_bottom(force=True), False)[1])
 
     @staticmethod
-    def _stats_text(msg: dict | None) -> str:
+    def _stats_text(msg: dict | None, took: float | None = None) -> str:
         t = (msg or {}).get("_meta", {}).get("timings") or {}
         tps, n = t.get("predicted_per_second"), t.get("predicted_n")
-        if not tps:
-            return ""
-        return f"{tps:.1f} tokens/s · {n} tokens"
+        parts = [f"Took {fmt_duration(took)}"] if took and took >= 1 else []
+        if tps:
+            parts.append(f"{tps:.1f} tokens/s")
+        return " · ".join(parts)
 
     # ================================================================== scrolling
     def _at_bottom(self) -> bool:
@@ -738,6 +809,8 @@ class ChatWindow(Adw.ApplicationWindow):
     def _update_composer(self) -> None:
         text = self._text()
         self.placeholder.set_visible(not text)
+        self.placeholder.set_label("Write a follow-up; Enter queues it for when Qwen finishes…"
+                                   if self.running else "Message Qwen…")
         self.send_btn.set_sensitive(bool(text.strip() or self.attachments) and not self.running)
         self.action_stack.set_visible_child_name("stop" if self.running else "send")
         self.stop_action.set_enabled(self.running)
@@ -879,27 +952,64 @@ class ChatWindow(Adw.ApplicationWindow):
 
     # ================================================================== sending
     def send(self, text: str | None = None) -> None:
-        if self.running:
-            # Enter while Qwen is busy: say why nothing happened; the text stays in the box.
-            if text or self._text().strip():
-                self.toast("Qwen is still working on the last message. Wait for it, or press Stop (Esc).")
-            return
         typed = text is None
         text = (self._text() if typed else text).strip()
-        if not text and not self.attachments:
+        atts = list(self.attachments)
+        if not text and not atts:
             return
-        content = text
-        if self.attachments:
-            listed = ", ".join(f"`{a}`" for a in self.attachments)
-            content = (text + "\n\n" if text else "") + f"Attached files (in the workspace): {listed}"
-            if not text:
-                content += "\nPlease look at them."
         if typed:
             self.buffer.set_text("")
         self._clear_chips()
+        if self.running:
+            self._queue(text, atts)
+        else:
+            self._submit(text, atts)
+
+    def _queue(self, text: str, atts: list[str]) -> None:
+        if self._queued is not None:
+            old, old_atts = self._queued
+            text = "\n\n".join(t for t in (old, text) if t)
+            atts = old_atts + [a for a in atts if a not in old_atts]
+        self._queued = (text, atts)
+        preview = " ".join(text.split()) or ", ".join(os.path.basename(a) for a in atts)
+        if text and atts:
+            preview += f"  (+{len(atts)} file{'s' if len(atts) > 1 else ''})"
+        self.queue_label.set_label(preview)
+        self.queue_label.set_tooltip_text(text[:600] or None)
+        self.queue_bar.set_reveal_child(True)
+
+    def _take_queued(self) -> tuple[str, list[str]] | None:
+        queued, self._queued = self._queued, None
+        self.queue_bar.set_reveal_child(False)
+        return queued
+
+    def _edit_queued(self) -> None:
+        queued = self._take_queued()
+        if queued is None:
+            return
+        text, atts = queued
+        current = self._text().strip()
+        self.buffer.set_text("\n\n".join(t for t in (text, current) if t))
+        for a in atts:
+            if a not in self.attachments:
+                self.attachments.append(a)
+                self._add_chip(a)
+        self._update_composer()
+        self.textview.grab_focus()
+
+    def _discard_queued(self) -> None:
+        if self._take_queued() is not None:
+            self.toast("The next message won't be sent.")
+
+    def _submit(self, text: str, atts: list[str]) -> None:
+        content = text
+        if atts:
+            listed = ", ".join(f"`{a}`" for a in atts)
+            content = (text + "\n\n" if text else "") + f"Attached files (in the workspace): {listed}"
+            if not text:
+                content += "\nPlease look at them."
         if self.chat is None:
             self.chat = self.store.new()
-            self.chat["auto_run"] = self._auto_run_new
             self._clear_messages()
         if not self.chat["messages"]:
             self.chat["title"] = title_from(text or os.path.basename(content))
@@ -929,6 +1039,7 @@ class ChatWindow(Adw.ApplicationWindow):
         turn.set_status("Starting…")
         self.turn = turn
         self.running = True
+        self._turn_started = time.monotonic()
         self.cancel = threading.Event()
         self._stick = True
         self._update_composer()
@@ -991,10 +1102,19 @@ class ChatWindow(Adw.ApplicationWindow):
             turn.show_error(err, retry=self.regenerate)
         elif cancelled:
             turn.add_note("Stopped")
-        turn.finish(self._stats_text(last) if not err else "", can_regenerate=True)
+        took = time.monotonic() - self._turn_started
+        turn.finish(self._stats_text(last, took) if not err else "", can_regenerate=True)
         self.running = False
         self.turn = None
         self._update_composer()
+        if self._queued is not None:
+            if err or cancelled:
+                # Don't pile a new question onto a failed or stopped answer; let the user decide.
+                self._edit_queued()
+                self.toast("Your next message is back in the box. Send it when you're ready.")
+            else:
+                text, atts = self._take_queued()
+                GLib.idle_add(lambda: (self._submit(text, atts), False)[1])
         self._update_context()
         if self._server_state == "ready" or self.server.health() == "ok":
             self._server_state = "ready"
@@ -1041,9 +1161,8 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _ev_tool_begin(self, turn, call_id, name, args) -> None:
         self._flush(turn)
-        turn.add_tool(call_id, name, args)
-        msg = ToolBox.describe(name, args, running=True)
-        msg = msg if msg.endswith("…") else msg + "…"
+        card = turn.add_tool(call_id, name, args)
+        msg = card.title_text()
         turn.set_status(msg)
         self._set_status(msg)
 
@@ -1056,17 +1175,18 @@ class ChatWindow(Adw.ApplicationWindow):
         turn.end_round(message)
 
     # ---------------------------------------------------------------- confirmations (worker thread)
-    def _approve(self, title: str, detail: str, code: str, action: str) -> bool:
-        """Commands and installs: asked whatever the file-change setting says. Commands skip the
-        question in chats where the user turned on running without asking."""
-        if action == "Run" and self._auto_run_on():
-            return True
+    def _approve(self, title: str, detail: str, code: str, action: str, reason: str = "") -> bool:
+        """Commands and installs the ToolBox wants an OK for: risky or big ones (with a reason),
+        or every one when "Ask Before Every Command" is on."""
         icon = "system-software-install-symbolic" if action == "Install" else "utilities-terminal-symbolic"
-        return self._confirm(title, detail, code=code, allow_label=action, icon=icon, always=True)
+        extra = None if reason else ("Allow All in This Chat", self._allow_all_in_chat)
+        return self._confirm(title, detail, code=code, allow_label=action, icon=icon, always=True,
+                             reason=reason, extra=extra)
 
     def _confirm(self, title: str, detail: str, code: str | None = None, allow_label: str = "Allow",
-                 icon: str = "dialog-warning-symbolic", always: bool = False) -> bool:
-        if not always and not self.settings["confirm_changes"]:
+                 icon: str = "dialog-warning-symbolic", always: bool = False, reason: str = "",
+                 extra=None) -> bool:
+        if not always and not self.settings["ask_file_changes"]:
             return True
         answered = threading.Event()
         result = {"ok": False}
@@ -1081,10 +1201,11 @@ class ChatWindow(Adw.ApplicationWindow):
             if turn is None:
                 on_answer(False)
                 return False
-            card = ConfirmCard(title, detail, on_answer, code=code, allow_label=allow_label, icon=icon)
+            card = ConfirmCard(title, detail, on_answer, code=code, allow_label=allow_label,
+                               icon=icon, reason=reason, extra=extra)
             card.kind = allow_label
             self._pending_confirm = card
-            turn.add_widget(card)
+            turn.add_confirm(card)
             turn.set_status("Waiting for your answer…")
             self._set_status("Waiting for your answer…")
             if not self.is_active():
@@ -1104,6 +1225,27 @@ class ChatWindow(Adw.ApplicationWindow):
     def _confirm_answered(self):
         self._pending_confirm = None
         return False
+
+    # ---------------------------------------------------------------- Trash
+    def _on_trash(self, original: Path, trashed: Path) -> None:
+        # Tools run on the worker thread; a trash on the main thread comes from Restore itself.
+        if threading.current_thread() is not threading.main_thread():
+            GLib.idle_add(self._offer_restore, original, trashed)
+
+    def _offer_restore(self, original: Path, trashed: Path) -> bool:
+        card = self.turn.last_tool_card() if self.turn is not None else None
+        if card is not None:
+            card.add_restore(lambda: self._restore(original, trashed))
+        return False
+
+    def _restore(self, original: Path, trashed: Path) -> bool:
+        try:
+            self.workspace.restore(original, trashed)
+        except (OSError, ToolError) as e:
+            self.toast(f"Couldn't restore {original.name}: {getattr(e, 'strerror', None) or e}")
+            return False
+        self.toast(f"Restored {original.name}")
+        return True
 
     # ================================================================== misc
     def toast(self, text: str) -> None:

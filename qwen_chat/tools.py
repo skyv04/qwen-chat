@@ -1,11 +1,14 @@
 """Tools the model can call: web search/fetch/download, a sandboxed workspace folder, and
-(when enabled) programs it runs or installs with the user's approval.
+(when enabled) programs it runs or installs.
 
 Every file operation goes through Workspace.resolve(), which follows symlinks and
 ".." with realpath() and rejects anything that does not land inside the workspace.
+Deleted and replaced files go to the desktop Trash, so they can be restored.
 Web requests are limited to public http(s) addresses, so a page cannot steer the
 model into probing localhost services (the model server itself listens there).
-Commands and installs are shown to the user verbatim and run only if they allow them.
+Routine commands and small installs can run without asking; commands that look risky
+(admin rights, files outside the workspace, stopping programs, ...) and big installs are
+shown to the user verbatim and run only if they allow them.
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ import codecs
 import html
 import inspect
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -20,6 +24,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -67,13 +72,85 @@ def _duration(seconds: int) -> str:
 
 # --------------------------------------------------------------------------- workspace
 
+def trash_home() -> Path:
+    """The freedesktop.org home Trash, which file managers show as "Trash"."""
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "Trash"
+
+
 class Workspace:
-    def __init__(self, root: str | os.PathLike, confirm: Callable[[str, str], bool] | None = None):
+    def __init__(self, root: str | os.PathLike, confirm: Callable[[str, str], bool] | None = None,
+                 trash_dir: str | os.PathLike | None = None):
         root = Path(os.path.expanduser(str(root)))
         root.mkdir(parents=True, exist_ok=True)
         self.root = Path(os.path.realpath(root))
         # confirm(title, detail) -> bool; asked before overwriting or deleting.
         self.confirm = confirm or (lambda title, detail: True)
+        self.trash_dir = Path(trash_dir) if trash_dir else trash_home()
+        # on_trash(original, trashed): a file went to the Trash (the UI offers Restore).
+        self.on_trash: Callable[[Path, Path], None] = lambda original, trashed: None
+        # Files Qwen wrote, with (mtime, size) right after: replacing one of those unchanged
+        # needs no backup, so rewriting its own script doesn't fill the Trash.
+        self._own: dict[Path, tuple[int, int]] = {}
+
+    def mark_own(self, f: Path) -> None:
+        try:
+            st = os.lstat(f)
+        except OSError:
+            return
+        self._own[f] = (st.st_mtime_ns, st.st_size)
+
+    def _is_own(self, f: Path) -> bool:
+        try:
+            st = os.lstat(f)
+        except OSError:
+            return False
+        return self._own.get(f) == (st.st_mtime_ns, st.st_size)
+
+    def trash(self, p: Path) -> Path:
+        """Moves p to the Trash (freedesktop.org spec) and returns where it went."""
+        files, info = self.trash_dir / "files", self.trash_dir / "info"
+        files.mkdir(parents=True, exist_ok=True)
+        info.mkdir(parents=True, exist_ok=True)
+        stem, suffix = (p.name, "") if p.is_dir() else (p.stem or p.name, p.suffix if p.stem else "")
+        n = 1
+        while True:
+            name = p.name if n == 1 else f"{stem}.{n}{suffix}"
+            record = info / (name + ".trashinfo")
+            try:  # the .trashinfo file reserves the name
+                fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                n += 1
+                continue
+            if os.path.lexists(files / name):
+                os.close(fd)
+                os.unlink(record)
+                n += 1
+                continue
+            break
+        with os.fdopen(fd, "w") as fh:
+            fh.write("[Trash Info]\nPath=" + urllib.parse.quote(str(p)) + "\nDeletionDate="
+                     + time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+        try:
+            shutil.move(str(p), str(files / name))
+        except BaseException:
+            os.unlink(record)
+            raise
+        self._own.pop(p, None)
+        self.on_trash(p, files / name)
+        return files / name
+
+    def restore(self, original: Path, trashed: Path) -> None:
+        """Puts a trashed file back; whatever is at its place now goes to the Trash."""
+        if not os.path.lexists(trashed):
+            raise ToolError("It's no longer in the Trash.")
+        if os.path.lexists(original):
+            self.trash(original)
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(trashed), str(original))
+        try:
+            os.unlink(self.trash_dir / "info" / (trashed.name + ".trashinfo"))
+        except OSError:
+            pass
 
     def resolve(self, path) -> Path:
         if path is None:
@@ -191,12 +268,17 @@ class Workspace:
             raise ToolError(f"Content is too large ({human_size(len(data))}).")
         existed = f.exists()
         name = self.display(f)
+        backup = ""
         if existed and not append:
             if not self.confirm("Replace a file?",
                                 f"Qwen wants to overwrite {name} ({human_size(f.stat().st_size)}) "
-                                f"with new content ({human_size(len(data))})."):
+                                f"with new content ({human_size(len(data))}). The old version "
+                                "goes to the Trash."):
                 raise ToolError(f"The user declined overwriting {name}. "
                                 "Ask what they want, or save under a new name.")
+            if not self._is_own(f) and f.stat().st_size:
+                self.trash(f)
+                backup = " The old version is in the Trash."
         f.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_TRUNC)
         fd = os.open(f, flags, 0o644)
@@ -204,8 +286,9 @@ class Workspace:
             if append and existed and f.stat().st_size and not _ends_with_newline(f):
                 fh.write(b"\n")
             fh.write(data)
+        self.mark_own(f)
         verb = "Appended to" if append and existed else ("Overwrote" if existed else "Created")
-        return f"{verb} {name} ({human_size(len(data))})."
+        return f"{verb} {name} ({human_size(len(data))}).{backup}"
 
     def make_directory(self, path: str) -> str:
         d = self.resolve(path)
@@ -242,13 +325,10 @@ class Workspace:
             detail = f"Qwen wants to delete the folder {name} and the {count} file(s) in it."
         else:
             detail = f"Qwen wants to delete {name} ({human_size(p.stat().st_size)})."
-        if not self.confirm("Delete from workspace?", detail):
+        if not self.confirm("Delete from workspace?", detail + " It goes to the Trash."):
             raise ToolError(f"The user declined deleting {name}.")
-        if p.is_dir():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
-        return f"Deleted {name}."
+        self.trash(p)
+        return f"Moved {name} to the Trash."
 
 
 def _ends_with_newline(f: Path) -> bool:
@@ -671,7 +751,8 @@ def download_file(ws: Workspace, url: str, path: str = "") -> str:
     if dest.is_dir():
         dest = ws.resolve(os.path.join(ws.display(dest) if dest != ws.root else ".", name))
     if dest.exists():
-        if not ws.confirm("Replace a file?", f"Qwen wants to download {url} over {ws.display(dest)}."):
+        if not ws.confirm("Replace a file?", f"Qwen wants to download {url} over "
+                          f"{ws.display(dest)}. The old version goes to the Trash."):
             raise ToolError(f"The user declined overwriting {ws.display(dest)}.")
     dest.parent.mkdir(parents=True, exist_ok=True)
     total = 0
@@ -687,6 +768,10 @@ def download_file(ws: Workspace, url: str, path: str = "") -> str:
                 if total > MAX_DOWNLOAD_BYTES:
                     raise ToolError(f"The file is larger than {human_size(MAX_DOWNLOAD_BYTES)}.")
                 out.write(block)
+        backup = ""
+        if dest.exists() and not ws._is_own(dest) and dest.stat().st_size:
+            ws.trash(dest)
+            backup = " The old version is in the Trash."
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -694,13 +779,15 @@ def download_file(ws: Workspace, url: str, path: str = "") -> str:
         except OSError:
             pass
         raise
-    return f"Saved {url} to {ws.display(dest)} ({human_size(total)}, {ctype})."
+    ws.mark_own(dest)
+    return f"Saved {url} to {ws.display(dest)} ({human_size(total)}, {ctype}).{backup}"
 
 
 # --------------------------------------------------------------------------- programs
 #
-# Commands and installs are not sandboxed beyond running in the workspace folder: the user
-# sees the exact command (or package list) and approves every single one.
+# Commands and installs are not sandboxed beyond running in the workspace folder. Routine
+# ones run without asking; command_risk() and the install size checks decide which ones the
+# user sees (verbatim) and approves first.
 
 TERMUX_PROOT = "/data/data/com.termux/files/usr/bin/proot"
 RUN_TIMEOUT = 300
@@ -921,12 +1008,18 @@ def apt_search(name: str, limit: int = 6) -> list[str]:
     return [line.split(" - ")[0] for line in r.stdout.splitlines()[:limit]]
 
 
-def _apt_size(text: str) -> str:
-    """'7,433 kB' -> '7.3 MB' (apt uses decimal units)."""
+def _apt_bytes(text: str) -> float | None:
     m = re.fullmatch(r"([\d.,]+) ?([kMG]?)B", text.strip())
     if not m:
+        return None
+    return float(m.group(1).replace(",", "")) * {"": 1, "k": 1e3, "M": 1e6, "G": 1e9}[m.group(2)]
+
+
+def _apt_size(text: str) -> str:
+    """'7,433 kB' -> '7.3 MB' (apt uses decimal units)."""
+    n = _apt_bytes(text)
+    if n is None:
         return text
-    n = float(m.group(1).replace(",", "")) * {"": 1, "k": 1e3, "M": 1e6, "G": 1e9}[m.group(2)]
     for unit, size in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
         if n >= size:
             return f"{n / size:.1f} {unit}"
@@ -947,8 +1040,10 @@ def apt_plan(pkgs: list[str]) -> dict:
         plan["count"] = int(m.group(1))
     if m := re.search(r"Need to get ([\d.,]+ ?[kMG]?B)", text):
         plan["download"] = _apt_size(m.group(1))
+        plan["download_bytes"] = _apt_bytes(m.group(1))
     if m := re.search(r"After this operation, ([\d.,]+ ?[kMG]?B) of additional disk space", text):
         plan["disk"] = _apt_size(m.group(1))
+        plan["disk_bytes"] = _apt_bytes(m.group(1))
     if m := re.search(r"The following packages will be REMOVED:\n((?:\s+.*\n)+)", text):
         plan["remove"] = m.group(1).split()
     if "E: " in text and "count" not in plan:
@@ -1018,8 +1113,311 @@ def _missing_hint(missing: list[str]) -> str:
     except (OSError, subprocess.SubprocessError):
         known = set()
     parts = [f"{p} (Debian package {pkg})" if pkg in known else p for p, pkg in pkgs.items()]
-    return (f"Not installed: {', '.join(parts)}. Use install_packages to ask the user to "
-            "install it, or use a program that is installed.")
+    return (f"Not installed: {', '.join(parts)}. Use install_packages to install it, or use a "
+            "program that is installed.")
+
+
+# --------------------------------------------------------------------------- what still asks
+#
+# Routine commands and small installs run without asking. These checks pick out the ones
+# that still need the user's OK. They read the command as written; they are a safety net,
+# not a sandbox (a script can do whatever it contains).
+
+_ADMIN = {"sudo", "su", "doas", "pkexec", "runuser", "proot", "chroot"}
+_SYSTEM = {"shutdown", "reboot", "poweroff", "halt", "systemctl", "service", "init", "telinit",
+           "loginctl", "pkill", "killall", "xkill", "mkfs", "mkswap", "wipefs", "fdisk", "sfdisk",
+           "gdisk", "parted", "mount", "umount", "losetup", "swapon", "swapoff", "shred",
+           "blkdiscard"}
+_ACCOUNTS = {"ssh", "scp", "sftp", "gh", "az", "aws", "gcloud", "kubectl", "crontab", "passwd",
+             "chsh", "chpasswd", "useradd", "usermod", "userdel", "adb"}
+_WRAPPERS = {"env", "nohup", "nice", "time", "timeout", "xargs", "exec", "command", "builtin",
+             "stdbuf", "setsid", "ionice", "watch", "flock"}
+_WRITERS = {"rm", "rmdir", "unlink", "mv", "chmod", "chown", "chgrp", "truncate", "touch", "tee",
+            "mkdir"}
+_DEST_LAST = {"cp", "rsync", "install", "ln"}
+_REDIRECTS = {">", ">>", ">|", "&>", "&>>", "<>", ">&"}
+_SCRATCH = ("/tmp", "/var/tmp", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/fd", "/proc/self")
+_PRIVATE = ("/sdcard", "/storage", "/data", "/mnt", "/media", "/root", "/etc/shadow",
+            "/etc/gshadow", "/etc/sudoers")
+_WHOLE = {"*", ".", "./", "./*", "*/", ".*", "./.*"}
+_PATH_END = r"(?=$|[\s'\"`;|&()<>])"
+_PATH_REST = r"(?:/[^\s'\"`;|&()<>]*)?"
+
+
+def _under(p: str, base: str) -> bool:
+    return p == base or p.startswith(base.rstrip("/") + "/")
+
+
+def _place(arg: str, cwd: str, root: str, home: str) -> str | None:
+    """'workspace' (or a scratch place), 'private' (home, phone storage), 'system', or None
+    when it can't be told (it starts with a variable)."""
+    if arg.startswith("~"):
+        if arg != "~" and not arg.startswith("~/"):
+            return "private"  # another user's home
+        arg = home + arg[1:]
+    elif m := re.match(r"\$(HOME\b|\{HOME\})", arg):
+        arg = home + arg[m.end():]
+    elif arg.startswith(("$", "`")):
+        return None
+    p = os.path.normpath(os.path.join(cwd, arg))
+    if _under(p, root) or _under(os.path.realpath(p), root) or any(_under(p, s) for s in _SCRATCH):
+        return "workspace"
+    if _under(p, home) or any(_under(p, s) for s in _PRIVATE):
+        return "private"
+    return "system"
+
+
+def _strip_heredocs(text: str) -> str:
+    """Drops here-document bodies (file contents, not commands)."""
+    out, pending = [], []
+    for line in text.split("\n"):
+        if pending:
+            delim, tabs = pending[0]
+            if (line.lstrip("\t") if tabs else line) == delim:
+                pending.pop(0)
+            continue
+        out.append(line)
+        for m in re.finditer(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2", line):
+            pending.append((m.group(3), m.group(1) == "-"))
+    return "\n".join(out)
+
+
+def _opt_value(args: list[str], flags: tuple[str, ...]) -> str:
+    for i, a in enumerate(args):
+        if a in flags and i + 1 < len(args):
+            return args[i + 1]
+        for f in flags:
+            if f.startswith("--") and a.startswith(f + "="):
+                return a[len(f) + 1:]
+    return ""
+
+
+def _short(path: str, cwd: str = "/") -> str:
+    """A path as the user should read it: absolute, with ~ for home, at most 60 characters."""
+    if not path.startswith(("$", "`", "~")):
+        path = _home(os.path.normpath(os.path.join(cwd, path)))
+    return path if len(path) <= 60 else path[:59] + "…"
+
+
+def command_risk(command: str, root, home: str | None = None) -> str | None:
+    """Why a command needs the user's OK, or None if it looks routine."""
+    return _risk(command, str(root), home or os.path.expanduser("~"), 0)
+
+
+def _risk(text: str, root: str, home: str, depth: int) -> str | None:
+    if depth > 3:
+        return None
+    if re.search(r"\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(\w*sh|python3?)\b"
+                 r"|\b(\w*sh|source|\.)\s+<\(\s*(curl|wget)\b", text):
+        return "It runs a script straight from the internet."
+    # Paths in the user's home or phone storage, wherever they appear (also inside quoted
+    # scripts and here-documents).
+    refs = [r"(?<![\w~./:$-])~" + _PATH_REST + _PATH_END,
+            r"\$(?:HOME\b|\{HOME\})" + _PATH_REST,
+            r"(?<![\w.:/-])" + re.escape(home) + _PATH_REST + _PATH_END if home not in ("", "/") else "",
+            r"(?<![\w.:/~-])/(?:sdcard|storage|data|mnt|media|root|etc/shadow|etc/gshadow|"
+            r"etc/sudoers)" + _PATH_REST + _PATH_END]
+    for pattern in filter(None, refs):
+        for m in re.finditer(pattern, text):
+            if _place(m.group(0), root, root, home) == "private":
+                return f"It uses files outside the workspace ({_short(m.group(0))})."
+    try:
+        lex = shlex.shlex(_strip_heredocs(text).replace("\\\n", " ").replace("\n", " ; "),
+                          posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return None
+    cwd, words, targets = root, [], []
+    i = 0
+    while i <= len(tokens):
+        tok = tokens[i] if i < len(tokens) else ";"
+        if tok in _REDIRECTS and i + 1 < len(tokens):
+            targets.append(tokens[i + 1])
+            i += 2
+            continue
+        if tok == "$":
+            i += 1
+            continue
+        if _starts_command(tok) or tok == ")":
+            reason, cwd = _risk_simple(words, targets, cwd, root, home, depth)
+            if reason:
+                return reason
+            words, targets = [], []
+        else:
+            words.append(tok)
+        i += 1
+    return None
+
+
+def _risk_simple(words, targets, cwd, root, home, depth) -> tuple[str | None, str]:
+    for t in targets:
+        if not re.fullmatch(r"\d+|-", t) and _place(t, cwd, root, home) in ("private", "system"):
+            return f"It writes to {_short(t, cwd)}, outside the workspace.", cwd
+    while words and _ASSIGNMENT.match(words[0]):
+        words = words[1:]
+    while words and os.path.basename(words[0]) in _WRAPPERS:
+        wrapper, words = os.path.basename(words[0]), words[1:]
+        while words and (words[0].startswith("-") or _ASSIGNMENT.match(words[0])
+                         or (wrapper == "timeout" and re.fullmatch(r"[\d.]+[smhd]?", words[0]))):
+            words = words[1:]
+    for w in words:
+        for inner in re.findall(r"`([^`]*)`", w):
+            if reason := _risk(inner, root, home, depth + 1):
+                return reason, cwd
+    if not words:
+        return None, cwd
+    prog, args = os.path.basename(words[0]), words[1:]
+    opts = [a for a in args if a.startswith("-")]
+    plain = [a for a in args if not a.startswith("-")]
+    if prog in _ADMIN:
+        return f"It asks for admin (root) rights with {prog}.", cwd
+    if prog in _SYSTEM or prog.startswith("mkfs."):
+        return f"It can stop programs or change the system ({prog}).", cwd
+    if prog == "kill" and any(not re.fullmatch(r"\$!|%\d*|\"?\$\{?\w+\}?\"?", a) for a in plain):
+        return "It stops a program that is running.", cwd
+    if prog in _ACCOUNTS or (prog == "git" and plain[:1] == ["push"]):
+        return f"It uses your accounts or another computer ({prog}).", cwd
+    if prog == "git" and plain[:1] == ["config"] and ("--global" in opts or "--system" in opts):
+        return "It changes your git settings.", cwd
+    sub = plain[0] if plain else ""
+    if ((prog in ("apt", "apt-get", "aptitude", "snap", "flatpak")
+         and sub in ("install", "reinstall", "remove", "purge", "autoremove", "upgrade",
+                     "full-upgrade", "dist-upgrade", "build-dep", "uninstall"))
+            or (prog == "dpkg" and set(opts) & {"-i", "--install", "-r", "--remove", "-P",
+                                                  "--purge", "--configure", "--unpack"})):
+        return "It installs or removes system software.", cwd
+    pip = prog in ("pip", "pip3") or (re.fullmatch(r"python[\d.]*", prog) and args[:2] == ["-m", "pip"])
+    if pip and (plain[1:2] if prog.startswith("python") else plain[:1]) in (["install"], ["uninstall"]):
+        return "It installs or removes Python packages.", cwd
+    if (prog == "npm" and sub in ("install", "i", "uninstall") and set(opts) & {"-g", "--global"}) \
+            or (prog in ("gem", "cargo") and sub in ("install", "uninstall")):
+        return f"It installs software outside the workspace ({prog}).", cwd
+    if prog in ("bash", "sh", "dash", "zsh") and "-c" in args[:-1]:
+        if reason := _risk(args[args.index("-c") + 1], root, home, depth + 1):
+            return reason, cwd
+    if prog == "eval" and (reason := _risk(" ".join(args), root, home, depth + 1)):
+        return reason, cwd
+    if prog in ("cd", "pushd"):
+        dest = plain[0] if plain else "~"
+        where = _place(dest, cwd, root, home) if dest != "-" else None
+        if where == "private":
+            return f"It works in {_short(dest, cwd)}, outside the workspace.", cwd
+        if where is not None:
+            cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(dest)))
+        return None, cwd
+    if prog == "rm" and cwd == root and _WHOLE & set(plain):
+        return "It deletes everything in the workspace.", cwd
+    paths: list[str] = []
+    if prog in _WRITERS:
+        paths = plain
+    elif prog in _DEST_LAST:
+        paths = [_opt_value(args, ("-t", "--target-directory"))] if \
+            _opt_value(args, ("-t", "--target-directory")) else plain[-1:]
+    elif prog == "sed" and any(o.startswith(("-i", "--in-place")) for o in opts):
+        paths = plain if "-e" in opts or "-f" in opts else plain[1:]
+    elif prog == "dd":
+        paths = [a[3:] for a in args if a.startswith("of=")]
+    elif prog == "tar":
+        paths = [_opt_value(args, ("-C", "--directory"))]
+    elif prog == "unzip":
+        paths = [_opt_value(args, ("-d",))]
+    elif prog == "wget":
+        paths = [_opt_value(args, ("-O", "-P", "--output-document", "--directory-prefix"))]
+    elif prog == "curl":
+        paths = [_opt_value(args, ("-o", "--output", "--output-dir"))]
+    elif prog == "find" and ("-delete" in args or "-exec" in args or "-execdir" in args):
+        paths = list(itertools.takewhile(lambda a: not a.startswith(("-", "(", "!")), args))
+    for p in paths:
+        if p and _place(p, cwd, root, home) in ("private", "system"):
+            return f"It changes files outside the workspace ({_short(p, cwd)}).", cwd
+    for a in args:
+        if ".." in a.split("/") and _place(a, cwd, root, home) == "private":
+            return f"It uses files outside the workspace ({_short(a, cwd)}).", cwd
+    return None, cwd
+
+
+# Big downloads ask first: these thresholds, plus pip packages that are known to be huge
+# (or to pull in something huge, usually PyTorch) or to compile for a long time on ARM.
+BIG_APT_DOWNLOAD = 100e6
+BIG_APT_DISK = 300e6
+BIG_PIP_BYTES = 50e6
+BIG_PIP = {
+    "torch", "torchvision", "torchaudio", "tensorflow", "tensorflow-cpu", "tf-nightly", "keras-nlp",
+    "jax", "jaxlib", "paddlepaddle", "paddleocr", "mxnet", "onnxruntime-gpu", "opencv-python",
+    "opencv-contrib-python", "opencv-python-headless", "opencv-contrib-python-headless",
+    "pyspark", "vllm", "xformers", "triton", "easyocr", "ultralytics", "sentence-transformers",
+    "openai-whisper", "accelerate", "timm", "mediapipe", "dlib", "llama-cpp-python", "playwright",
+    "spacy", "gradio", "streamlit", "bitsandbytes", "deepspeed", "nemo-toolkit",
+}
+
+
+def apt_big_reason(plan: dict) -> str | None:
+    if plan.get("remove"):
+        return f"It would also remove {', '.join(plan['remove'][:8])}."
+    if (plan.get("download_bytes") or 0) >= BIG_APT_DOWNLOAD:
+        return f"It's a big download ({human_size(plan['download_bytes'])})."
+    if (plan.get("disk_bytes") or 0) >= BIG_APT_DISK:
+        return f"It takes a lot of space ({human_size(plan['disk_bytes'])})."
+    return None
+
+
+def _pip_norm(spec: str) -> str:
+    return re.sub(r"[-_.]+", "-", re.split(r"[\[=<>~!;@ ]", spec, 1)[0]).lower()
+
+
+def _pip_pick(files: list[dict]) -> tuple[int, bool]:
+    """(size of the file pip would download here, whether it must be compiled)."""
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    wheels = [f for f in files if f.get("packagetype") == "bdist_wheel"]
+    native = [f for f in wheels if "aarch64" in f["filename"] and "musllinux" not in f["filename"]
+              and (tag in f["filename"] or "abi3" in f["filename"] or "-py3-none-" in f["filename"])]
+    for pick in (native, [f for f in wheels if f["filename"].endswith("-none-any.whl")]):
+        if pick:
+            return max(int(f.get("size") or 0) for f in pick), False
+    sdist = max((int(f.get("size") or 0) for f in files if f.get("packagetype") == "sdist"), default=0)
+    return sdist, bool(wheels)  # built for other machines but not this one: pip compiles it
+
+
+def _pip_info(name: str, timeout: float) -> tuple[int, bool] | None:
+    """_pip_pick() for the latest release on PyPI, or None if PyPI doesn't answer."""
+    try:
+        req = urllib.request.Request(f"https://pypi.org/pypi/{urllib.parse.quote(name)}/json",
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read(16 * 1024 * 1024))
+        return _pip_pick(data.get("urls") or [])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def pip_big_reason(pkgs: list[str], timeout: float = 6.0) -> str | None:
+    names = list(dict.fromkeys(_pip_norm(p) for p in pkgs))
+    known = [n for n in names if n in BIG_PIP]
+    if known:
+        return (f"{', '.join(known)} {'is' if len(known) == 1 else 'are'} large: often hundreds "
+                "of MB with what it needs, and slow to install here.")
+    found: dict[str, tuple[int, bool]] = {}
+
+    def look(name: str) -> None:
+        info = _pip_info(name, timeout)
+        if info is not None:  # no answer: don't hold the install up
+            found[name] = info
+
+    threads = [threading.Thread(target=look, args=(n,), daemon=True) for n in names[:20]]
+    for t in threads:
+        t.start()
+    end = time.monotonic() + timeout + 1
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+    big = [f"{n} ({human_size(size)})" for n, (size, _) in found.items() if size >= BIG_PIP_BYTES]
+    if big:
+        return f"It's a big download: {', '.join(big)}."
+    built = [n for n, (_, compiled) in found.items() if compiled]
+    if built:
+        return (f"{', '.join(built)} {'has' if len(built) == 1 else 'have'} no ready-made build "
+                "for this phone, so pip compiles it, which can take a long time.")
+    return None
 
 
 def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
@@ -1079,7 +1477,7 @@ FILE_TOOLS = [
         {"path": {**_S, "description": "Folder path relative to the workspace"}}, ["path"]),
     _fn("move_path", "Move or rename a file or folder inside the workspace.",
         {"source": _S, "destination": _S}, ["source", "destination"]),
-    _fn("delete_path", "Delete a file or folder from the workspace (the user is asked first).",
+    _fn("delete_path", "Delete a file or folder from the workspace (it goes to the Trash).",
         {"path": _S}, ["path"]),
 ]
 DOWNLOAD_TOOL = _fn(
@@ -1093,15 +1491,17 @@ FILE_RESULT_TOOLS = {"write_file", "download_file", "make_directory", "move_path
 _LIST = {"type": "array", "items": _S}
 PROGRAM_TOOLS = [
     _fn("run_command", "Run a bash command in the workspace folder and get its output and exit "
-        "code. The user must approve every command, so do related steps in one command or script. "
-        "There is no keyboard input; use non-interactive options.",
+        "code. Routine commands run right away; the user is asked first only for risky ones "
+        "(admin rights, files outside the workspace, stopping programs). Do related steps in "
+        "one command or script. There is no keyboard input; use non-interactive options.",
         {"command": {**_S, "description": "The bash command or script"},
          "why": {**_S, "description": "One short sentence telling the user what it does and why"},
          "timeout_seconds": {"type": "integer", "description": "Default 300, up to 1800 for slow jobs"}},
         ["command", "why"]),
-    _fn("install_packages", "Ask the user to install missing software: Debian packages with apt "
+    _fn("install_packages", "Install missing software: Debian packages with apt "
         "(programs such as tesseract-ocr, ffmpeg, pandoc, img2pdf) or Python packages with pip "
-        "(into the Python that run_command's python3 uses).",
+        "(into the Python that run_command's python3 uses). Small installs run right away; the "
+        "user is asked first for big ones.",
         {"packages": {**_LIST, "description": "Package names, e.g. [\"tesseract-ocr\"]"},
          "manager": {**_S, "enum": ["apt", "pip"], "description": "Default apt"},
          "why": {**_S, "description": "One short sentence telling the user why they are needed"}},
@@ -1126,20 +1526,23 @@ def _as_list(value) -> list[str]:
 class ToolBox:
     def __init__(self, workspace: Workspace, web: bool = True, files: bool = True,
                  commands: bool = False,
-                 approve: Callable[[str, str, str, str], bool] | None = None):
+                 approve: Callable[..., bool] | None = None,
+                 auto_approve: Callable[[], bool] | None = None):
         self.ws = workspace
         self.web = web
         self.files = files
         self.commands = commands
-        # approve(title, detail, code, action_label) -> bool. Asked before every command and
-        # install, regardless of the "ask before replacing files" setting. Default: refuse.
-        self.approve = approve or (lambda title, detail, code, action: False)
+        # approve(title, detail, code, action_label, reason) -> bool; reason says why a
+        # command or install needs an OK even when routine ones don't. Default: refuse.
+        self.approve = approve or (lambda title, detail, code, action, reason="": False)
+        # auto_approve() -> True lets routine commands and small installs run without asking.
+        # Risky commands and big installs ask whatever it says. Default: ask for everything.
+        self.auto_approve = auto_approve or (lambda: False)
         # Set by the agent for each turn.
         self.cancel: threading.Event | None = None
         self.status: Callable[[str], None] = lambda text: None
         # Once the user says no, nothing else is asked in that turn: the model has to reply.
         self.declined = False
-        self._made: dict[str, Path] = {}
 
     def schemas(self) -> list[dict]:
         out = []
@@ -1177,9 +1580,12 @@ class ToolBox:
     def _cancelled(self) -> bool:
         return self.cancel is not None and self.cancel.is_set()
 
-    def _ask(self, title: str, detail: str, code: str, action: str, refused: str) -> None:
+    def _ask(self, title: str, detail: str, code: str, action: str, refused: str,
+             reason: str | None = None) -> None:
         self._check_declined()
-        if not self.approve(title, detail, code, action):
+        if reason is None and self.auto_approve():
+            return
+        if not self.approve(title, detail, code, action, reason or ""):
             self.declined = True
             raise ToolError(refused + " Don't try a workaround now; ask the user what they "
                             "would like to do.")
@@ -1206,7 +1612,7 @@ class ToolBox:
         if missing:
             raise ToolError(_missing_hint(missing) + " The command was not run.")
         self._ask("Run this command?", detail, command.strip(), "Run",
-                  "The user said no to this command.")
+                  "The user said no to this command.", command_risk(command, self.ws.root))
         if self._cancelled():
             raise ToolError("Stopped by the user.")
         before = _snapshot(self.ws.root)
@@ -1220,7 +1626,8 @@ class ToolBox:
             shown = ", ".join(f"{p} ({human_size(self._size(p))})" for p in changed[:15])
             more = f" and {len(changed) - 15} more" if len(changed) > 15 else ""
             notes.append(f"Files created or changed in the workspace: {shown}{more}.")
-            self._made[command] = self.ws.root / changed[0]
+            for p in changed[:200]:
+                self.ws.mark_own(self.ws.root / p)
         if deleted:
             notes.append(f"Files deleted: {', '.join(deleted[:15])}"
                          + (f" and {len(deleted) - 15} more." if len(deleted) > 15 else "."))
@@ -1235,7 +1642,7 @@ class ToolBox:
             hint = ""
             if rc == 127 or re.search(r"command not found|No such file or directory", out[-600:]):
                 hint = ("\nIf a program is missing, check_programs shows what's installed and "
-                        "install_packages can ask the user to install it.")
+                        "install_packages can install it.")
             raise ToolError(f"The command failed with exit code {rc}.\n{body}{tail}{hint}")
         return f"Exit code 0.\n{body}{tail}"
 
@@ -1299,7 +1706,7 @@ class ToolBox:
         if plan.get("remove"):
             detail += f"\nWarning: this would also remove {', '.join(plan['remove'])}."
         self._ask("Install software?", detail, "apt install " + " ".join(missing), "Install",
-                  f"The user said no to installing {', '.join(missing)}.")
+                  f"The user said no to installing {', '.join(missing)}.", apt_big_reason(plan))
         # Once apt has downloaded everything, dpkg changes the system: Stop must not cut it off.
         # Checked on every chunk of output, since the status line only shows some lines.
         state = {"dpkg": False, "tail": ""}
@@ -1360,8 +1767,12 @@ class ToolBox:
                     return f"Already installed for python3: {', '.join(pkgs)}."
         detail = (f"{why}\n\nFrom PyPI, into Qwen's own Python environment "
                   f"({_home(venv)}); the rest of the system is not changed.")
+        reason = None
+        if self.auto_approve():  # only worth a lookup when the answer decides whether to ask
+            self.status("Checking the download size…")
+            reason = pip_big_reason(pkgs)
         self._ask("Install Python packages?", detail, "pip install " + " ".join(pkgs), "Install",
-                  f"The user said no to installing {', '.join(pkgs)}.")
+                  f"The user said no to installing {', '.join(pkgs)}.", reason)
         if not py.exists():
             self.status("Creating Qwen's Python environment…")
             self._make_venv(venv)
@@ -1510,20 +1921,44 @@ class ToolBox:
             return f"{tried[name]} {obj}"
         return f"{now if running else done} {obj}"
 
-    def result_path(self, name: str, args: dict) -> Path | None:
-        """Workspace path a successful tool call produced, for 'Open' buttons."""
+    def label(self, name: str, args: dict, running: bool = False, ok: bool = True) -> str:
+        """describe(), with workspace paths shown relative to it."""
+        text = self.describe(name, args, running, ok)
+        root = str(self.ws.root)
+        return text.replace(root + "/", "").replace(root, "the workspace").replace(
+            os.path.expanduser("~") + "/", "~/")
+
+    def result_paths(self, name: str, args: dict, result: str = "") -> list[Path]:
+        """Workspace files or folders a successful tool call produced, for 'Open' buttons."""
         if name == "run_command":
-            p = self._made.get(str((args or {}).get("command", "")))
-            return p if p is not None and p.exists() else None
+            # Read back from the result, so this also works for chats opened later.
+            m = re.search(r"^Files created or changed in the workspace: (.*)$", result or "", re.M)
+            found = []
+            for rel in re.findall(r"(?:^|, )(.+?) \([\d.]+ (?:bytes|KB|MB|GB)\)", m.group(1) if m else ""):
+                parts = Path(rel).parts
+                if any(x.startswith(".") or x in ("__pycache__", "node_modules") for x in parts):
+                    continue
+                p = self.ws.root / rel
+                if p.is_file() and p.resolve().is_relative_to(self.ws.root):
+                    found.append(p)
+            return found[:5]
         key = {"write_file": "path", "make_directory": "path", "move_path": "destination",
                "download_file": "path"}.get(name)
         if not key:
-            return None
+            return []
         val = (args or {}).get(key) or ""
         if name == "download_file" and not val:
             val = os.path.basename(urllib.parse.urlsplit(str(args.get("url", ""))).path)
         try:
             p = self.ws.resolve(str(val))
         except ToolError:
-            return None
-        return p if p.exists() else None
+            return []
+        if name == "move_path" and p.is_dir():  # moved into a folder
+            src = os.path.basename(str((args or {}).get("source", "")).rstrip("/"))
+            if src and (p / src).exists():
+                p = p / src
+        return [p] if p.exists() else []
+
+    def result_path(self, name: str, args: dict, result: str = "") -> Path | None:
+        paths = self.result_paths(name, args, result)
+        return paths[0] if paths else None

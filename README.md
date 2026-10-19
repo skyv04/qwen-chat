@@ -7,8 +7,8 @@ Adreno GPU through llama.cpp (Vulkan). Built for Debian in PRoot on Termux with 
 
 - Desktop icon or the **Qwen Chat** menu entry
 - `qwen-chat` in a terminal
-- `qwen-chat --ask "question"` for a one-off answer in the terminal (commands and
-  installs ask `[y/N]` first; `--yes` allows them without asking)
+- `qwen-chat --ask "question"` for a one-off answer in the terminal (risky commands and
+  big installs ask `[y/N]` first; `--yes` allows them without asking)
 
 When the app opens, it starts the model server (`~/.local/bin/qwen-server`) if one isn't
 already running. When you close the app, it stops the server again, but only if the app
@@ -23,13 +23,18 @@ started it.
 - **Files**: list, read, write, move and delete files, plus create folders, all inside the
   workspace folder only.
 - **Run** (needs Files on): Qwen can run shell commands in the workspace, for example to
-  convert images, merge PDFs, run OCR or a Python script. When a task needs a program it
-  doesn't have, it asks to install it: Debian packages with apt, or Python packages with
-  pip. Every command and install shows a card with the exact command (and, for apt, the
-  download and disk size) and waits for **Run**/**Install** or **Don't allow**. To stop
-  pressing **Run** for every command in a chat, turn on menu → *Run Commands Without
-  Asking (This Chat)*. The Run button then reads **Auto-run**. The choice is saved with
-  that chat only, and installs still ask.
+  convert images, merge PDFs, run OCR or a Python script, and install the programs a task
+  needs: Debian packages with apt, or Python packages with pip. Routine commands and small
+  installs run right away. Risky commands and big installs (see *Safety model*) show a card
+  with the reason, the exact command and **Run**/**Install** or **Don't allow**.
+- Steps show what they're for, with the command underneath. Click a step to see its
+  output; files it made get **Open** buttons. When an answer is done, three or more steps
+  fold into one line such as "4 steps · Wrote a file, ran a command…". Files Qwen made or
+  changed are listed under the answer as chips that open them.
+- A replaced or deleted file goes to the Trash first. Its step shows **Restore**, which
+  puts the old version back.
+- You can type while Qwen works: **Enter** queues the message ("Next: …") and sends it when
+  the answer is done. **Edit** takes it back into the box; **×** drops it.
 - Long files are written in parts: one reply holds at most about 4,000 tokens, so Qwen is
   told to keep each tool call under about 8,000 characters and append the rest. If a call
   is cut off anyway, nothing is written. Qwen is told why and tries again in parts, and
@@ -37,9 +42,10 @@ started it.
 - **Think**: optional step-by-step reasoning, shown in a collapsible "Thoughts" section.
 - Attach files with the paperclip button or drag and drop. They're copied into
   `workspace/attachments`.
-- Chats are saved, with a sidebar to switch, delete and undo a delete.
+- Chats are saved, with a sidebar grouped by date (Today, Yesterday, …) to switch, delete
+  and undo a delete.
 - Status line: reading progress, then the live GPU busy percentage, tokens per second,
-  and how much of the context window is used.
+  and how much of the context window is used. Each answer ends with how long it took.
 - Stop at any time; the partial answer is kept.
 - Light, dark and system color schemes.
 
@@ -47,13 +53,33 @@ started it.
 
 - Every file path is resolved and must stay inside the workspace. Paths that escape with
   `..`, absolute paths or symlinks are refused.
-- By default, overwriting or deleting a file needs your approval (menu → *Ask Before
-  Replacing or Deleting Files*).
-- Commands and installs need your approval, whatever that setting says, except commands in
-  a chat where you turned on *Run Commands Without Asking (This Chat)*. Installs always
-  ask. There is no sandbox beyond that: a command runs in the workspace with your account's
-  access, so read the command before you click **Run** (expand a "Ran …" step to see the
-  exact command that ran). Commands have no keyboard input
+- Overwriting or deleting a file you had (not one Qwen wrote in this session) first moves
+  the old file to the desktop Trash (`~/.local/share/Trash`), so **Restore** or the file
+  manager can bring it back. To be asked first as well, turn on menu → *Ask Before
+  Replacing or Deleting Files*.
+- Routine commands run without asking. A command asks first, with the reason on the card,
+  when it:
+  - uses files outside the workspace (your home folder, `~`, `/sdcard`, `/storage`,
+    `/data`, `/mnt`, `/media`, `/root`, or private files in `/etc`), apart from scratch
+    places such as `/tmp` and `/dev/null`;
+  - writes outside the workspace, deletes everything in it, or pipes a download into a
+    shell (`curl … | sh`);
+  - uses `sudo`/`su`, stops programs or changes the system (`kill`, `systemctl`, `mount`,
+    …), uses your accounts or other computers (`ssh`, `gh`, `git push`, …), changes git
+    settings, or installs software directly (`apt`, `pip`, `npm -g`) instead of through
+    the install tool.
+- Installs run without asking unless they're big:
+  - apt: a download of 100 MB or more, 300 MB or more on disk, or a plan that would remove
+    packages;
+  - pip: a package on the known-big list (torch, tensorflow, opencv, …), a download of
+    50 MB or more, or one with no ready-made build for this phone, so pip would compile it.
+  The card shows the size (apt also shows the download and disk size).
+- To approve every command and install yourself, turn on menu → *Ask Before Every
+  Command*. Cards for routine commands then also offer **Allow All in This Chat**, which
+  lets that chat run routine commands and small installs without asking again. Risky
+  commands and big installs still ask.
+- There is no sandbox beyond that: a command runs in the workspace with your account's
+  access. Expand a step to see the exact command that ran. Commands have no keyboard input
   and are stopped after 5 minutes (Qwen can ask for up to 30), or when you click Stop.
 - If you click **Don't allow**, Qwen isn't allowed to call any more tools in that reply.
   It has to answer in words, so it can't try a workaround behind your back.
@@ -77,8 +103,9 @@ started it.
 | `server_url` | `http://127.0.0.1:8080` | llama-server address |
 | `server_command` | `["~/.local/bin/qwen-server"]` | How to start the server |
 | `context_size` | `16384` | Context window for a server the app starts |
-| `confirm_changes` | `true` | Ask before overwriting or deleting |
-| `commands` | `true` | Let Qwen ask to run commands and install programs (the **Run** button) |
+| `commands` | `true` | Let Qwen run commands and install programs (the **Run** button) |
+| `ask_commands` | `false` | Ask before every command and install, not only risky commands and big installs (menu → *Ask Before Every Command*) |
+| `ask_file_changes` | `false` | Also ask before overwriting or deleting a file, on top of the Trash backup (menu → *Ask Before Replacing or Deleting Files*) |
 | `stop_server_on_exit` | `true` | Stop the server on quit, if the app started it (menu → *Unload Model When Closing*) |
 
 Chats are stored in `~/.local/share/qwen-chat/chats`. The server log is

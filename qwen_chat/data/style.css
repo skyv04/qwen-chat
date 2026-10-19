@@ -25,6 +25,12 @@
 .chat-row .row-delete:hover {
   opacity: 1;
 }
+.chat-group-header {
+  padding: 14px 12px 4px 14px;
+  font-size: 0.78em;
+  font-weight: bold;
+  color: alpha(@window_fg_color, 0.55);
+}
 .workspace-button {
   margin: 6px;
   padding: 8px 10px;
@@ -87,6 +93,17 @@ button.suggestion image {
 .msg-tools button:hover {
   opacity: 1;
 }
+/* The copy button under your own messages shows up on hover. */
+.user-row .msg-tools button {
+  opacity: 0;
+}
+.user-row:hover .msg-tools button {
+  opacity: 0.55;
+}
+.user-row .msg-tools button:hover,
+.user-row .msg-tools button:focus-visible {
+  opacity: 1;
+}
 .small-button {
   min-width: 28px;
   min-height: 28px;
@@ -103,6 +120,29 @@ button.suggestion image {
 }
 .turn-status {
   margin-left: 30px;
+}
+.turn-status .elapsed {
+  font-feature-settings: "tnum";
+}
+.turn-files {
+  margin-left: 30px;
+}
+button.file-chip {
+  padding: 4px 12px;
+  min-height: 28px;
+  border-radius: 999px;
+  background-color: @card_bg_color;
+  box-shadow: inset 0 0 0 1px alpha(@borders, 1);
+  font-weight: normal;
+}
+button.file-chip:hover {
+  background-color: mix(@card_bg_color, @accent_bg_color, 0.08);
+}
+button.file-chip image {
+  color: @accent_color;
+}
+button.folder-chip {
+  padding: 4px 9px;
 }
 
 .markdown label {
@@ -181,15 +221,56 @@ button.suggestion image {
   border-color: alpha(@warning_color, 0.45);
 }
 .tool-header {
-  padding: 6px 10px;
+  padding: 5px 6px 5px 10px;
+  min-height: 30px;
   border-radius: 10px;
-  font-weight: normal;
+}
+.tool-header:hover {
+  background-color: alpha(@window_fg_color, 0.04);
+}
+.tool-expander {
+  min-width: 24px;
+  min-height: 24px;
+  color: alpha(@window_fg_color, 0.55);
 }
 .tool-header .tool-icon {
   color: @accent_color;
 }
 .tool-body {
   padding: 2px 12px 10px 12px;
+}
+.tool-subtitle {
+  font-size: 0.8em;
+  color: alpha(@window_fg_color, 0.55);
+}
+.tool-card image.success {
+  opacity: 0.6;
+}
+.tool-group.folded {
+  border-radius: 10px;
+  border: 1px solid alpha(@borders, 0.9);
+  background-color: alpha(@card_bg_color, 0.6);
+}
+.tool-group.folded .group-steps {
+  padding: 2px 6px 6px 6px;
+}
+.group-header {
+  padding: 6px 10px;
+  border-radius: 10px;
+  font-weight: normal;
+}
+.group-header .tool-icon {
+  color: @accent_color;
+}
+.group-count {
+  font-weight: bold;
+}
+.group-failed {
+  font-size: 0.85em;
+  color: @warning_color;
+}
+button.restore-button {
+  color: @accent_color;
 }
 .tool-result {
   font-family: monospace;
@@ -221,9 +302,27 @@ image.warning {
   background-color: alpha(@warning_color, 0.12);
   border: 1px solid alpha(@warning_color, 0.4);
 }
+.confirm-card.routine {
+  background-color: alpha(@accent_bg_color, 0.08);
+  border-color: alpha(@accent_color, 0.35);
+}
 .confirm-card.answered {
-  background-color: alpha(@window_fg_color, 0.04);
+  padding: 6px 12px;
+  background-color: alpha(@window_fg_color, 0.03);
   border-color: alpha(@borders, 0.9);
+}
+.confirm-card.answered .heading {
+  font-weight: normal;
+  color: alpha(@window_fg_color, 0.7);
+}
+.confirm-reason {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background-color: alpha(@warning_color, 0.16);
+  font-weight: bold;
+}
+.confirm-reason image {
+  color: @warning_color;
 }
 .confirm-code {
   padding: 8px 10px;
@@ -243,6 +342,16 @@ image.warning {
 /* ---------------------------------------------------------------- composer */
 .composer-area {
   padding: 4px 16px 6px 16px;
+}
+.queue-bar {
+  margin: 0 6px 8px 6px;
+  padding: 4px 6px 4px 12px;
+  border-radius: 12px;
+  background-color: alpha(@accent_bg_color, 0.10);
+  border: 1px solid alpha(@accent_color, 0.3);
+}
+.queue-bar > image {
+  color: @accent_color;
 }
 .composer {
   padding: 4px 8px 8px 6px;

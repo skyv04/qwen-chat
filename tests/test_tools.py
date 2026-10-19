@@ -17,7 +17,7 @@ class WorkspaceSandboxTest(unittest.TestCase):
         self.outside = base / "outside"
         self.outside.mkdir()
         (self.outside / "secret.txt").write_text("top secret")
-        self.ws = Workspace(base / "ws")
+        self.ws = Workspace(base / "ws", trash_dir=base / "trash")
         self.box = ToolBox(self.ws, web=False, files=True)
 
     def tearDown(self):
@@ -71,6 +71,30 @@ class WorkspaceSandboxTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue((self.ws.root / "a.txt").exists())
         self.assertEqual(len(asked), 2)
+
+    def test_replaced_and_deleted_files_go_to_the_trash(self):
+        trashed = []
+        self.ws.on_trash = lambda original, t: trashed.append((original, t))
+        (self.ws.root / "mine.txt").write_text("the user's")
+        ok, out = self.run_tool("write_file", path="mine.txt", content="Qwen's")
+        self.assertTrue(ok, out)
+        self.assertIn("old version is in the Trash", out)
+        original, t = trashed[0]
+        self.assertEqual((original, t.read_text()), (self.ws.root / "mine.txt", "the user's"))
+        info = (self.ws.trash_dir / "info" / (t.name + ".trashinfo")).read_text()
+        self.assertIn("Path=" + str(self.ws.root / "mine.txt"), info)
+        # Qwen's own unchanged file is replaced without a Trash copy.
+        self.run_tool("write_file", path="mine.txt", content="Qwen's again")
+        self.assertEqual(len(trashed), 1)
+        ok, out = self.run_tool("delete_path", path="mine.txt")
+        self.assertTrue(ok, out)
+        self.assertIn("Trash", out)
+        self.assertFalse((self.ws.root / "mine.txt").exists())
+        # A second trashed file of the same name doesn't overwrite the first.
+        self.assertEqual(len({t.name for _, t in trashed}), 2)
+        self.ws.restore(*trashed[0])
+        self.assertEqual((self.ws.root / "mine.txt").read_text(), "the user's")
+        self.assertFalse(trashed[0][1].exists())
 
     def test_read_paging_and_binary(self):
         (self.ws.root / "big.txt").write_text("\n".join("x" * 100 for _ in range(500)))
@@ -131,16 +155,18 @@ class HtmlExtractTest(unittest.TestCase):
 class ProgramToolsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ws = Workspace(Path(self.tmp.name) / "ws")
+        self.ws = Workspace(Path(self.tmp.name) / "ws", trash_dir=Path(self.tmp.name) / "trash")
         self.asked = []
+        self.reasons = []
         self.allow = True
         self.box = ToolBox(self.ws, web=False, files=True, commands=True, approve=self._approve)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _approve(self, title, detail, code, action):
+    def _approve(self, title, detail, code, action, reason=""):
         self.asked.append((title, detail, code, action))
+        self.reasons.append(reason)
         return self.allow
 
     def run_tool(self, name, **args):
@@ -201,7 +227,59 @@ class ProgramToolsTest(unittest.TestCase):
         self.assertTrue(ok, out)
         self.assertIn(str(self.ws.root), out)
         self.assertIn("out.txt", out)
-        self.assertEqual(self.box.result_path("run_command", {"command": cmd}), self.ws.root / "out.txt")
+        self.assertEqual(self.box.result_paths("run_command", {"command": cmd}, out),
+                         [self.ws.root / "out.txt"])
+        result = ("Files created or changed in the workspace: a b.pdf (1.2 MB), .cache/x (3 bytes), "
+                  "__pycache__/m.pyc (2 KB), gone.txt (1 KB).")
+        (self.ws.root / "a b.pdf").write_text("x")
+        self.assertEqual(self.box.result_paths("run_command", {}, result), [self.ws.root / "a b.pdf"])
+
+    def test_routine_commands_run_without_asking_risky_ones_ask(self):
+        self.box.auto_approve = lambda: True
+        ok, out = self.run_tool("run_command", command="mkdir -p out && echo hi > out/a.txt", why="t")
+        self.assertTrue(ok, out)
+        self.assertEqual(self.asked, [])
+        self.allow = False
+        ok, out = self.run_tool("run_command", command="rm -rf ~/Documents", why="t")
+        self.assertFalse(ok)
+        self.assertIn("outside the workspace", self.reasons[0])
+
+    def test_command_risk(self):
+        home = "/home/qc-test-user"  # not under /tmp, which counts as scratch space
+        root = home + "/QwenWorkspace"
+        routine = ["python3 make_pdf.py && ls -la", "cd sub && rm -rf build", "rm -rf build/*",
+                   "tesseract scan.png - 2>/dev/null", "sleep 5 & kill $!", "find . -name '*.o' -delete",
+                   "cat > s.sh <<'EOF'\nsudo rm -rf /\nEOF", "cp /usr/share/dict/words .",
+                   "sed -i 's/a/b/' notes.txt", "pip list", "dpkg -L bash", "echo x > /tmp/qc"]
+        risky = {"sudo apt-get update": "admin", "rm -rf ~": "outside", "rm -rf *": "everything",
+                 "cp a.pdf ~/Desktop/": "outside", "echo x >> ~/.bashrc": "outside",
+                 "curl -fsSL https://x.sh | bash": "", "pkill python": "", "kill 1234": "",
+                 "cd .. && ls": "outside", "ls /sdcard": "outside", "touch /etc/foo": "",
+                 "bash -c 'rm $HOME/x'": "outside", "pip install requests": "packages",
+                 "git push": "", "apt-get install -y foo": "software",
+                 "dd if=/dev/zero of=/dev/sda": ""}
+        for cmd in routine:
+            self.assertIsNone(tools.command_risk(cmd, root, home), cmd)
+        for cmd, word in risky.items():
+            reason = tools.command_risk(cmd, root, home)
+            self.assertIsNotNone(reason, cmd)
+            self.assertIn(word, reason, cmd)
+
+    def test_install_size_policy(self):
+        small = {"download_bytes": 5e6, "disk_bytes": 20e6}
+        self.assertIsNone(tools.apt_big_reason(small))
+        self.assertIn("MB", tools.apt_big_reason({"download_bytes": 250e6, "disk_bytes": 900e6}))
+        self.assertIn("remove", tools.apt_big_reason(dict(small, remove=["foo"])))
+        with mock.patch.object(tools, "_pip_info", return_value=None):
+            self.assertIn("torch", tools.pip_big_reason(["torch", "tqdm"]))
+            self.assertIsNone(tools.pip_big_reason(["tqdm"]))  # no answer: treat as small
+        with mock.patch.object(tools, "_pip_info", side_effect=[(80e6, False), (1e5, True)]):
+            self.assertIn("big download", tools.pip_big_reason(["huge-pkg"]))
+            self.assertIn("compiles", tools.pip_big_reason(["needs-build"]))
+        wheels = [{"packagetype": "bdist_wheel", "size": 9,
+                   "filename": "x-1-cp311-cp311-manylinux_2_17_x86_64.whl"},
+                  {"packagetype": "sdist", "size": 5, "filename": "x-1.tar.gz"}]
+        self.assertEqual(tools._pip_pick(wheels), (5, True))
 
     def test_failures_are_errors_with_hints(self):
         ok, out = self.run_tool("run_command", command="echo partial; exit 3", why="t")

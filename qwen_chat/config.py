@@ -24,10 +24,14 @@ DEFAULTS = {
     "context_size": 16384,
     "web": True,
     "files": True,
-    # Lets the model run programs and install software; each command/install is approved.
+    # Lets the model run programs and install software. Routine commands and small installs
+    # run without asking; risky commands and big installs always ask.
     "commands": True,
+    # Ask before every command and install, not only the risky and big ones.
+    "ask_commands": False,
     "thinking": False,
-    "confirm_changes": True,
+    # Ask before replacing or deleting a file (they go to the Trash either way).
+    "ask_file_changes": False,
     "stop_server_on_exit": True,
     "color_scheme": "system",
     "window_size": [1180, 820],

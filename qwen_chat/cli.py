@@ -22,13 +22,18 @@ def run(question: str, web: bool, files: bool, think: bool, keep_server: bool, y
             return False
         return input(f"\n{title} {detail} [y/N] ").strip().lower() in ("y", "yes")
 
-    ws = Workspace(settings.workspace_path, confirm=confirm)
+    # Same rules as the app: replaced and deleted files go to the Trash, and only risky
+    # commands and big installs ask, unless the settings say to ask for everything.
+    ws = Workspace(settings.workspace_path,
+                   confirm=confirm if settings["ask_file_changes"] else None)
     server = ServerManager(settings)
 
-    def approve(title: str, detail: str, code: str, action: str) -> bool:
-        return confirm(title, f"{detail}\n\n    {code}\n\n{action}?")
+    def approve(title: str, detail: str, code: str, action: str, reason: str = "") -> bool:
+        why = f"{reason}\n" if reason else ""
+        return confirm(title, f"{why}{detail}\n\n    {code}\n\n{action}?")
 
-    toolbox = ToolBox(ws, web=web, files=files, commands=settings["commands"], approve=approve)
+    toolbox = ToolBox(ws, web=web, files=files, commands=settings["commands"], approve=approve,
+                      auto_approve=lambda: not settings["ask_commands"])
     agent = Agent(server, toolbox)
     out = sys.stdout
 
