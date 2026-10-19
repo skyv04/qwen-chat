@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import threading
 import time
 from typing import Protocol
@@ -11,8 +12,11 @@ from .llm import Cancelled, ChatStream, LLMError, ServerManager
 from .tools import ToolBox
 
 MAX_TOOL_ROUNDS = 12
+MAX_OUT_TOKENS = 4096      # per reply, tool call arguments included
+CALL_CHARS = 8000          # what the model is told one tool call may hold (well under the cap)
 CHARS_PER_TOKEN = 3.0      # conservative; real English text is ~3.5-4
 OLD_TOOL_STUB = "[Earlier tool output removed to save context space.]"
+LONG_ARG = 1500            # tool call strings longer than this get shortened when space is tight
 
 
 class Events(Protocol):
@@ -57,7 +61,10 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "Nothing outside it is accessible. When the user asks you to create, save, write, "
             "export or edit a file, actually do it with the file tools (don't just show the "
             "content), then mention the file name. Read a file before changing it. Use clear "
-            "file names with the right extension (.md, .txt, .csv, .py, .html, ...).")
+            "file names with the right extension (.md, .txt, .csv, .py, .html, ...). One tool "
+            f"call can hold at most about {CALL_CHARS:,} characters; longer calls get cut off and "
+            "fail. Write a longer file in parts: write_file with the first part, then write_file "
+            "with append: true for each next part.")
     else:
         parts.append("\nFile access is turned off in this chat.")
     if toolbox.files and toolbox.commands:
@@ -74,7 +81,9 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "images: when a task depends on what images show (text, page or question numbers, "
             "order), read them first with OCR (`tesseract IMAGE -`; ask to install tesseract-ocr "
             "if it's missing). Never guess the order or contents from file names. Commands get "
-            "no keyboard input, so use non-interactive options, and keep files in the workspace.")
+            "no keyboard input, so use non-interactive options, and keep files in the workspace. "
+            "For a long script, save it with write_file, then run it with run_command; keep it "
+            "short by using loops, lists and helper functions instead of repeating code.")
     parts.append(
         "\n## Style\nAnswer in Markdown. Be direct and helpful; use headings, lists, tables and "
         "fenced code blocks (with a language) when they make the answer clearer.")
@@ -88,6 +97,41 @@ def _size(msg: dict) -> int:
     return n
 
 
+def _args_ok(raw) -> bool:
+    """llama-server re-parses every earlier tool call; one broken call fails the whole request."""
+    if isinstance(raw, dict):
+        return True
+    try:
+        return isinstance(json.loads(raw), dict)
+    except (TypeError, ValueError):
+        return False
+
+
+_SALVAGE = re.compile(r'"(path)"\s*:\s*("(?:[^"\\]|\\.)*")|"(append)"\s*:\s*(true|false)')
+
+
+def salvage_args(raw) -> dict:
+    """The small fields that survive in broken (usually cut-off) arguments, for the UI and history."""
+    out = {}
+    for m in _SALVAGE.finditer(raw if isinstance(raw, str) else ""):
+        key, val = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        try:
+            out.setdefault(key, json.loads(val))
+        except ValueError:
+            pass
+    return out
+
+
+def _api_call(call: dict) -> dict:
+    fn = call.get("function") or {}
+    raw = fn.get("arguments")
+    if isinstance(raw, dict):
+        raw = json.dumps(raw, ensure_ascii=False)
+    elif not _args_ok(raw):
+        raw = json.dumps(salvage_args(raw), ensure_ascii=False)
+    return {**call, "function": {**fn, "arguments": raw}}
+
+
 def clean_for_api(messages: list[dict]) -> list[dict]:
     """Drops UI-only fields; earlier reasoning is not sent back (Qwen's template ignores it)."""
     out = []
@@ -95,12 +139,33 @@ def clean_for_api(messages: list[dict]) -> list[dict]:
         c = {k: v for k, v in m.items() if not k.startswith("_") and k != "reasoning_content"}
         if c.get("role") == "assistant" and c.get("content") is None:
             c["content"] = ""
+        if c.get("tool_calls"):
+            c["tool_calls"] = [_api_call(tc) for tc in c["tool_calls"]]
         out.append(c)
     return out
 
 
+def _shrink_call(call: dict) -> bool:
+    """Shortens long strings (like a whole file) in a tool call's arguments. True if it changed."""
+    try:
+        args = json.loads(call["function"]["arguments"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not isinstance(args, dict):
+        return False
+    changed = False
+    for k, v in args.items():
+        if isinstance(v, str) and len(v) > LONG_ARG:
+            args[k] = v[:300] + f"\n[... {len(v) - 300:,} more characters removed to save context space]"
+            changed = True
+    if changed:
+        call["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
+    return changed
+
+
 def fit_context(messages: list[dict], budget_chars: int) -> list[dict]:
-    """Shrinks history to fit: first old tool outputs, then whole old turns, then current tool outputs."""
+    """Shrinks history to fit: first old tool outputs and arguments, then whole old turns, then the
+    current turn's tool outputs, then its tool arguments."""
     msgs = copy.deepcopy(messages)
     total = lambda: sum(_size(m) for m in msgs)
     if total() <= budget_chars:
@@ -109,6 +174,8 @@ def fit_context(messages: list[dict], budget_chars: int) -> list[dict]:
     for i, m in enumerate(msgs[:last_user]):
         if m["role"] == "tool" and len(m.get("content") or "") > len(OLD_TOOL_STUB):
             m["content"] = OLD_TOOL_STUB
+        for call in m.get("tool_calls") or []:
+            _shrink_call(call)
     # Drop whole turns from the front (a turn = a user message and everything up to the next).
     while total() > budget_chars:
         users = [i for i, m in enumerate(msgs) if m["role"] == "user"]
@@ -124,6 +191,12 @@ def fit_context(messages: list[dict], budget_chars: int) -> list[dict]:
         over = total() - budget_chars
         keep = max(400, len(big["content"]) - over - 200)
         big["content"] = big["content"][:keep] + "\n[...truncated to fit the context window]"
+    # Last resort: the current turn's long tool arguments (e.g. files written in parts), oldest first.
+    for m in msgs[last_user:]:
+        if total() <= budget_chars:
+            break
+        for call in m.get("tool_calls") or []:
+            _shrink_call(call)
     return msgs
 
 
@@ -157,6 +230,18 @@ def _drafting(name: str, chars: int) -> str:
     return f"{what}… {chars:,} characters" if chars >= 200 else f"{what}…"
 
 
+def _broken_call_note(name: str, chars: int, cut_off: bool) -> str:
+    """Tool result for a call whose arguments couldn't be read, telling the model how to recover."""
+    if cut_off:
+        return (f"Error: this {name} call was cut off after {chars:,} characters because the reply "
+                "reached its length limit, so nothing was done. Keep each tool call under about "
+                f"{CALL_CHARS:,} characters: write a long file in parts (write_file with the first "
+                "part, then write_file with append: true for each next part), and keep scripts "
+                "short with loops and helper functions.")
+    return (f"Error: the {name} arguments were not valid JSON, so nothing was done. Try again with "
+            "valid JSON (escape quotes, backslashes and newlines inside strings).")
+
+
 class Agent:
     def __init__(self, server: ServerManager, toolbox: ToolBox):
         self.server = server
@@ -178,7 +263,7 @@ class Agent:
         tools = self.toolbox.schemas()
         sys_msg = {"role": "system", "content": system_prompt(self.toolbox, self.server.model_name)}
         n_ctx = self.server.n_ctx
-        max_out = min(4096 if thinking else 3072, n_ctx // 3)
+        max_out = min(MAX_OUT_TOKENS + (2048 if thinking else 0), n_ctx // 3)
         tool_chars = len(json.dumps(tools)) if tools else 0
         budget = int((n_ctx - max_out) * CHARS_PER_TOKEN) - len(sys_msg["content"]) - tool_chars
         rounds = 0
@@ -225,8 +310,17 @@ class Agent:
             finally:
                 self.stream = None
             msg, timings = result["message"], result["timings"]
-            if result["finish_reason"] == "length" and not msg.get("tool_calls"):
+            cut_off = result["finish_reason"] == "length"
+            if cut_off and not msg.get("tool_calls"):
                 msg["content"] = (msg.get("content") or "") + "\n\n*[Stopped: reached the response length limit.]*"
+            # Broken arguments (usually a call cut off by the length limit) must not be stored:
+            # llama-server would reject every later request in this chat.
+            broken: dict[str, int] = {}
+            for call in msg.get("tool_calls") or []:
+                fn = call["function"]
+                if not _args_ok(fn.get("arguments")):
+                    broken[call["id"]] = len(fn.get("arguments") or "")
+                    fn["arguments"] = json.dumps(salvage_args(fn.get("arguments")), ensure_ascii=False)
             msg["_meta"] = {"timings": {k: timings.get(k) for k in
                                         ("predicted_per_second", "predicted_n", "prompt_n",
                                          "prompt_per_second", "cache_n")},
@@ -247,7 +341,9 @@ class Agent:
                     args = {}
                 events.tool_begin(call["id"], name, args)
                 key = name + ":" + json.dumps(args, sort_keys=True)
-                if key in seen and name in ("web_search", "fetch_url", "list_files", "read_file"):
+                if call["id"] in broken:
+                    ok, out = False, _broken_call_note(name, broken[call["id"]], cut_off)
+                elif key in seen and name in ("web_search", "fetch_url", "list_files", "read_file"):
                     ok, out = True, seen[key] + "\n[You already ran this exact call; use this result.]"
                 else:
                     ok, out = self.toolbox.run(name, raw)

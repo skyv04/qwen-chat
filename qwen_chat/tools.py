@@ -1070,7 +1070,7 @@ FILE_TOOLS = [
         {"path": {**_S, "description": "File path relative to the workspace"},
          "start_line": {"type": "integer", "description": "Line to start from (default 1)"}}, ["path"]),
     _fn("write_file", "Create or overwrite a text file in the workspace (parent folders are created). "
-        "Set append=true to add to the end instead.",
+        "Set append=true to add to the end instead, e.g. to write a long file in parts.",
         {"path": {**_S, "description": "File path relative to the workspace, e.g. 'notes/plan.md'"},
          "content": {**_S, "description": "Full text to write"},
          "append": {"type": "boolean", "description": "Append instead of replacing"}},
@@ -1499,10 +1499,13 @@ class ToolBox:
             "install_packages": ("Installing", "Installed", pkgs),
             "check_programs": ("Checking for", "Checked for", checked or "programs"),
         }
-        tried = {"run_command": "Tried to run", "install_packages": "Tried to install"}
+        tried = {"run_command": "Tried to run", "install_packages": "Tried to install",
+                 "write_file": "Tried to append to" if a.get("append") else "Tried to write"}
         if name not in verbs:
             return f"Using {name}" if running else f"Used {name}"
         now, done, obj = verbs[name]
+        if name == "write_file" and not a.get("path"):
+            obj = "a file"
         if not running and not ok and name in tried:
             return f"{tried[name]} {obj}"
         return f"{now if running else done} {obj}"

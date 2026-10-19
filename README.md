@@ -26,7 +26,14 @@ started it.
   convert images, merge PDFs, run OCR or a Python script. When a task needs a program it
   doesn't have, it asks to install it: Debian packages with apt, or Python packages with
   pip. Every command and install shows a card with the exact command (and, for apt, the
-  download and disk size) and waits for **Run**/**Install** or **Don't allow**.
+  download and disk size) and waits for **Run**/**Install** or **Don't allow**. To stop
+  pressing **Run** for every command in a chat, turn on menu → *Run Commands Without
+  Asking (This Chat)*. The Run button then reads **Auto-run**. The choice is saved with
+  that chat only, and installs still ask.
+- Long files are written in parts: one reply holds at most about 4,000 tokens, so Qwen is
+  told to keep each tool call under about 8,000 characters and append the rest. If a call
+  is cut off anyway, nothing is written. Qwen is told why and tries again in parts, and
+  the broken call is never saved, so the chat keeps working.
 - **Think**: optional step-by-step reasoning, shown in a collapsible "Thoughts" section.
 - Attach files with the paperclip button or drag and drop. They're copied into
   `workspace/attachments`.
@@ -42,9 +49,11 @@ started it.
   `..`, absolute paths or symlinks are refused.
 - By default, overwriting or deleting a file needs your approval (menu → *Ask Before
   Replacing or Deleting Files*).
-- Commands and installs always need your approval, whatever that setting says. There is
-  no sandbox beyond that: an approved command runs in the workspace with your account's
-  access, so read the command before you click **Run**. Commands have no keyboard input
+- Commands and installs need your approval, whatever that setting says, except commands in
+  a chat where you turned on *Run Commands Without Asking (This Chat)*. Installs always
+  ask. There is no sandbox beyond that: a command runs in the workspace with your account's
+  access, so read the command before you click **Run** (expand a "Ran …" step to see the
+  exact command that ran). Commands have no keyboard input
   and are stopped after 5 minutes (Qwen can ask for up to 30), or when you click Stop.
 - If you click **Don't allow**, Qwen isn't allowed to call any more tools in that reply.
   It has to answer in words, so it can't try a workaround behind your back.

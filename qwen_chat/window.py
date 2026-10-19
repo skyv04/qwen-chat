@@ -15,7 +15,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from . import APP_ID, APP_NAME  # noqa: E402
-from .agent import Agent, repair_history  # noqa: E402
+from .agent import Agent, repair_history, salvage_args  # noqa: E402
 from .llm import Cancelled, LLMError, ServerError, gpu_busy_percent  # noqa: E402
 from .store import ChatStore, title_from  # noqa: E402
 from .tools import ToolBox, Workspace  # noqa: E402
@@ -36,6 +36,11 @@ SUGGESTIONS = [
 BIDI = GObject.BindingFlags.BIDIRECTIONAL
 SYNC = GObject.BindingFlags.SYNC_CREATE
 INVERT = GObject.BindingFlags.INVERT_BOOLEAN
+
+RUN_TIP_ASK = ("Let Qwen run programs and install software it needs "
+               "(it asks you before every command or install)")
+RUN_TIP_AUTO = ("Let Qwen run programs and install software it needs. In this chat, commands "
+                "run without asking (installs still ask); change it in the main menu")
 
 
 def _k(n: int) -> str:
@@ -103,6 +108,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._loading_list = False
         self._deleted: dict | None = None
         self._pending_confirm: ConfirmCard | None = None
+        self._auto_run_new = False   # "run without asking" chosen before this chat's first message
 
         w, h = (settings["window_size"] + [1180, 820])[:2]
         self.set_default_size(int(w), int(h))
@@ -299,8 +305,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self.files_toggle.connect("toggled", self._on_files_toggled)
         row.append(self.files_toggle)
         self.run_toggle = self._pill("utilities-terminal-symbolic", "Run", self.settings["commands"],
-                                     "Let Qwen run programs and install software it needs "
-                                     "(it asks you before every command or install)")
+                                     RUN_TIP_ASK)
+        self.run_label = self.run_toggle.get_child().get_last_child()
         self.run_toggle.connect("toggled", self._on_run_toggled)
         row.append(self.run_toggle)
         self.think_toggle = self._pill("emoji-objects-symbolic", "Think", self.settings["thinking"],
@@ -376,6 +382,7 @@ class ChatWindow(Adw.ApplicationWindow):
         s2 = Gio.Menu()
         s2.append_submenu("Appearance", look)
         s2.append("Ask Before Replacing or Deleting Files", "win.confirm-changes")
+        s2.append("Run Commands Without Asking (This Chat)", "win.auto-run")
         s2.append("Unload Model When Closing", "win.stop-on-exit")
         menu.append_section(None, s2)
         s3 = Gio.Menu()
@@ -408,6 +415,9 @@ class ChatWindow(Adw.ApplicationWindow):
             act = Gio.SimpleAction.new_stateful(name, None, GLib.Variant("b", bool(self.settings[key])))
             act.connect("activate", self._on_bool_setting, key)
             self.add_action(act)
+        self.auto_run_action = Gio.SimpleAction.new_stateful("auto-run", None, GLib.Variant("b", False))
+        self.auto_run_action.connect("activate", self._on_auto_run)
+        self.add_action(self.auto_run_action)
 
     # ================================================================== settings
     def _on_color_scheme(self, action, value) -> None:
@@ -421,6 +431,32 @@ class ChatWindow(Adw.ApplicationWindow):
         action.set_state(GLib.Variant("b", new))
         self.settings[key] = new
         self.settings.save()
+
+    # Commands without asking: a per-chat choice, saved with the chat. Installs always ask.
+    def _auto_run_on(self) -> bool:
+        return bool(self.chat.get("auto_run")) if self.chat is not None else self._auto_run_new
+
+    def _sync_auto_run(self) -> None:
+        on = self._auto_run_on()
+        self.auto_run_action.set_state(GLib.Variant("b", on))
+        self.run_label.set_label("Auto-run" if on else "Run")
+        self.run_toggle.set_tooltip_text(RUN_TIP_AUTO if on else RUN_TIP_ASK)
+
+    def _on_auto_run(self, action, _param) -> None:
+        on = not action.get_state().get_boolean()
+        if self.chat is not None:
+            self.chat["auto_run"] = on
+            self.store.save(self.chat)
+        else:
+            self._auto_run_new = on
+        self._sync_auto_run()
+        if on:
+            self.toast("Commands in this chat now run without asking. Installs still ask.")
+            card = self._pending_confirm
+            if card is not None and getattr(card, "kind", "") == "Run":
+                card.answer(True)
+        else:
+            self.toast("Qwen will ask before each command again.")
 
     def _on_web_toggled(self, btn) -> None:
         self.settings["web"] = self.toolbox.web = btn.get_active()
@@ -595,6 +631,9 @@ class ChatWindow(Adw.ApplicationWindow):
         self._clear_messages()
         self.stack.set_visible_child_name("empty")
         self.title.set_title(APP_NAME)
+        if self.chat is None:
+            self._auto_run_new = False
+        self._sync_auto_run()
         self._update_context()
 
     def _new_turn(self) -> AssistantTurn:
@@ -614,13 +653,28 @@ class ChatWindow(Adw.ApplicationWindow):
             self._show_empty()
             return
         self.stack.set_visible_child_name("chat")
+        self._sync_auto_run()
         turn = None
         turns: list[tuple[AssistantTurn, dict | None]] = []
+        error = None
+
+        def show_error(last: bool):
+            # A turn that failed is saved as an error on its user message, so it stays visible.
+            nonlocal turn
+            if not error:
+                return
+            if turn is None:
+                turn = self._new_turn()
+                turns.append([turn, None])
+            turn.show_error(error, retry=self.regenerate if last else None)
+
         for m in msgs:
             role = m.get("role")
             if role == "user":
+                show_error(False)
                 self.msg_box.append(UserMessage(m.get("content") or ""))
                 turn = None
+                error = (m.get("_meta") or {}).get("error")
             elif role == "assistant":
                 if turn is None:
                     turn = self._new_turn()
@@ -633,7 +687,7 @@ class ChatWindow(Adw.ApplicationWindow):
                     try:
                         args = ToolBox.parse_args(call["function"].get("arguments"))
                     except Exception:
-                        args = {}
+                        args = salvage_args(call["function"].get("arguments"))
                     turn.add_tool(call.get("id"), call["function"].get("name", ""), args)
                 if m.get("_meta", {}).get("stopped"):
                     turn.add_note("Stopped")
@@ -641,6 +695,7 @@ class ChatWindow(Adw.ApplicationWindow):
             elif role == "tool" and turn is not None:
                 turn.end_tool(m.get("tool_call_id"), bool(m.get("_meta", {}).get("ok", True)),
                               m.get("content") or "")
+        show_error(True)
         for i, (t, last) in enumerate(turns):
             t.finish(self._stats_text(last), can_regenerate=(i == len(turns) - 1 and t is self.last_turn))
         self._update_context()
@@ -825,6 +880,9 @@ class ChatWindow(Adw.ApplicationWindow):
     # ================================================================== sending
     def send(self, text: str | None = None) -> None:
         if self.running:
+            # Enter while Qwen is busy: say why nothing happened; the text stays in the box.
+            if text or self._text().strip():
+                self.toast("Qwen is still working on the last message. Wait for it, or press Stop (Esc).")
             return
         typed = text is None
         text = (self._text() if typed else text).strip()
@@ -841,6 +899,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self._clear_chips()
         if self.chat is None:
             self.chat = self.store.new()
+            self.chat["auto_run"] = self._auto_run_new
             self._clear_messages()
         if not self.chat["messages"]:
             self.chat["title"] = title_from(text or os.path.basename(content))
@@ -875,6 +934,9 @@ class ChatWindow(Adw.ApplicationWindow):
         self._update_composer()
         self.scroll_to_bottom(force=True)
         GLib.timeout_add(1000, self._tick)
+        last_user = next((m for m in reversed(self.chat["messages"]) if m.get("role") == "user"), None)
+        if last_user is not None:
+            (last_user.get("_meta") or {}).pop("error", None)
         work = [dict(m) for m in self.chat["messages"]]
         thinking = self.think_toggle.get_active()
         chat = self.chat
@@ -918,6 +980,10 @@ class ChatWindow(Adw.ApplicationWindow):
                              "_meta": {"stopped": True, "time": time.time()}})
                 turn.end_round(work[-1])
         repair_history(work)
+        if err:
+            asked = next((m for m in reversed(work) if m.get("role") == "user"), None)
+            if asked is not None:
+                asked["_meta"] = {**(asked.get("_meta") or {}), "error": err}
         chat["messages"] = work
         self.store.save(chat)
         last = next((m for m in reversed(work) if m.get("role") == "assistant"), None)
@@ -991,7 +1057,10 @@ class ChatWindow(Adw.ApplicationWindow):
 
     # ---------------------------------------------------------------- confirmations (worker thread)
     def _approve(self, title: str, detail: str, code: str, action: str) -> bool:
-        """Commands and installs: always asked, whatever the file-change setting says."""
+        """Commands and installs: asked whatever the file-change setting says. Commands skip the
+        question in chats where the user turned on running without asking."""
+        if action == "Run" and self._auto_run_on():
+            return True
         icon = "system-software-install-symbolic" if action == "Install" else "utilities-terminal-symbolic"
         return self._confirm(title, detail, code=code, allow_label=action, icon=icon, always=True)
 
@@ -1013,6 +1082,7 @@ class ChatWindow(Adw.ApplicationWindow):
                 on_answer(False)
                 return False
             card = ConfirmCard(title, detail, on_answer, code=code, allow_label=allow_label, icon=icon)
+            card.kind = allow_label
             self._pending_confirm = card
             turn.add_widget(card)
             turn.set_status("Waiting for your answer…")

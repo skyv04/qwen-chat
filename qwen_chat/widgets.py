@@ -385,6 +385,14 @@ class ToolCard(Gtk.Box):
         self.revealer = Gtk.Revealer()
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         body.add_css_class("tool-body")
+        command = (args or {}).get("command") if name == "run_command" else None
+        if isinstance(command, str) and command.strip():
+            # The whole command, also when it ran without a confirmation card.
+            cmd = Gtk.Label(label=command.strip(), xalign=0, wrap=True,
+                            wrap_mode=Pango.WrapMode.CHAR, selectable=True)
+            cmd.add_css_class("monospace")
+            cmd.add_css_class("tool-command")
+            body.append(cmd)
         self.result = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR,
                                 selectable=True)
         self.result.add_css_class("tool-result")

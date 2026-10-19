@@ -272,4 +272,6 @@ class ChatStream:
             err = {"message": err}
         msg = err.get("message") or f"HTTP {status}"
         overflow = err.get("type") == "exceed_context_size_error" or "context" in msg.lower() and "exceed" in msg.lower()
+        if len(msg) > 400:
+            msg = msg[:400].rstrip() + "…"
         raise LLMError(msg, context_overflow=overflow)
