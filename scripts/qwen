@@ -1,0 +1,57 @@
+#!/bin/bash
+# Shared terminal/server launcher for the tested Adreno + Turnip setup.
+set -euo pipefail
+unset LD_PRELOAD
+
+llama_bin="${QWEN_LLAMA_BIN:-$HOME/Documents/GitHub/llama.cpp/build-vulkan/bin}"
+model="${QWEN_MODEL:-$HOME/models/Qwen3.5-9B-Q4_K_M.gguf}"
+ctx="${QWEN_CTX:-16384}"
+gpu_env="${QWEN_GPU_ENV:-/opt/mesa-adreno/activate.sh}"
+
+case "$(basename "$0")" in
+    qwen-server) tool=llama-server ;;
+    *) tool=llama-cli ;;
+esac
+
+if [ ! -x "$llama_bin/$tool" ]; then
+    echo "qwen: executable not found: $llama_bin/$tool. See docs/termux-setup.md." >&2
+    exit 1
+fi
+if [ ! -r "$model" ]; then
+    echo "qwen: model not found: $model. Set QWEN_MODEL or follow docs/termux-setup.md." >&2
+    exit 1
+fi
+if [ ! -r "$gpu_env" ]; then
+    echo "qwen: GPU environment not found: $gpu_env. Set QWEN_GPU_ENV to your GPU setup script." >&2
+    exit 1
+fi
+
+# Turnip copies the weights into shared system RAM. Running out can kill Termux,
+# taking the desktop with it. This guard is for the default 9B Q4_K_M model.
+need_mb=6000
+avail_mb=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+if [ -z "$avail_mb" ]; then
+    echo "qwen: could not read available RAM from /proc/meminfo." >&2
+    exit 1
+fi
+if [ "${QWEN_SKIP_MEM_CHECK:-0}" != 1 ] && [ "$avail_mb" -lt "$need_mb" ]; then
+    echo "qwen: only ${avail_mb} MB RAM free; allow at least ${need_mb} MB for this model." >&2
+    echo "Close Android apps or browser tabs and retry. QWEN_SKIP_MEM_CHECK=1 bypasses" >&2
+    echo "this check, but risks Android killing Termux and the desktop." >&2
+    exit 1
+fi
+
+# GPU setup scripts can reference unset desktop variables. Retain their driver
+# paths, but remove process-interposing bridge shims before starting llama.cpp.
+set +u
+. "$gpu_env"
+set -u
+unset LD_PRELOAD
+
+# A 512-token micro-batch faulted on the tested Adreno driver. Keep the stable 128.
+defaults=(-m "$model" -ngl 99 -t 6 -c "$ctx" -fa on -ctk q8_0 -ctv q8_0 -ub 128 --reasoning off)
+if [ "$tool" = llama-server ]; then
+    defaults+=(--host 127.0.0.1 --port 8080)
+    echo "qwen-server: local API at http://127.0.0.1:8080 (Ctrl+C to stop)" >&2
+fi
+exec nice -n 5 "$llama_bin/$tool" "${defaults[@]}" "$@"

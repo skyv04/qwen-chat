@@ -50,7 +50,9 @@ class QwenChatApp(Adw.Application):
             act.connect("activate", cb)
             self.add_action(act)
         for action, accels in (("app.quit", ["<Ctrl>q"]), ("win.new-chat", ["<Ctrl>n"]),
-                               ("win.stop", ["Escape"]), ("win.toggle-sidebar", ["F9"]),
+                               ("win.escape", ["Escape"]), ("win.toggle-sidebar", ["F9"]),
+                               ("win.skills", ["<Ctrl>k"]),
+                               ("win.rename-chat", ["F2"]),
                                ("win.focus-composer", ["<Ctrl>l"])):
             self.set_accels_for_action(action, accels)
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):

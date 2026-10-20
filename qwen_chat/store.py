@@ -51,10 +51,24 @@ class ChatStore:
 
     def save(self, chat: dict) -> None:
         chat["updated"] = time.time()
+        self._write(chat)
+
+    def _write(self, chat: dict) -> None:
         path = self._path(chat["id"])
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(chat, ensure_ascii=False, indent=1))
         os.replace(tmp, path)
+
+    def rename(self, chat_id: str, title: str) -> str:
+        title = " ".join(title.split())
+        if not title:
+            raise ValueError("Enter a name for the chat.")
+        chat = json.loads(self._path(chat_id).read_text())
+        if not isinstance(chat, dict) or chat.get("id") != chat_id:
+            raise ValueError("The saved chat could not be read.")
+        chat["title"] = title
+        self._write(chat)
+        return title
 
     def delete(self, chat_id: str) -> None:
         try:

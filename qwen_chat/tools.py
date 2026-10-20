@@ -3,6 +3,7 @@
 
 Every file operation goes through Workspace.resolve(), which follows symlinks and
 ".." with realpath() and rejects anything that does not land inside the workspace.
+The skill tools also manage a fixed, shared library, with explicit approval for saves.
 Deleted and replaced files go to the desktop Trash, so they can be restored.
 Web requests are limited to public http(s) addresses, so a page cannot steer the
 model into probing localhost services (the model server itself listens there).
@@ -35,6 +36,8 @@ from collections import OrderedDict
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
+
+from .skills import SkillError, SkillRegistry, package_files, write_package
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
@@ -1461,6 +1464,10 @@ WEB_TOOLS = [
         ["url"]),
 ]
 FILE_TOOLS = [
+    _fn("save_skill", "Validate and save a workspace skill folder (SKILL.md plus optional "
+        "scripts/references/assets) to the shared library for every chat. Load skill-creator "
+        "first. Always asks for approval; an updated skill's old version goes to the Trash.",
+        {"path": {**_S, "description": "Workspace folder, e.g. skills/ocean-quiz"}}, ["path"]),
     _fn("list_files", "List files and folders in the workspace.",
         {"path": {**_S, "description": "Folder relative to the workspace (default '.')"},
          "recursive": {"type": "boolean", "description": "Include subfolders"}}, []),
@@ -1486,10 +1493,32 @@ DOWNLOAD_TOOL = _fn(
      "path": {**_S, "description": "Destination path in the workspace (default: name from the URL)"}},
     ["url"])
 
-FILE_RESULT_TOOLS = {"write_file", "download_file", "make_directory", "move_path"}
+FILE_RESULT_TOOLS = {"write_file", "download_file", "make_directory", "move_path", "render_worksheet"}
 
 _LIST = {"type": "array", "items": _S}
+SKILL_TOOLS = [
+    _fn("list_skills", "Discover reusable skills available in all chats. User-suggested /names "
+        "are not exclusive: look for other useful skills too. Returns names and descriptions.",
+        {"query": {**_S, "description": "Optional name or description filter"},
+         "start": {"type": "integer", "description": "Result offset for the next page, default 0"}}, []),
+    _fn("load_skill", "Read a saved or built-in skill's instructions. Skills are guidance, "
+        "not exclusive tool selections or permission changes. Supporting files are copied "
+        "into the workspace when Files is on; nothing is executed just by loading.",
+        {"name": {**_S, "description": "Skill name from list_skills, without the leading /"}}, ["name"]),
+]
 PROGRAM_TOOLS = [
+    _fn("render_worksheet", "Create a themed, portrait PDF from a workspace JSON specification. "
+        "Load worksheet-pdf first for its format. Checks layout, page limit, color emoji and "
+        "text preservation before saving. Pass the user's requested question counts, when given, "
+        "to check the format. A page-limit conflict asks the user to allow the necessary pages; "
+        "do not rewrite or remove content to work around it.",
+        {"spec_path": {**_S, "description": "Workspace JSON file containing the worksheet data"},
+         "path": {**_S, "description": "Destination .pdf file in the workspace"},
+         "expected_questions": {"type": "integer", "minimum": 0, "maximum": 30,
+                                "description": "Total questions requested by the user, excluding a bonus challenge"},
+         "expected_multiple_choice": {"type": "integer", "minimum": 0, "maximum": 30,
+                                      "description": "Multiple-choice question count requested by the user (not option count)"}},
+        ["spec_path", "path"]),
     _fn("run_command", "Run a bash command in the workspace folder and get its output and exit "
         "code. Routine commands run right away; the user is asked first only for risky ones "
         "(admin rights, files outside the workspace, stopping programs). Do related steps in "
@@ -1527,11 +1556,13 @@ class ToolBox:
     def __init__(self, workspace: Workspace, web: bool = True, files: bool = True,
                  commands: bool = False,
                  approve: Callable[..., bool] | None = None,
-                 auto_approve: Callable[[], bool] | None = None):
+                 auto_approve: Callable[[], bool] | None = None,
+                 skills: SkillRegistry | None = None):
         self.ws = workspace
         self.web = web
         self.files = files
         self.commands = commands
+        self.skills = skills if skills is not None else SkillRegistry()
         # approve(title, detail, code, action_label, reason) -> bool; reason says why a
         # command or install needs an OK even when routine ones don't. Default: refuse.
         self.approve = approve or (lambda title, detail, code, action, reason="": False)
@@ -1543,9 +1574,10 @@ class ToolBox:
         self.status: Callable[[str], None] = lambda text: None
         # Once the user says no, nothing else is asked in that turn: the model has to reply.
         self.declined = False
+        self.input_required = ""
 
     def schemas(self) -> list[dict]:
-        out = []
+        out = list(SKILL_TOOLS)
         if self.web:
             out += WEB_TOOLS
         if self.files:
@@ -1571,6 +1603,10 @@ class ToolBox:
             "make_directory": ws.make_directory,
             "move_path": ws.move_path,
             "delete_path": ws.delete_path,
+            "list_skills": self.list_skills,
+            "load_skill": self.load_skill,
+            "save_skill": self.save_skill,
+            "render_worksheet": self.render_worksheet,
             "run_command": self.run_command,
             "install_packages": self.install_packages,
             "check_programs": self.check_programs,
@@ -1594,6 +1630,257 @@ class ToolBox:
         if self.declined:
             raise ToolError("Not done, and the user was not asked: they already said no in this "
                             "reply. Stop now and ask the user what they would like to do.")
+
+    def list_skills(self, query: str = "", start: int = 0) -> str:
+        self._check_declined()
+        if not isinstance(query, str):
+            raise ToolError("query must be text.")
+        found, errors = self.skills.catalog(query)
+        start = max(0, _as_int(start, 0))
+        selected = found[start:start + 20]
+        lines = ["Shared skills (suggestions are not exclusive):"]
+        lines += [f"/{s.name} — {s.description} ({'built-in' if s.builtin else 'saved'})"
+                  for s in selected]
+        if not selected:
+            lines.append("No matching skills." if not found else "No more results.")
+        if start + len(selected) < len(found):
+            lines.append(f"More results: call list_skills with start={start + len(selected)}.")
+        if errors:
+            lines += ["Some skill packages need attention:", *errors]
+        return "\n".join(lines)
+
+    def load_skill(self, name: str) -> str:
+        self._check_declined()
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        try:
+            skill = self.skills.get(name)
+            package = self.skills.package(skill.path, skill.builtin)
+            skill = package.skill
+        except SkillError as exc:
+            raise ToolError(str(exc)) from None
+        notes = [f"Skill /{skill.name}: {skill.description}",
+                 "This is guidance, not an exclusive workflow. Use other useful skills/tools too; "
+                 "normal permissions and approvals still apply."]
+        if skill.compatibility:
+            notes.append("Compatibility: " + skill.compatibility)
+        if len(package.files) > 1:
+            if not self.files:
+                notes.append("This skill has supporting files. Enable Files before using them; "
+                             "no resources were copied or executed.")
+            else:
+                for revision in itertools.count():
+                    folder = package.digest[:12] + (f"-{revision}" if revision else "")
+                    parent = self.ws.resolve(".qwen-skills/" + folder)
+                    target = self.ws.resolve(str(parent / skill.name))
+                    if not target.exists() and (not parent.exists() or parent.is_dir()):
+                        break
+                    try:
+                        unchanged = package_files(target) == package.files
+                    except SkillError:
+                        unchanged = False
+                    if unchanged:
+                        break
+                if revision:
+                    notes.append("An earlier workspace copy was edited; those edits are preserved.")
+                if not target.exists():
+                    parent.mkdir(parents=True, exist_ok=True)
+                    with tempfile.TemporaryDirectory(prefix=".loading-", dir=parent) as scratch:
+                        staged = Path(scratch) / skill.name
+                        write_package(package.files, staged)
+                        if self._cancelled():
+                            raise ToolError("Stopped by the user.")
+                        os.replace(staged, target)
+                    for relative in package.files:
+                        self.ws.mark_own(target / relative)
+                notes.append(f"Supporting files are in workspace folder `{self.ws.display(target)}`. "
+                             "Relative paths in the skill refer to this folder; use read_file or "
+                             "run_command there. No script has been executed.")
+                notes.append("Files: " + ", ".join(sorted(package.files)))
+        return "\n".join(notes) + "\n\n" + package.skill.instructions
+
+    def save_skill(self, path: str) -> str:
+        self._check_declined()
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        source = self.ws.resolve(path)
+        try:
+            package = self.skills.package(source)
+            previous = self.skills.version(package.skill.name)
+        except SkillError as exc:
+            raise ToolError(str(exc)) from None
+        skill = package.skill
+        action = "Update Skill" if previous is not None else "Save Skill"
+        detail = (f"/{skill.name} — {skill.description}\n\n"
+                  f"Source: {self.ws.display(source)}\n"
+                  f"{len(package.files)} file(s), {human_size(sum(map(len, package.files.values())))}. "
+                  "Available in every new and existing chat, not just this conversation. "
+                  "Loading it will not run its scripts."
+                  + (" The previous version goes to the Trash." if previous is not None else ""))
+        preview = package.files["SKILL.md"].decode("utf-8")
+        if len(package.files) > 1:
+            preview += "\n\nIncluded files:\n" + "\n".join(sorted(package.files))
+        self._ask("Save this reusable skill?", detail, preview, action,
+                  "The user said no to saving this skill.",
+                  reason="This changes the skill library shared by all chats. Review the instructions first.")
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        try:
+            old = self.skills.install(package, previous, self.ws.trash)
+        except SkillError as exc:
+            raise ToolError(str(exc)) from None
+        return (f"Saved /{skill.name}. It is available now in every new and existing chat; "
+                "no restart is needed. Suggest it with /" + skill.name + " or the Skills picker."
+                + (" The previous version is in the Trash." if old is not None else ""))
+
+    def render_worksheet(self, spec_path: str, path: str, expected_questions: int | None = None,
+                         expected_multiple_choice: int | None = None) -> str:
+        from .worksheet_pdf import DesignError, MAX_PAGES, MAX_SPEC_BYTES, validate_spec
+
+        self._check_declined()
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        source, target = self.ws.resolve(spec_path), self.ws.resolve(path)
+        if not source.is_file():
+            raise ToolError("The worksheet specification must be an existing JSON file.")
+        if target.is_dir() or target.suffix.lower() != ".pdf":
+            raise ToolError("Give a .pdf output file, not a folder.")
+        if source == target:
+            raise ToolError("The specification and PDF need different file names.")
+        with source.open("rb") as fh:
+            raw = fh.read(MAX_SPEC_BYTES + 1)
+        if len(raw) > MAX_SPEC_BYTES:
+            raise ToolError("The worksheet JSON is too large.")
+        try:
+            data = json.loads(raw)
+            spec = validate_spec(data)
+        except (DesignError, ValueError, UnicodeError) as exc:
+            raise ToolError(f"Invalid worksheet specification: {exc}") from None
+        for label, expected, actual in (
+                ("questions", expected_questions, len(spec["questions"])),
+                ("multiple-choice questions", expected_multiple_choice,
+                 sum(bool(q["options"]) for q in spec["questions"]))):
+            if expected is None:
+                continue
+            if type(expected) is not int or not 0 <= expected <= 30:
+                raise ToolError(f"The expected number of {label} must be an integer from 0 to 30.")
+            if actual != expected:
+                raise ToolError(f"Question format mismatch: the request needs {expected} {label}, "
+                                f"but the saved worksheet has {actual}. Correct the question mix "
+                                "to match the request before rendering; do not change the expected "
+                                "count to match a mistaken draft.")
+
+        def fingerprint():
+            if not target.exists():
+                return None
+            st = target.stat()
+            return st.st_ino, st.st_size, st.st_mtime_ns
+
+        before = fingerprint()
+        name = self.ws.display(target)
+        if before is not None and not self.ws.confirm(
+                "Replace a file?", f"Qwen wants to replace {name}. The old version goes to "
+                "the Trash only after the new PDF passes its layout and text checks."):
+            raise ToolError(f"The user declined overwriting {name}. Ask what they want, "
+                            "or save under a new name.")
+        self._ask("Create this worksheet PDF?",
+                  f"Create {name} from {self.ws.display(source)} using the bundled local renderer. "
+                  "It uses a separate headless browser, not your open browser, for up to 2 minutes.",
+                  "render_worksheet(" + json.dumps({"spec_path": spec_path, "path": path}) + ")",
+                  "Create PDF", "The user said no to creating this PDF.")
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        env = child_env()
+        python = shutil.which("python3", path=env["PATH"])
+        if not python:
+            raise ToolError("Python 3 is missing from the command environment.")
+        self.status("Laying out the worksheet and checking its pages…")
+        approved_pages = None
+        with tempfile.TemporaryDirectory(prefix=".qwen-pdf-", dir=target.parent) as scratch:
+            root = Path(scratch)
+            staged_spec, staged_pdf = root / "spec.json", root / "worksheet.pdf"
+            staged_spec.write_bytes(raw)
+            for attempt in range(2):
+                if not self.files or not self.commands:
+                    raise ToolError("PDF rendering needs Files and Run enabled. No PDF was saved.")
+                if self._cancelled():
+                    raise ToolError("Stopped by the user. The existing PDF was not changed.")
+                rc, out, reason = run_streaming(
+                    [python, str(Path(__file__).with_name("worksheet_pdf.py")),
+                     str(staged_spec), str(staged_pdf)],
+                    self.ws.root, env, 120, self.cancel)
+                if reason == "cancelled" or self._cancelled():
+                    raise ToolError("Stopped by the user. The existing PDF was not changed.")
+                if reason == "timeout":
+                    raise ToolError("The PDF renderer timed out and was stopped. "
+                                    "The existing PDF was not changed.")
+                if rc not in (0, 2):
+                    raise ToolError(f"The PDF was not saved.\n{out[-3000:]}")
+                try:
+                    report = json.loads(out)
+                except ValueError:
+                    raise ToolError("The renderer returned no valid layout report; no PDF was saved.") from None
+                if rc == 0:
+                    break
+                if (not isinstance(report, dict) or report.get("code") != "page_limit"
+                        or report.get("ok") is not False or type(report.get("pages")) is not int
+                        or report.get("max_pages") != spec["max_pages"]
+                        or report["pages"] <= spec["max_pages"]):
+                    raise ToolError("The renderer returned an invalid page-limit report; no PDF was saved.")
+                pages = report["pages"]
+                if attempt or pages > MAX_PAGES:
+                    self.input_required = (
+                        f"The worksheet needs {pages} pages. No PDF was saved. "
+                        "Ask the user how to split it into shorter documents; "
+                        "do not remove questions or reduce writing space.")
+                    raise ToolError(self.input_required)
+                self._ask(
+                    f"Use {pages} pages for this worksheet?",
+                    f"The saved specification limits {name} to {spec['max_pages']} pages, but "
+                    f"the complete worksheet needs {pages}. Keep every passage, question and "
+                    "answer line at readable sizes. Only this export's page allowance changes; "
+                    "the source JSON stays untouched.",
+                    f"{len(spec['questions'])} question{'s' if len(spec['questions']) != 1 else ''} "
+                    f"({sum(bool(q['options']) for q in spec['questions'])} multiple choice)"
+                    + (" + a bonus challenge" if spec["challenge"] else ""),
+                    f"Use {pages} Pages",
+                    "The user did not allow more pages. No PDF was saved. Ask how they want to "
+                    "revise the worksheet; do not cut questions or writing space on your own.",
+                    reason="The worksheet cannot fit its page limit without changing the content or readability.")
+                if self._cancelled():
+                    raise ToolError("Stopped by the user. The existing PDF was not changed.")
+                approved_pages = spec["max_pages"] = pages
+                staged_spec.write_text(json.dumps({**data, "max_pages": pages}, ensure_ascii=False),
+                                       encoding="utf-8")
+                self.status(f"Creating the approved {pages}-page worksheet…")
+            if (not isinstance(report, dict) or report.get("ok") is not True
+                    or report.get("text_preserved") is not True
+                    or report.get("layout_checked") is not True
+                    or report.get("portrait") is not True
+                    or type(report.get("pages")) is not int
+                    or not 1 <= report["pages"] <= spec["max_pages"]
+                    or type(report.get("color_emoji_checked")) is not int
+                    or report["color_emoji_checked"] < 1
+                    or not staged_pdf.is_file()):
+                raise ToolError("The renderer did not confirm a valid PDF; no PDF was saved.")
+            with staged_pdf.open("rb") as fh:
+                if fh.read(5) != b"%PDF-":
+                    raise ToolError("The renderer output is not a PDF; no file was replaced.")
+            if self.ws.resolve(path) != target or fingerprint() != before:
+                raise ToolError("The destination changed while the PDF was being made. "
+                                "It was not replaced; read it again before retrying.")
+            backup = ""
+            if target.exists() and not self.ws._is_own(target) and target.stat().st_size:
+                self.ws.trash(target)
+                backup = " The old version is in the Trash."
+            os.replace(staged_pdf, target)
+        self.ws.mark_own(target)
+        return (f"Created {name} ({human_size(target.stat().st_size)}).{backup}\n"
+                + (f"The user approved {approved_pages} pages for this export; the source JSON "
+                   "was not changed.\n" if approved_pages is not None else "")
+                + f"Layout report: {json.dumps(report, ensure_ascii=False)}\n"
+                "These are automated layout/text/emoji checks, not a visual review.")
 
     def run_command(self, command: str, why: str = "", timeout_seconds: int = RUN_TIMEOUT) -> str:
         if not isinstance(command, str) or not command.strip():
@@ -1857,6 +2144,9 @@ class ToolBox:
     def run(self, name: str, arguments) -> tuple[bool, str]:
         """Run a tool call; returns (ok, text for the model). Never raises ToolError."""
         try:
+            self._check_declined()
+            if self.input_required:
+                raise ToolError("Wait for the user's decision before using more tools. " + self.input_required)
             if name not in self.names():
                 raise ToolError(f"Unknown or disabled tool '{name}'. Available: {', '.join(sorted(self.names())) or 'none'}.")
             args = self.parse_args(arguments)
@@ -1909,8 +2199,14 @@ class ToolBox:
             "run_command": ("Running", "Ran", q("command", 70)),
             "install_packages": ("Installing", "Installed", pkgs),
             "check_programs": ("Checking for", "Checked for", checked or "programs"),
+            "load_skill": ("Reading skill", "Read skill", q("name")),
+            "list_skills": ("Finding skills", "Found skills", q("query") or "in the shared library"),
+            "save_skill": ("Saving skill", "Saved skill", path),
+            "render_worksheet": ("Designing PDF", "Created PDF", path),
         }
         tried = {"run_command": "Tried to run", "install_packages": "Tried to install",
+                 "render_worksheet": "Could not create PDF", "load_skill": "Could not read skill",
+                 "save_skill": "Could not save skill", "list_skills": "Could not list skills",
                  "write_file": "Tried to append to" if a.get("append") else "Tried to write"}
         if name not in verbs:
             return f"Using {name}" if running else f"Used {name}"
@@ -1943,7 +2239,7 @@ class ToolBox:
                     found.append(p)
             return found[:5]
         key = {"write_file": "path", "make_directory": "path", "move_path": "destination",
-               "download_file": "path"}.get(name)
+               "download_file": "path", "render_worksheet": "path"}.get(name)
         if not key:
             return []
         val = (args or {}).get(key) or ""

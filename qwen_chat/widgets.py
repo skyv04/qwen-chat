@@ -30,6 +30,10 @@ TOOL_ICONS = {
     "run_command": "utilities-terminal-symbolic",
     "install_packages": "system-software-install-symbolic",
     "check_programs": "system-search-symbolic",
+    "load_skill": "help-contents-symbolic",
+    "list_skills": "view-list-symbolic",
+    "save_skill": "document-save-symbolic",
+    "render_worksheet": "x-office-document-symbolic",
 }
 
 _LANG_ALIASES = {"py": "python3", "python": "python3", "js": "js", "javascript": "js",
@@ -362,6 +366,10 @@ STEP_WORDS = {
     "run_command": ("ran a command", "ran {n} commands"),
     "install_packages": ("installed software", "installed software"),
     "check_programs": ("checked for programs", "checked for programs"),
+    "load_skill": ("read a skill", "read {n} skills"),
+    "list_skills": ("looked for skills", "looked for skills"),
+    "save_skill": ("saved a skill", "saved {n} skills"),
+    "render_worksheet": ("created a PDF", "created {n} PDFs"),
 }
 
 

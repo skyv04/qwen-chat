@@ -3,6 +3,30 @@
 A native GTK 4 / libadwaita chat app for a local Qwen model that runs on the phone's
 Adreno GPU through llama.cpp (Vulkan). Built for Debian in PRoot on Termux with XFCE.
 
+## Install
+
+The complete, pinned [Termux setup guide](docs/termux-setup.md) covers the GPU
+prerequisite, Debian packages, llama.cpp build, model download/checksum and
+first launch. Start there if you do not already have a working Vulkan backend.
+The tested device is an Adreno 840 phone with about 14 GiB of usable RAM;
+this is not a promise that the same model fits every Android phone.
+
+Once those dependencies and the model are ready, in your Debian desktop account:
+
+```sh
+mkdir -p "$HOME/Documents/GitHub"
+cd "$HOME/Documents/GitHub"
+git clone https://github.com/skyv04/qwen-chat.git
+cd qwen-chat
+env -u LD_PRELOAD /usr/bin/python3 install.py --desktop
+~/.local/bin/qwen-chat
+```
+
+This installs per-user launchers, the icon and an application-menu entry.
+`--desktop` also adds a desktop icon. It does not change settings or chats,
+start a model, or install packages. Keep the checkout: the app loads from it.
+For updates, close the app, pull the checkout and rerun the installer.
+
 ## Launch
 
 - Desktop icon or the **Qwen Chat** menu entry
@@ -18,6 +42,10 @@ started it.
 
 - Answers stream in as they're written, with Markdown: code blocks with syntax
   highlighting and copy buttons, tables, lists, quotes and clickable links.
+- The message box has one compact toolbar: **Attach**, **Skills**, **Tools** and
+  **Send**, with the context-token counter always visible beside Send. **Tools**
+  contains Web, Files, Run and Think switches, with explanations. Its button shows
+  how many tools are on.
 - **Web**: searches DuckDuckGo, reads pages and downloads files. Each page comes with its
   list of links, so answers can link to the exact article.
 - **Files**: list, read, write, move and delete files, plus create folders, all inside the
@@ -27,14 +55,23 @@ started it.
   needs: Debian packages with apt, or Python packages with pip. Routine commands and small
   installs run right away. Risky commands and big installs (see *Safety model*) show a card
   with the reason, the exact command and **Run**/**Install** or **Don't allow**.
+- PDF worksheets and quizzes have an on-demand **worksheet-pdf** design skill and
+  reusable renderer: related color emoji, themed margins, consistent headings,
+  portrait pages, numbered paragraphs and ruled answer areas, instead of a new
+  hand-written PDF script for every request.
+- **Skills**: suggest reusable guidance with `/skill-name`, a searchable picker or
+  **Ctrl+K**. Create skills or package a successful workflow for use in every chat.
+  Suggestions never limit Qwen to just those skills or disable its other tools.
 - Steps show what they're for, with the command underneath. Click a step to see its
   output; files it made get **Open** buttons. When an answer is done, three or more steps
   fold into one line such as "4 steps · Wrote a file, ran a command…". Files Qwen made or
   changed are listed under the answer as chips that open them.
 - A replaced or deleted file goes to the Trash first. Its step shows **Restore**, which
   puts the old version back.
-- You can type while Qwen works: **Enter** queues the message ("Next: …") and sends it when
-  the answer is done. **Edit** takes it back into the box; **×** drops it.
+- You can type while Qwen works: **Enter** or the send button queues the message
+  ("Next: …") and sends it when the answer is done. The Stop button stays available
+  beside it. **Edit** takes the queued message and attachments back into the box;
+  **×** drops it.
 - Long files are written in parts: one reply holds at most about 4,000 tokens, so Qwen is
   told to keep each tool call under about 8,000 characters and append the rest. If a call
   is cut off anyway, nothing is written. Qwen is told why and tries again in parts, and
@@ -43,16 +80,115 @@ started it.
 - Attach files with the paperclip button or drag and drop. They're copied into
   `workspace/attachments`.
 - Chats are saved, with a sidebar grouped by date (Today, Yesterday, …) to switch, delete
-  and undo a delete.
-- Status line: reading progress, then the live GPU busy percentage, tokens per second,
-  and how much of the context window is used. Each answer ends with how long it took.
+  and undo a delete. The pencil beside a chat renames it; for the current chat you can
+  also use **F2** or menu → **Rename Chat...**. Renaming keeps its messages, settings
+  and position in history, including when you reopen the app.
+- Status line: reading progress, then the live GPU busy percentage and tokens per second.
+  Each answer ends with how long it took.
 - Stop at any time; the partial answer is kept.
 - Light, dark and system color schemes.
 
+## Skills in every chat
+
+Click **Skills** under the message box, press **Ctrl+K**, or type `/` to browse.
+Search names or descriptions, then select a skill. While completing a slash mention,
+**Up/Down** chooses a result and **Tab/Enter** inserts it without sending the message;
+**Escape** closes the picker without stopping an answer already in progress.
+
+For example:
+
+```text
+/worksheet-pdf Make a new space-themed reading quiz for fourth grade.
+```
+
+These are suggestions, not exclusive modes. Qwen is instructed to discover other
+relevant skills, combine them or skip an unsuitable suggestion. The mention stays in
+the message, so queued follow-ups and reopened conversations keep it.
+
+The picker offers **Create a skill...** and **Save this workflow as a skill**.
+Both draft an editable `/skill-creator` request; they keep anything already typed and
+do not send it automatically. You can also ask directly:
+
+```text
+/skill-creator Package the approach we just used as a reusable skill.
+```
+
+Qwen drafts a standard [Agent Skills](https://agentskills.io/specification) folder in
+the workspace: `SKILL.md` with YAML `name` and `description`, plus optional `scripts/`,
+`references/` and `assets/`. The name matches the folder and uses 1-64 lowercase
+letters, digits and single hyphens. Keep instructions concise: `SKILL.md` is limited
+to 16,000 UTF-8 bytes; the whole package to 64 files and 10 MiB. Hidden files, caches
+and symlinks are rejected.
+
+`save_skill` shows the instructions and packaged file list for approval, even when
+routine commands run automatically. After approval, the package is saved to
+`~/.local/share/qwen-chat/skills/<name>/`. It immediately appears in **every new and
+existing chat**, including other open windows; reopening the picker refreshes it.
+There is no per-chat copy of the library and no restart is needed to discover a new
+skill. Updating a saved skill requires the same approval and keeps the previous
+version in the Trash. Built-ins are read-only; customize one under a new name.
+The picker has an **Open shared skill library** folder button.
+
+`list_skills` and `load_skill` work even with Files and Run off. Full instructions
+load only when needed. Supporting files are copied into
+`workspace/.qwen-skills/<version>/<name>/` when Files is enabled; edited copies are
+preserved. Loading a skill never executes a script. Saving requires Files, executing
+helpers requires Run, and normal command/install approvals still apply. Skill text
+and metadata such as `allowed-tools` do not grant permissions. In the terminal,
+`--yes` is explicit approval for saving skills as well as commands and installs.
+
+## Designed worksheet PDFs
+
+With **Files** and **Run** enabled, ask for a worksheet/quiz PDF or ask Qwen to improve
+an existing one's layout. Qwen is instructed to load `worksheet-pdf`, choose a visual
+theme for the topic, write a small JSON content/theme specification, and call
+`render_worksheet`. New quizzes get fresh content; an appearance-only restyle preserves
+the existing wording. The skill is loaded only when needed, not added to every
+conversation's context. Its format and examples live in
+[`qwen_chat/data/skills/worksheet-pdf/SKILL.md`](qwen_chat/data/skills/worksheet-pdf/SKILL.md).
+
+The renderer uses existing Chromium and Poppler (`pdfinfo`, `pdftotext`) with local
+Liberation Sans or DejaVu fonts and Noto Color Emoji (including Android's COLRv1 font).
+It needs no ReportLab/Pillow packages. HTML is generated from escaped plain text,
+with no network assets, and printed using a temporary, separate headless browser
+profile. In PRoot it uses the installed bridge's PCI compatibility shim; it does not
+open, control or reuse the desktop browser.
+
+Pages are portrait US Letter with readable body type, repeated theme artwork and
+page numbers. The passage starts on the first page, not after a wasted cover.
+Each question stays with its requested answer space. Before saving, the renderer
+checks the page budget, text bounds, actual color-emoji pixels, answer-line placement,
+and that every supplied text block survives PDF export. These are automated checks,
+not a visual review or a check of educational correctness.
+
+By default, the document uses as many pages as it needs, up to ten; there is no
+arbitrary three-page cap. Set `max_pages` only for a limit the user requested.
+If that limit is too small, Qwen Chat shows **Use N Pages** with the required count.
+Approval finishes the same export without rewriting the passage, removing questions,
+reducing answer lines or changing the source JSON. Refusing leaves any existing PDF
+untouched and blocks further tool calls in that reply. Documents beyond the ten-page
+limit pause for a decision on how to split them, rather than retrying or deleting content.
+An older draft that failed its page limit can be retried with the same JSON.
+
+When a request specifies question counts, Qwen is instructed to pass
+`expected_questions` and/or `expected_multiple_choice` to `render_worksheet`.
+A mismatch is rejected before rendering: three multiple-choice questions means
+three separate questions with options. The report lists both the total and the
+multiple-choice count; the optional bonus challenge is separate.
+
+Input and output paths stay in the workspace. Rendering follows the command-approval
+preference and Stop button; overwriting follows the normal file confirmation and
+Trash/Restore rules. A failed or cancelled render leaves an existing PDF untouched.
+Successful PDFs get an **Open** chip like other generated files.
+
+Relaunch Qwen Chat after updating the application to load new tools and instructions.
+Existing conversations can use them; a new chat is not required.
+
 ## Safety model
 
-- Every file path is resolved and must stay inside the workspace. Paths that escape with
-  `..`, absolute paths or symlinks are refused.
+- Ordinary file-tool paths are resolved and must stay inside the workspace. Paths that
+  escape with `..`, absolute paths or symlinks are refused. Skill tools additionally
+  manage only their fixed shared library; saving there needs separate approval.
 - Overwriting or deleting a file you had (not one Qwen wrote in this session) first moves
   the old file to the desktop Trash (`~/.local/share/Trash`), so **Restore** or the file
   manager can bring it back. To be asked first as well, turn on menu → *Ask Before
@@ -103,7 +239,7 @@ started it.
 | `server_url` | `http://127.0.0.1:8080` | llama-server address |
 | `server_command` | `["~/.local/bin/qwen-server"]` | How to start the server |
 | `context_size` | `16384` | Context window for a server the app starts |
-| `commands` | `true` | Let Qwen run commands and install programs (the **Run** button) |
+| `commands` | `true` | Let Qwen run commands and install programs (**Tools → Run**) |
 | `ask_commands` | `false` | Ask before every command and install, not only risky commands and big installs (menu → *Ask Before Every Command*) |
 | `ask_file_changes` | `false` | Also ask before overwriting or deleting a file, on top of the Trash backup (menu → *Ask Before Replacing or Deleting Files*) |
 | `stop_server_on_exit` | `true` | Stop the server on quit, if the app started it (menu → *Unload Model When Closing*) |
@@ -119,15 +255,40 @@ Chats are stored in `~/.local/share/qwen-chat/chats`. The server log is
   as fast and stable.
 - Speeds: reading runs at about 30 tokens/s and writing at 5–10 tokens/s. Writing slows
   down when the phone gets hot and lowers the GPU clock.
-- The first message after the server starts takes about 70 s, because the instructions
-  and tool descriptions (about 2,100 tokens) are read once. Later messages reuse them
-  from the cache.
+- The first message after the server starts is slower because the instructions and
+  tool descriptions have to be read once. Later messages reuse the cached prefix.
+  A design skill adds its instructions only when that skill is loaded.
 
 ## Development
 
 ```sh
-python3 -m unittest -q tests.test_tools tests.test_markdown
+python3 -m unittest -q tests.test_store tests.test_skills tests.test_agent tests.test_tools tests.test_markdown tests.test_worksheet_pdf
 ```
 
+The worksheet tests include a local headless render when Chromium, Poppler and the
+fonts are available; they do not download or install anything.
+
+Skill metadata uses PyYAML (`requirements.txt`, or Debian's `python3-yaml`).
 The GUI needs Debian's `/usr/bin/python3.11` (python3-gi, GTK 4.8, libadwaita 1.2,
 GtkSourceView 5). The launcher in `~/.local/bin/qwen-chat` sets this up.
+
+Native picker, keyboard, approval and chat-renaming tests use Xvfb, xdotool and ImageMagick, with isolated
+settings, chats, workspace and skills. They never start a model server. Run them
+separately, not on the user's desktop:
+
+```sh
+env -u LD_PRELOAD GSK_RENDERER=cairo QWEN_TEST_GUI=1 \
+  dbus-run-session -- xvfb-run -a /usr/bin/python3.11 -m unittest -q tests.test_window_ui
+```
+
+The per-user installer and model launchers can be checked without loading a model:
+
+```sh
+env -u LD_PRELOAD /usr/bin/python3 -m unittest -q tests.test_install
+```
+
+## License
+
+The app and its bundled skills use the [MIT license](LICENSE), matching the
+license shown in About. llama.cpp, Mesa, Chromium and the downloaded model
+retain their own licenses.

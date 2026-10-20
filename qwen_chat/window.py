@@ -18,6 +18,8 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 from . import APP_ID, APP_NAME  # noqa: E402
 from .agent import Agent, repair_history, salvage_args  # noqa: E402
 from .llm import Cancelled, LLMError, ServerError, gpu_busy_percent  # noqa: E402
+from .skill_picker import SkillPicker  # noqa: E402
+from .skills import slash_query  # noqa: E402
 from .store import ChatStore, title_from  # noqa: E402
 from .tools import ToolBox, ToolError, Workspace  # noqa: E402
 from .widgets import AssistantTurn, ConfirmCard, UserMessage, fmt_duration, open_uri  # noqa: E402
@@ -125,6 +127,8 @@ class ChatWindow(Adw.ApplicationWindow):
         self._pending_confirm: ConfirmCard | None = None
         self._queued: tuple[str, list[str]] | None = None   # sent when the current answer ends
         self._turn_started = 0.0
+        self._inserting_skill = False
+        self._dismissed_skill_query = None
 
         w, h = (settings["window_size"] + [1180, 820])[:2]
         self.set_default_size(int(w), int(h))
@@ -292,10 +296,7 @@ class ChatWindow(Adw.ApplicationWindow):
         qbox.append(q_title)
         self.queue_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         qbox.append(self.queue_label)
-        q_hint = Gtk.Label(label="sends when Qwen finishes")
-        q_hint.add_css_class("dim-label")
-        q_hint.add_css_class("caption")
-        qbox.append(q_hint)
+        qbox.set_tooltip_text("This message will be sent when Qwen finishes the current answer")
         q_edit = Gtk.Button(label="Edit", action_name="win.queue-edit", valign=Gtk.Align.CENTER,
                             tooltip_text="Put it back in the message box")
         q_edit.add_css_class("pill-small")
@@ -312,6 +313,7 @@ class ChatWindow(Adw.ApplicationWindow):
         clamp = Adw.Clamp(maximum_size=820, tightening_threshold=640)
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card.add_css_class("composer")
+        self.composer = card
 
         self.chips = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=6,
                                  column_spacing=6, row_spacing=6)
@@ -321,12 +323,14 @@ class ChatWindow(Adw.ApplicationWindow):
 
         tv_overlay = Gtk.Overlay()
         sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
-                                max_content_height=220)
+                                min_content_height=54, max_content_height=220)
         self.textview = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False,
                                      top_margin=8, bottom_margin=8, left_margin=10, right_margin=10)
         self.textview.add_css_class("composer-text")
+        self.textview.set_tooltip_text("Enter to send, Shift+Enter for a new line. Type / to suggest a skill.")
         self.buffer = self.textview.get_buffer()
         self.buffer.connect("changed", lambda *_: self._update_composer())
+        self.buffer.connect("mark-set", self._composer_mark_set)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         keys.connect("key-pressed", self._on_key)
@@ -340,60 +344,64 @@ class ChatWindow(Adw.ApplicationWindow):
         tv_overlay.add_overlay(self.placeholder)
         card.append(tv_overlay)
 
-        row = Gtk.Box(spacing=6)
-        self.web_toggle = self._pill("qwen-chat-web-symbolic", "Web", self.settings["web"],
-                                     "Let Qwen search and read the internet")
-        self.web_toggle.connect("toggled", self._on_web_toggled)
-        row.append(self.web_toggle)
-        self.files_toggle = self._pill("folder-symbolic", "Files", self.settings["files"],
-                                       f"Let Qwen read and write files in {_home(self.settings.workspace_path)}")
-        self.files_toggle.connect("toggled", self._on_files_toggled)
-        row.append(self.files_toggle)
-        self.run_toggle = self._pill("utilities-terminal-symbolic", "Run", self.settings["commands"],
-                                     RUN_TIP_AUTO)
-        self.run_toggle.connect("toggled", self._on_run_toggled)
-        row.append(self.run_toggle)
-        self.think_toggle = self._pill("emoji-objects-symbolic", "Think", self.settings["thinking"],
-                                       "Reason step by step before answering (slower, better for hard questions)")
-        self.think_toggle.connect("toggled", self._on_think_toggled)
-        row.append(self.think_toggle)
+        row = Gtk.Box(spacing=4)
+        row.add_css_class("composer-toolbar")
         self.attach_btn = Gtk.Button(icon_name="mail-attachment-symbolic", valign=Gtk.Align.CENTER,
                                      tooltip_text="Attach a file (copied into the workspace)")
         self.attach_btn.add_css_class("flat")
         self.attach_btn.add_css_class("circular")
         self.attach_btn.connect("clicked", lambda *_: self.pick_attachment())
         row.append(self.attach_btn)
+        self.skills_button = Gtk.MenuButton(direction=Gtk.ArrowType.UP,
+                                            tooltip_text="Suggest a skill (type / or press Ctrl+K)")
+        self.skills_button.add_css_class("composer-menu")
+        skill_label = Gtk.Box(spacing=5)
+        skill_label.append(Gtk.Image(icon_name="help-contents-symbolic"))
+        skill_label.append(Gtk.Label(label="Skills"))
+        self.skills_button.set_child(skill_label)
+        self.skill_picker = SkillPicker(
+            self.toolbox.skills, self._insert_skill,
+            lambda: self._skill_prompt(False), lambda: self._skill_prompt(True),
+            self.open_skill_library, lambda: self.textview.grab_focus(),
+            lambda: self.toolbox.files, lambda: bool(self.chat and self.chat.get("messages")))
+        self.skills_button.set_popover(self.skill_picker)
+        self.skills_button.set_create_popup_func(lambda *_: self.skill_picker.prepare())
+        row.append(self.skills_button)
+        self.tools_button = Gtk.MenuButton(direction=Gtk.ArrowType.UP,
+                                           tooltip_text="Choose tools and thinking")
+        self.tools_button.add_css_class("composer-menu")
+        tools_label = Gtk.Box(spacing=6)
+        tools_label.append(Gtk.Image(icon_name="preferences-system-symbolic"))
+        tools_label.append(Gtk.Label(label="Tools"))
+        self.tools_summary = Gtk.Label()
+        self.tools_summary.add_css_class("dim-label")
+        self.tools_summary.add_css_class("caption")
+        tools_label.append(self.tools_summary)
+        self.tools_button.set_child(tools_label)
+        self.tools_popover = self._build_tools_popover()
+        self.tools_button.set_popover(self.tools_popover)
+        row.append(self.tools_button)
         row.append(Gtk.Box(hexpand=True))
         self.ctx_label = Gtk.Label(valign=Gtk.Align.CENTER)
         self.ctx_label.add_css_class("ctx-label")
         self.ctx_label.add_css_class("caption")
         row.append(self.ctx_label)
-        self.action_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stop_btn = Gtk.Button(icon_name="media-playback-stop-symbolic", tooltip_text="Stop (Esc)",
+                                   valign=Gtk.Align.CENTER, visible=False)
+        self.stop_btn.add_css_class("circular")
+        self.stop_btn.add_css_class("stop-button")
+        self.stop_btn.connect("clicked", lambda *_: self.stop())
+        row.append(self.stop_btn)
         self.send_btn = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Send (Enter)",
                                    valign=Gtk.Align.CENTER)
         self.send_btn.add_css_class("circular")
         self.send_btn.add_css_class("suggested-action")
         self.send_btn.add_css_class("send-button")
         self.send_btn.connect("clicked", lambda *_: self.send())
-        self.action_stack.add_named(self.send_btn, "send")
-        self.stop_btn = Gtk.Button(icon_name="media-playback-stop-symbolic", tooltip_text="Stop (Esc)",
-                                   valign=Gtk.Align.CENTER)
-        self.stop_btn.add_css_class("circular")
-        self.stop_btn.add_css_class("stop-button")
-        self.stop_btn.connect("clicked", lambda *_: self.stop())
-        self.action_stack.add_named(self.stop_btn, "stop")
-        row.append(self.action_stack)
+        row.append(self.send_btn)
         card.append(row)
         clamp.set_child(card)
         outer.append(clamp)
-        self.caption = Gtk.Label(label=f"Files stay in {_home(self.settings.workspace_path)} · "
-                                       "Qwen can make mistakes, so check important facts.",
-                                 wrap=True, justify=Gtk.Justification.CENTER)
-        self.caption.add_css_class("caption")
-        self.caption.add_css_class("dim-label")
-        self.caption.add_css_class("composer-caption")
-        outer.append(self.caption)
-
         try:
             drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
             drop.connect("drop", self._on_drop)
@@ -402,21 +410,64 @@ class ChatWindow(Adw.ApplicationWindow):
             pass
         return outer
 
-    @staticmethod
-    def _pill(icon: str, label: str, active: bool, tooltip: str) -> Gtk.ToggleButton:
-        btn = Gtk.ToggleButton(active=active, tooltip_text=tooltip, valign=Gtk.Align.CENTER)
-        btn.add_css_class("pill-toggle")
-        box = Gtk.Box(spacing=5)
-        box.append(Gtk.Image(icon_name=icon))
-        box.append(Gtk.Label(label=label))
-        btn.set_child(box)
-        return btn
+    def _build_tools_popover(self) -> Gtk.Popover:
+        popover = Gtk.Popover(position=Gtk.PositionType.TOP, has_arrow=False, halign=Gtk.Align.START)
+        popover.add_css_class("composer-options")
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, width_request=320)
+        heading = Gtk.Label(label="Tools & thinking", xalign=0)
+        heading.add_css_class("heading")
+        body.append(heading)
+        group = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        group.add_css_class("boxed-list")
+
+        def option(title, subtitle, icon, key, callback):
+            toggle = Gtk.Switch(active=self.settings[key], valign=Gtk.Align.CENTER,
+                                tooltip_text=title)
+            option_row = Adw.ActionRow(title=title, subtitle=subtitle, subtitle_lines=2)
+            option_row.add_prefix(Gtk.Image(icon_name=icon))
+            option_row.add_suffix(toggle)
+            option_row.set_activatable_widget(toggle)
+            toggle.connect("notify::active", lambda btn, _prop: callback(btn))
+            group.append(option_row)
+            return toggle, option_row
+
+        self.web_toggle, _ = option("Web", "Search and read the internet",
+                                    "qwen-chat-web-symbolic", "web", self._on_web_toggled)
+        self.files_toggle, _ = option("Files", f"Only inside {_home(self.settings.workspace_path)}",
+                                      "folder-symbolic", "files", self._on_files_toggled)
+        self.run_toggle, self.run_row = option("Run", "Run programs in the workspace",
+                                               "utilities-terminal-symbolic", "commands",
+                                               self._on_run_toggled)
+        self.think_toggle, _ = option("Think", "More deliberate answers; takes longer",
+                                      "emoji-objects-symbolic", "thinking", self._on_think_toggled)
+        body.append(group)
+        hint = Gtk.Label(label="Enter to send · Shift+Enter for a new line", xalign=0)
+        hint.add_css_class("caption")
+        hint.add_css_class("dim-label")
+        body.append(hint)
+        popover.set_child(body)
+        return popover
+
+    def _sync_tools_summary(self) -> None:
+        files = self.files_toggle.get_active()
+        enabled = [name for name, active in (("Web", self.web_toggle.get_active()), ("Files", files),
+                                             ("Run", files and self.run_toggle.get_active())) if active]
+        self.tools_summary.set_label(f"{len(enabled)} on" if enabled else "off")
+        thinking = self.think_toggle.get_active()
+        self.tools_button.set_tooltip_text(
+            f"Tools: {', '.join(enabled) or 'off'}. Thinking: {'on' if thinking else 'off'}. "
+            "Click to change access or thinking.")
+        if thinking:
+            self.tools_summary.set_label(self.tools_summary.get_label() + " · Think")
 
     def _build_menu(self) -> Gio.Menu:
         menu = Gio.Menu()
         s1 = Gio.Menu()
         s1.append("New Chat", "win.new-chat")
         s1.append("Open Workspace Folder", "win.open-workspace")
+        s1.append("Skills", "win.skills")
+        s1.append("Save This Workflow as a Skill", "win.save-skill")
+        s1.append("Rename Chat...", "win.rename-chat")
         s1.append("Restart Model", "win.restart-model")
         menu.append_section(None, s1)
         look = Gio.Menu()
@@ -445,6 +496,12 @@ class ChatWindow(Adw.ApplicationWindow):
 
         add("new-chat", lambda *_: self.new_chat())
         add("open-workspace", lambda *_: self.open_workspace())
+        add("skills", lambda *_: self._show_skills())
+        add("save-skill", lambda *_: self._skill_prompt(True))
+        self.rename_action = add("rename-chat",
+                                 lambda *_: self.rename_chat(self.chat["id"]) if self.chat else None)
+        self.rename_action.set_enabled(False)
+        add("escape", lambda *_: self._escape())
         add("restart-model", lambda *_: self.restart_model())
         self.stop_action = add("stop", lambda *_: self.stop())
         add("toggle-sidebar", lambda *_: self.flap.set_reveal_flap(not self.flap.get_reveal_flap()))
@@ -496,6 +553,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _sync_run_tip(self) -> None:
         self.run_toggle.set_tooltip_text(RUN_TIP_AUTO if self._auto_approve() else RUN_TIP_ASK)
+        self.run_row.set_subtitle("Enable Files to run programs" if not self.files_toggle.get_active()
+                                 else "Ask before every command" if not self._auto_approve()
+                                 else "Routine commands run; risky changes ask")
 
     def _allow_all_in_chat(self) -> None:
         if self.chat is not None:
@@ -513,6 +573,7 @@ class ChatWindow(Adw.ApplicationWindow):
     def _on_web_toggled(self, btn) -> None:
         self.settings["web"] = self.toolbox.web = btn.get_active()
         self.settings.save()
+        self._sync_tools_summary()
 
     def _on_files_toggled(self, btn) -> None:
         self.settings["files"] = self.toolbox.files = btn.get_active()
@@ -522,10 +583,12 @@ class ChatWindow(Adw.ApplicationWindow):
     def _on_run_toggled(self, btn) -> None:
         self.settings["commands"] = self.toolbox.commands = btn.get_active()
         self.settings.save()
+        self._sync_tools_summary()
 
     def _on_think_toggled(self, btn) -> None:
         self.settings["thinking"] = btn.get_active()
         self.settings.save()
+        self._sync_tools_summary()
 
     # ================================================================== model server
     def preload_model(self) -> None:
@@ -613,11 +676,18 @@ class ChatWindow(Adw.ApplicationWindow):
                 lbl = Gtk.Label(label=info["title"], xalign=0, hexpand=True,
                                 ellipsize=Pango.EllipsizeMode.END, tooltip_text=info["title"])
                 box.append(lbl)
+                rename = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Rename chat",
+                                    valign=Gtk.Align.CENTER)
+                rename.add_css_class("flat")
+                rename.add_css_class("circular")
+                rename.add_css_class("row-action")
+                rename.connect("clicked", lambda _b, cid=info["id"]: self.rename_chat(cid))
+                box.append(rename)
                 delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete chat",
                                     valign=Gtk.Align.CENTER)
                 delete.add_css_class("flat")
                 delete.add_css_class("circular")
-                delete.add_css_class("row-delete")
+                delete.add_css_class("row-action")
                 delete.connect("clicked", lambda _b, cid=info["id"]: self.delete_chat(cid))
                 box.append(delete)
                 row.set_child(box)
@@ -677,6 +747,50 @@ class ChatWindow(Adw.ApplicationWindow):
         toast = Adw.Toast(title="Chat deleted", button_label="Undo", action_name="win.undo-delete",
                           timeout=6)
         self.toasts.add_toast(toast)
+
+    def rename_chat(self, chat_id: str) -> None:
+        chat = self.chat if self.chat and self.chat["id"] == chat_id else self.store.load(chat_id)
+        if chat is None:
+            self.toast("That chat could not be opened.")
+            self._reload_chat_list(self.chat["id"] if self.chat else None)
+            return
+        dialog = Adw.MessageDialog(transient_for=self, heading="Rename Chat",
+                                  body="Only the name changes. Your messages stay as they are.",
+                                  modal=True)
+        entry = Adw.EntryRow(title="Chat name", text=chat.get("title") or "Chat")
+        group = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        group.add_css_class("boxed-list")
+        group.append(entry)
+        dialog.set_extra_child(group)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("rename", "Rename")
+        dialog.set_response_appearance("rename", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("rename")
+        dialog.set_close_response("cancel")
+        entry.connect("changed", lambda *_: dialog.set_response_enabled(
+            "rename", bool(entry.get_text().strip())))
+        entry.connect("entry-activated", lambda *_: dialog.get_default_widget().activate()
+                      if dialog.get_response_enabled("rename") else None)
+
+        def respond(_dialog, response):
+            if response != "rename":
+                return
+            try:
+                title = self.store.rename(chat_id, entry.get_text())
+            except (OSError, ValueError) as exc:
+                self.toast(f"Couldn't rename the chat: {exc}")
+                return
+            if self.chat and self.chat["id"] == chat_id:
+                self.chat["title"] = title
+                self.title.set_title(title)
+            self._reload_chat_list(self.chat["id"] if self.chat else None)
+            self.toast("Chat renamed")
+
+        dialog.connect("response", respond)
+        self._dialog = dialog
+        dialog.present()
+        entry.grab_focus()
+        entry.select_region(0, -1)
 
     def _undo_delete(self) -> None:
         if self._deleted:
@@ -809,18 +923,121 @@ class ChatWindow(Adw.ApplicationWindow):
     def _update_composer(self) -> None:
         text = self._text()
         self.placeholder.set_visible(not text)
-        self.placeholder.set_label("Write a follow-up; Enter queues it for when Qwen finishes…"
+        self.placeholder.set_label("Add a follow-up…"
                                    if self.running else "Message Qwen…")
-        self.send_btn.set_sensitive(bool(text.strip() or self.attachments) and not self.running)
-        self.action_stack.set_visible_child_name("stop" if self.running else "send")
+        has_draft = bool(text.strip() or self.attachments)
+        self.send_btn.set_sensitive(has_draft)
+        self.send_btn.set_visible(not self.running or has_draft)
+        self.send_btn.set_tooltip_text("Queue after this answer (Enter)" if self.running else "Send (Enter)")
+        self.send_btn.set_icon_name("mail-send-symbolic" if self.running else "go-up-symbolic")
+        self.stop_btn.set_visible(self.running)
         self.stop_action.set_enabled(self.running)
         self.attach_btn.set_sensitive(self.files_toggle.get_active())
         # Commands run in the workspace, so they go together with file access.
         self.run_toggle.set_sensitive(self.files_toggle.get_active())
+        self._sync_run_tip()
+        self._sync_tools_summary()
         self.new_btn.set_sensitive(not self.running)
         self.chat_list.set_sensitive(not self.running)
+        self._update_skill_completion()
+
+    def _composer_mark_set(self, _buffer, _iter, mark):
+        if mark.get_name() == "insert":
+            self._update_skill_completion()
+
+    def _skill_query(self):
+        cursor = self.buffer.get_iter_at_mark(self.buffer.get_insert()).get_offset()
+        return slash_query(self._text(), cursor)
+
+    def _update_skill_completion(self):
+        if self._inserting_skill or not hasattr(self, "skill_picker"):
+            return
+        query = self._skill_query()
+        if query is None:
+            self._dismissed_skill_query = None
+            if self.skill_picker.inline:
+                self.skill_picker.popdown()
+        elif query != self._dismissed_skill_query:
+            self.skill_picker.show_inline(query[2])
+
+    def _show_skills(self):
+        self.skills_button.popup()
+
+    def _escape(self):
+        if self.skill_picker.get_visible():
+            self._dismissed_skill_query = self._skill_query()
+            self.skill_picker.popdown()
+            self.textview.grab_focus()
+        elif self.tools_popover.get_visible():
+            self.tools_popover.popdown()
+            self.textview.grab_focus()
+        elif self.running:
+            self.stop()
+
+    def _insert_skill(self, name):
+        query = self._skill_query()
+        cursor = self.buffer.get_iter_at_mark(self.buffer.get_insert()).get_offset()
+        start, end = query[:2] if query is not None else (cursor, cursor)
+        text = self._text()
+        prefix = " " if start and not text[start - 1].isspace() else ""
+        suffix = "" if text[end:end + 1].isspace() else " "
+        replacement = prefix + "/" + name + suffix
+        caret = start + len(replacement) + (0 if suffix else 1)
+        self._inserting_skill = True
+        self.buffer.begin_user_action()
+        try:
+            self.buffer.delete(self.buffer.get_iter_at_offset(start), self.buffer.get_iter_at_offset(end))
+            self.buffer.insert(self.buffer.get_iter_at_offset(start), replacement)
+            self.buffer.place_cursor(self.buffer.get_iter_at_offset(caret))
+        finally:
+            self.buffer.end_user_action()
+            self._inserting_skill = False
+        self._dismissed_skill_query = None
+        self.skill_picker.popdown()
+        self.textview.grab_focus()
+        self._update_composer()
+
+    def _skill_prompt(self, from_workflow):
+        if not self.toolbox.files:
+            self.toast("Turn on Files to create and save a skill.")
+            return
+        if from_workflow and not (self.chat and self.chat.get("messages")):
+            self.toast("Work through a task first, or choose Create a skill.")
+            return
+        prompt = ("/skill-creator Package the successful workflow from this conversation as a "
+                  "reusable skill for all my chats. Keep the general method, useful helpers and "
+                  "checks, not private details or one-off output. Let me review it before saving."
+                  if from_workflow else
+                  "/skill-creator Help me build a reusable skill for all my chats. Use the task "
+                  "I describe, ask only for missing details, and show me the package before saving.")
+        existing = self._text().strip()
+        self.buffer.insert(self.buffer.get_end_iter(), ("\n\n" if existing else "") + prompt)
+        self.buffer.place_cursor(self.buffer.get_end_iter())
+        self.textview.grab_focus()
+        self.toast("Review the request, then send it. Your existing draft is kept.")
+
+    def open_skill_library(self):
+        try:
+            root = self.toolbox.skills.user_root
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            open_uri(root.as_uri())
+        except OSError as exc:
+            self.toast(f"Couldn't open the skill library: {exc}")
 
     def _on_key(self, _ctrl, keyval, _code, state) -> bool:
+        if self.skill_picker.get_visible() and self.skill_picker.inline:
+            if keyval == Gdk.KEY_Escape:
+                self._dismissed_skill_query = self._skill_query()
+                self.skill_picker.popdown()
+                return True
+            if not state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                if keyval in (Gdk.KEY_Up, Gdk.KEY_Down):
+                    self.skill_picker.move(-1 if keyval == Gdk.KEY_Up else 1)
+                    return True
+                if keyval in (Gdk.KEY_Tab, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                    if self.skill_picker.select_current():
+                        return True
+                    self.skill_picker.popdown()
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             if state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK):
                 if state & Gdk.ModifierType.CONTROL_MASK:
@@ -832,17 +1049,16 @@ class ChatWindow(Adw.ApplicationWindow):
         return False
 
     def _update_context(self) -> None:
-        if not self.chat or not self.chat.get("messages"):
-            self.ctx_label.set_label("")
-            return
+        self.rename_action.set_enabled(self.chat is not None)
+        messages = self.chat.get("messages", []) if self.chat else []
         used = 0
-        for m in reversed(self.chat["messages"]):
+        for m in reversed(messages):
             t = m.get("_meta", {}).get("timings") if m.get("role") == "assistant" else None
             if t and t.get("prompt_n") is not None:
                 used = (t.get("cache_n") or 0) + (t.get("prompt_n") or 0) + (t.get("predicted_n") or 0)
                 break
         if not used:
-            used = sum(len(str(m.get("content") or "")) for m in self.chat["messages"]) // 3
+            used = sum(len(str(m.get("content") or "")) for m in messages) // 3
         total = self.server.n_ctx
         self.ctx_label.set_label(f"{_k(used)} / {total // 1000}k")
         full = used > total * 0.8
@@ -960,10 +1176,12 @@ class ChatWindow(Adw.ApplicationWindow):
         if typed:
             self.buffer.set_text("")
         self._clear_chips()
+        self._update_composer()
         if self.running:
             self._queue(text, atts)
         else:
             self._submit(text, atts)
+        self.textview.grab_focus()
 
     def _queue(self, text: str, atts: list[str]) -> None:
         if self._queued is not None:
@@ -1017,6 +1235,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.store.save(self.chat)
         self._reload_chat_list(self.chat["id"])
         self.title.set_title(self.chat["title"])
+        self.rename_action.set_enabled(True)
         self.stack.set_visible_child_name("chat")
         self.msg_box.append(UserMessage(content))
         self._start_turn()
@@ -1178,7 +1397,9 @@ class ChatWindow(Adw.ApplicationWindow):
     def _approve(self, title: str, detail: str, code: str, action: str, reason: str = "") -> bool:
         """Commands and installs the ToolBox wants an OK for: risky or big ones (with a reason),
         or every one when "Ask Before Every Command" is on."""
-        icon = "system-software-install-symbolic" if action == "Install" else "utilities-terminal-symbolic"
+        icon = ("document-new-symbolic" if action.startswith("Use ") and action.endswith(" Pages") else
+                "document-save-symbolic" if action in ("Save Skill", "Update Skill") else
+                "system-software-install-symbolic" if action == "Install" else "utilities-terminal-symbolic")
         extra = None if reason else ("Allow All in This Chat", self._allow_all_in_chat)
         return self._confirm(title, detail, code=code, allow_label=action, icon=icon, always=True,
                              reason=reason, extra=extra)
@@ -1253,7 +1474,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def _show_shortcuts(self) -> None:
         rows = [("Send message", "Enter"), ("New line", "Shift+Enter"), ("Stop answering", "Esc"),
+                ("Suggest a skill", "/ or Ctrl+K"), ("Choose a skill suggestion", "Up/Down, Tab/Enter"),
                 ("New chat", "Ctrl+N"), ("Focus the message box", "Ctrl+L"),
+                ("Rename current chat", "F2"),
                 ("Show or hide chats", "F9"), ("Quit", "Ctrl+Q")]
         dlg = Adw.MessageDialog(transient_for=self, heading="Keyboard Shortcuts")
         grid = Gtk.Grid(column_spacing=24, row_spacing=8)
@@ -1281,4 +1504,3 @@ def apply_color_scheme(name: str) -> None:
         "light": Adw.ColorScheme.FORCE_LIGHT,
         "dark": Adw.ColorScheme.FORCE_DARK,
     }.get(name, Adw.ColorScheme.DEFAULT))
-

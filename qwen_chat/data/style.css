@@ -12,17 +12,18 @@
   min-height: 34px;
   border-radius: 8px;
 }
-.chat-row .row-delete {
+.chat-row .row-action {
   opacity: 0;
   min-width: 26px;
   min-height: 26px;
   padding: 0;
 }
-.chat-row:hover .row-delete,
-.chat-row:selected .row-delete {
+.chat-row:hover .row-action,
+.chat-row:selected .row-action,
+.chat-row .row-action:focus-visible {
   opacity: 0.7;
 }
-.chat-row .row-delete:hover {
+.chat-row .row-action:hover {
   opacity: 1;
 }
 .chat-group-header {
@@ -72,6 +73,22 @@ button.suggestion:hover {
 }
 button.suggestion image {
   color: @accent_color;
+}
+
+/* ---------------------------------------------------------------- skills */
+.skill-picker > contents {
+  padding: 14px;
+}
+.skill-list {
+  background-color: transparent;
+}
+.skill-list row {
+  padding: 9px 10px;
+  border-radius: 9px;
+}
+.skill-list row:selected {
+  background-color: alpha(@accent_bg_color, 0.16);
+  color: @window_fg_color;
 }
 
 /* ---------------------------------------------------------------- messages */
@@ -341,7 +358,7 @@ image.warning {
 
 /* ---------------------------------------------------------------- composer */
 .composer-area {
-  padding: 4px 16px 6px 16px;
+  padding: 8px 16px 14px 16px;
 }
 .queue-bar {
   margin: 0 6px 8px 6px;
@@ -354,7 +371,7 @@ image.warning {
   color: @accent_color;
 }
 .composer {
-  padding: 4px 8px 8px 6px;
+  padding: 6px 8px 8px 8px;
   border-radius: 18px;
   background-color: @view_bg_color;
   box-shadow: 0 0 0 1px alpha(@borders, 1), 0 2px 8px alpha(black, 0.07);
@@ -368,26 +385,31 @@ image.warning {
   color: alpha(@window_fg_color, 0.45);
   font-size: 1.04em;
 }
-.composer-caption {
-  margin: 6px 12px 2px 12px;
-  font-size: 0.8em;
+.composer-toolbar {
+  padding: 0 2px;
 }
-button.pill-toggle {
-  padding: 3px 11px;
-  min-height: 26px;
-  border-radius: 999px;
+.composer-menu > button {
+  padding: 5px 9px;
+  min-height: 28px;
+  border-radius: 10px;
   background-color: transparent;
-  box-shadow: inset 0 0 0 1px alpha(@borders, 1);
-  color: alpha(@window_fg_color, 0.7);
+  box-shadow: none;
+  color: alpha(@window_fg_color, 0.76);
   font-weight: normal;
 }
-button.pill-toggle:hover {
+.composer-menu > button:hover,
+.composer-menu > button:checked {
   background-color: alpha(@window_fg_color, 0.05);
 }
-button.pill-toggle:checked {
-  background-color: alpha(@accent_bg_color, 0.14);
-  box-shadow: inset 0 0 0 1px alpha(@accent_color, 0.45);
-  color: @accent_color;
+.composer-menu image {
+  opacity: 0.75;
+}
+.composer-options > contents {
+  padding: 14px;
+}
+.composer-options row {
+  padding: 4px 10px;
+  min-height: 56px;
 }
 .send-button,
 .stop-button {
@@ -399,7 +421,7 @@ button.pill-toggle:checked {
   color: @window_bg_color;
 }
 .ctx-label {
-  color: alpha(@window_fg_color, 0.45);
+  color: alpha(@window_fg_color, 0.65);
   font-feature-settings: "tnum";
   margin-right: 4px;
 }

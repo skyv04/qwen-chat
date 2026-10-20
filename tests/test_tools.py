@@ -169,13 +169,15 @@ class ProgramToolsTest(unittest.TestCase):
         self.reasons.append(reason)
         return self.allow
 
-    def run_tool(self, name, **args):
-        return self.box.run(name, json.dumps(args))
+    def run_tool(self, tool_name, **args):
+        return self.box.run(tool_name, json.dumps(args))
 
     def test_offered_only_with_files_and_commands_on(self):
         names = lambda box: {t["function"]["name"] for t in box.schemas()}
-        self.assertIn("run_command", names(self.box))
-        self.assertNotIn("run_command", names(ToolBox(self.ws, web=True, files=True)))
+        for name in ("run_command", "render_worksheet"):
+            self.assertIn(name, names(self.box))
+            self.assertNotIn(name, names(ToolBox(self.ws, web=True, files=True)))
+            self.assertNotIn(name, names(ToolBox(self.ws, files=False, commands=True)))
         self.assertNotIn("install_packages", names(ToolBox(self.ws, files=False, commands=True)))
 
     def test_command_runs_only_when_approved(self):
@@ -392,6 +394,211 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn("Debian package: tesseract-ocr", out)
         self.assertIn("python module json: installed", out)
         self.assertIn("python module no_such_module_qwen: not installed", out)
+
+    def _worksheet_spec(self):
+        (self.ws.root / "quiz.json").write_text(json.dumps({
+            "title": "A quiz", "questions": [{"prompt": "What did you find?", "lines": 4}],
+        }))
+
+    @staticmethod
+    def _render_ok(argv, *_args):
+        Path(argv[-1]).write_bytes(b"%PDF-1.7\nrendered")
+        return 0, json.dumps({"ok": True, "text_preserved": True, "portrait": True,
+                              "layout_checked": True, "pages": 1, "color_emoji_checked": 4}), ""
+
+    def test_skill_name_is_registered_not_a_path(self):
+        ok, text = self.run_tool("load_skill", name="worksheet-pdf")
+        self.assertTrue(ok, text)
+        self.assertIn("render_worksheet", text)
+        for name in ("../../tools.py", "/etc/passwd", "unknown"):
+            ok, text = self.run_tool("load_skill", name=name)
+            self.assertFalse(ok)
+            self.assertIn("Unknown skill", text)
+
+    def test_worksheet_paths_and_approval_are_enforced(self):
+        self._worksheet_spec()
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (self.ws.root / "link").symlink_to(outside, target_is_directory=True)
+        with mock.patch.object(tools, "run_streaming") as run:
+            for spec, output in (("../outside/quiz.json", "quiz.pdf"),
+                                 ("quiz.json", "link/quiz.pdf"),
+                                 ("quiz.json", "../outside/quiz.pdf")):
+                ok, text = self.run_tool("render_worksheet", spec_path=spec, path=output)
+                self.assertFalse(ok)
+                self.assertIn("outside the workspace", text)
+            self.allow = False
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+            self.assertFalse(ok)
+            self.assertIn("said no", text)
+            self.allow = True
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="other.pdf")
+            self.assertFalse(ok)
+            self.assertIn("already said no", text)
+            self.assertEqual(len(self.asked), 1)
+            run.assert_not_called()
+
+    def test_worksheet_checks_requested_question_counts_before_rendering(self):
+        self._worksheet_spec()
+        with mock.patch.object(tools, "run_streaming") as run:
+            for expected, message in (({"expected_multiple_choice": 3}, "needs 3 multiple-choice questions"),
+                                      ({"expected_questions": 5}, "needs 5 questions"),
+                                      ({"expected_multiple_choice": True}, "must be an integer")):
+                ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf",
+                                        **expected)
+                self.assertFalse(ok, text)
+                self.assertIn(message, text)
+            run.assert_not_called()
+        self.assertEqual(self.asked, [])
+
+    @staticmethod
+    def _page_limit(pages=5, limit=3):
+        return 2, json.dumps({"ok": False, "code": "page_limit", "pages": pages, "max_pages": limit}), ""
+
+    def test_page_limit_asks_once_and_exports_without_rewriting_content(self):
+        self._worksheet_spec()
+        source = self.ws.root / "quiz.json"
+        data = json.loads(source.read_text())
+        data["max_pages"] = 3
+        source.write_text(json.dumps(data))
+        before = source.read_bytes()
+        rendered = []
+        self.box.auto_approve = lambda: True
+
+        def render(argv, *_args):
+            rendered.append(json.loads(Path(argv[-2]).read_text()))
+            if len(rendered) == 1:
+                return self._page_limit()
+            rc, out, reason = self._render_ok(argv)
+            return rc, json.dumps({**json.loads(out), "pages": 5}), reason
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf",
+                                    expected_questions=1, expected_multiple_choice=0)
+        self.assertTrue(ok, text)
+        self.assertEqual(rendered, [data, {**data, "max_pages": 5}])
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.asked[0][3], "Use 5 Pages")
+        self.assertIn("without changing", self.reasons[0])
+        self.assertIn("user approved 5 pages", text)
+        self.assertTrue((self.ws.root / "quiz.pdf").is_file())
+
+    def test_refusing_more_pages_blocks_rewrites_and_preserves_existing_pdf(self):
+        self._worksheet_spec()
+        source = self.ws.root / "quiz.json"
+        data = {**json.loads(source.read_text()), "max_pages": 3}
+        source.write_text(json.dumps(data))
+        before = source.read_bytes()
+        target = self.ws.root / "quiz.pdf"
+        target.write_bytes(b"original PDF")
+        self.box.auto_approve = lambda: True
+        self.allow = False
+        with mock.patch.object(tools, "run_streaming", return_value=self._page_limit()) as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+        self.assertFalse(ok)
+        self.assertIn("did not allow more pages", text)
+        self.assertTrue(self.box.declined)
+        self.assertEqual(run.call_count, 1)
+        ok, text = self.run_tool("write_file", path="quiz.json", content="remove questions")
+        self.assertFalse(ok)
+        self.assertIn("already said no", text)
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(target.read_bytes(), b"original PDF")
+        self.assertFalse(self.ws.trash_dir.exists())
+
+    def test_stopping_during_page_approval_never_restarts_the_renderer(self):
+        import threading
+        self._worksheet_spec()
+        source = self.ws.root / "quiz.json"
+        source.write_text(json.dumps({**json.loads(source.read_text()), "max_pages": 3}))
+        self.box.auto_approve = lambda: True
+        self.box.cancel = threading.Event()
+        self.box.approve = lambda *_: self.box.cancel.set() or True
+        with mock.patch.object(tools, "run_streaming", return_value=self._page_limit()) as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+        self.assertFalse(ok)
+        self.assertIn("Stopped", text)
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse((self.ws.root / "quiz.pdf").exists())
+
+    def test_disabling_run_during_page_approval_prevents_a_second_render(self):
+        self._worksheet_spec()
+        source = self.ws.root / "quiz.json"
+        source.write_text(json.dumps({**json.loads(source.read_text()), "max_pages": 3}))
+        self.box.auto_approve = lambda: True
+
+        def disable_run(*_):
+            self.box.commands = False
+            return True
+
+        self.box.approve = disable_run
+        with mock.patch.object(tools, "run_streaming", return_value=self._page_limit()) as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+        self.assertFalse(ok)
+        self.assertIn("Files and Run enabled", text)
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse((self.ws.root / "quiz.pdf").exists())
+
+    def test_failed_or_stopped_render_never_replaces_an_existing_pdf(self):
+        self._worksheet_spec()
+        target = self.ws.root / "quiz.pdf"
+        target.write_bytes(b"original document")
+        self.box.auto_approve = lambda: True
+        for result, message in (((1, "Needs 4 pages", ""), "not saved"),
+                                ((-15, "", "cancelled"), "Stopped"),
+                                ((-15, "", "timeout"), "timed out"),
+                                ((0, "not a report", ""), "no valid layout report"),
+                                ((0, '{"ok": true}', ""), "did not confirm")):
+            with self.subTest(result=result):
+                with mock.patch.object(tools, "run_streaming", return_value=result):
+                    ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+                self.assertFalse(ok, text)
+                self.assertIn(message, text)
+                self.assertEqual(target.read_bytes(), b"original document")
+                self.assertFalse(self.ws.trash_dir.exists())
+                self.assertEqual(list(self.ws.root.glob(".qwen-pdf-*")), [])
+
+    def test_successful_pdf_has_open_chip_and_recoverable_original(self):
+        self._worksheet_spec()
+        target = self.ws.root / "quiz.pdf"
+        target.write_bytes(b"the user's original")
+        trashed = []
+        self.ws.on_trash = lambda original, backup: trashed.append((original, backup))
+        self.box.auto_approve = lambda: True
+        with mock.patch.object(tools, "run_streaming", side_effect=self._render_ok):
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+        self.assertTrue(ok, text)
+        self.assertIn("old version is in the Trash", text)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.box.result_paths("render_worksheet", {"path": "quiz.pdf"}, text), [target])
+        self.assertEqual(trashed[0][1].read_bytes(), b"the user's original")
+        self.ws.restore(*trashed[0])
+        self.assertEqual(target.read_bytes(), b"the user's original")
+
+    def test_pdf_overwrite_refusal_and_concurrent_user_edit_are_preserved(self):
+        self._worksheet_spec()
+        target = self.ws.root / "quiz.pdf"
+        target.write_bytes(b"original")
+        self.ws.confirm = lambda *_: False
+        self.box.auto_approve = lambda: True
+        with mock.patch.object(tools, "run_streaming") as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+            self.assertFalse(ok)
+            self.assertIn("declined overwriting", text)
+            run.assert_not_called()
+        self.ws.confirm = lambda *_: True
+
+        def edited_during_render(*args):
+            target.write_bytes(b"edited by the user during rendering")
+            return self._render_ok(*args)
+
+        with mock.patch.object(tools, "run_streaming", side_effect=edited_during_render):
+            ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+        self.assertFalse(ok)
+        self.assertIn("destination changed", text)
+        self.assertEqual(target.read_bytes(), b"edited by the user during rendering")
+        self.assertFalse(self.ws.trash_dir.exists())
 
 
 if __name__ == "__main__":
