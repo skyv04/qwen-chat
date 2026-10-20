@@ -77,6 +77,20 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(args[-2:], ["--port", "8181"])
                 if name == "qwen-server":
                     self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
+        prefix = self.home / "mesa-adreno"
+        icd = prefix / "share/vulkan/icd.d/freedreno_icd.aarch64.json"
+        icd.parent.mkdir(parents=True)
+        icd.write_text("{}")
+        default_env = {k: v for k, v in env.items() if k != "QWEN_GPU_ENV"}
+        default_env["MESA_ADRENO_PREFIX"] = str(prefix)
+        result = subprocess.run([str(self.home / ".local/bin/qwen-server")], env=default_env,
+                                check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(json.loads(result.stdout)["driver"], str(icd))
+        icd.unlink()
+        result = subprocess.run([str(self.home / ".local/bin/qwen-server")], env=default_env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Turnip ICD not found", result.stderr)
         gpu_env.unlink()
         result = subprocess.run([str(self.home / ".local/bin/qwen-server")], env=env,
                                 capture_output=True, text=True, timeout=10)

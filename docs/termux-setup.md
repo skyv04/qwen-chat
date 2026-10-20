@@ -21,11 +21,12 @@ restrictions. Its root account is not Android root. The bridge app provides
 camera, microphone and codec access; **Qwen inference does not go through that
 app**. Turnip talks directly to the Adreno device through `/dev/kgsl-3d0`.
 
-The tested Mesa prefix is `/opt/mesa-adreno`, with its `activate.sh` environment
-script. In a Debian terminal:
+The tested Mesa prefix is `/opt/mesa-adreno`. In a Debian terminal:
 
 ```sh
-. /opt/mesa-adreno/activate.sh
+export LD_LIBRARY_PATH="/opt/mesa-adreno/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export VK_DRIVER_FILES=/opt/mesa-adreno/share/vulkan/icd.d/freedreno_icd.aarch64.json
+export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
 env -u LD_PRELOAD vulkaninfo --summary
 ```
 
@@ -93,7 +94,7 @@ to two jobs is deliberate: an earlier six-job build exhausted memory and
 took down the Termux session. Close other heavy applications first.
 
 Removing `LD_PRELOAD` avoids a child-process hang caused by inherited bridge
-shims. Keep the Turnip library and driver paths from `activate.sh`.
+shims. Keep the Turnip library and driver paths from step 1.
 
 ## 4. Download and verify the model
 
@@ -137,6 +138,9 @@ its desktop icon; if XFCE asks, choose **Allow Launching**. Leave out that
 option if you do not want another desktop icon. Keep the checkout where it
 is, because the launcher loads the Python code and bundled skills from it.
 Installation does not start a model, change chats, or download packages.
+It also installs `scripts/turnip-env.sh` for the model launcher, so no private
+`gpu-env.sh` or hand-made `activate.sh` is needed. That helper selects the
+already-built Mesa driver; it does not build or replace Mesa.
 
 The app reuses an existing server at `127.0.0.1:8080`, or starts one using
 `~/.local/bin/qwen-server`. **Do not start a second server for a second window.**
@@ -166,7 +170,8 @@ all phones equivalent. Do not treat an always-busy GPU as a performance target.
 |---|---|
 | `QWEN_LLAMA_BIN` | `~/Documents/GitHub/llama.cpp/build-vulkan/bin` |
 | `QWEN_MODEL` | `~/models/Qwen3.5-9B-Q4_K_M.gguf` |
-| `QWEN_GPU_ENV` | `/opt/mesa-adreno/activate.sh` |
+| `QWEN_GPU_ENV` | `~/.local/share/qwen-chat/turnip-env.sh` (respects `XDG_DATA_HOME`) |
+| `MESA_ADRENO_PREFIX` | `/opt/mesa-adreno` for the bundled Turnip helper |
 | `QWEN_CTX` | `16384` for manual launches; the GUI uses `context_size` from settings |
 | `QWEN_SKIP_MEM_CHECK` | Unset. `1` bypasses the memory check, at your own risk |
 

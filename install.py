@@ -72,6 +72,7 @@ def main() -> None:
     model_launcher = (ROOT / "scripts/qwen").read_bytes()
     for name in ("qwen", "qwen-server"):
         install_file(bin_dir / name, model_launcher, 0o755)
+    install_file(data_dir / "qwen-chat/turnip-env.sh", (ROOT / "scripts/turnip-env.sh").read_bytes())
     icon = ROOT / f"qwen_chat/data/icons/hicolor/scalable/apps/{APP_ID}.svg"
     install_file(data_dir / f"icons/hicolor/scalable/apps/{APP_ID}.svg", icon.read_bytes())
     entry = (
