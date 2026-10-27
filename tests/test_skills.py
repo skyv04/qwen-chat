@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import unittest
@@ -76,8 +77,30 @@ class SkillLibraryTest(unittest.TestCase):
         ok, text = self.run_tool("load_skill", name="worksheet-pdf")
         self.assertTrue(ok, text)
         self.assertIn("render_worksheet", text)
+        ok, text = self.run_tool("load_skill", name="answer-key")
+        self.assertTrue(ok, text)
+        self.assertIn("read_quiz", text)
+        self.assertIn("render_answer_key", text)
         self.approve.assert_not_called()
         self.assertEqual(list(self.ws.root.iterdir()), [])
+
+    def test_library_is_kept_apart_from_chats_and_older_skills_move_there(self):
+        data, harness = self.root / "share/qwen-chat", self.root / "share/qwen-chat-harness"
+        for root, name, body in ((data / "skills", "ocean-quiz", "Old copy."),
+                                 (data / "skills", "river-quiz", "Rivers."),
+                                 (harness / "skills", "ocean-quiz", "Kept copy.")):
+            (root / name).mkdir(parents=True)
+            (root / name / "SKILL.md").write_bytes(skill_text(name, body))
+        (data / "chats").mkdir()
+        (data / "chats" / "keep.json").write_text("{}")
+        with mock.patch.multiple(skills.config, DATA_DIR=data, HARNESS_DIR=harness):
+            registry = SkillRegistry()
+        self.assertEqual(registry.user_root, (harness / "skills").resolve())
+        self.assertEqual(registry.get("ocean-quiz").instructions, "Kept copy.")
+        self.assertTrue((data / "skills/ocean-quiz/SKILL.md").is_file())  # never overwritten
+        self.assertEqual((data / "chats/keep.json").read_text(), "{}")
+        shutil.rmtree(data)  # deleting every chat leaves the library intact
+        self.assertEqual(registry.get("river-quiz").instructions, "Rivers.")
 
     def test_save_is_visible_to_existing_and_new_readers(self):
         existing = ToolBox(Workspace(self.root / "second-workspace"),

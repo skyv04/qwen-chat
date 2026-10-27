@@ -23,7 +23,9 @@ TOOL_ICONS = {
     "download_file": "folder-download-symbolic",
     "list_files": "folder-symbolic",
     "read_file": "text-x-generic-symbolic",
+    "read_quiz": "text-x-generic-symbolic",
     "write_file": "document-edit-symbolic",
+    "edit_file": "document-edit-symbolic",
     "make_directory": "folder-new-symbolic",
     "move_path": "go-next-symbolic",
     "delete_path": "user-trash-symbolic",
@@ -34,6 +36,8 @@ TOOL_ICONS = {
     "list_skills": "view-list-symbolic",
     "save_skill": "document-save-symbolic",
     "render_worksheet": "x-office-document-symbolic",
+    "render_answer_key": "x-office-document-symbolic",
+    "open_file": "document-open-symbolic",
 }
 
 _LANG_ALIASES = {"py": "python3", "python": "python3", "js": "js", "javascript": "js",
@@ -359,7 +363,9 @@ STEP_WORDS = {
     "download_file": ("downloaded a file", "downloaded {n} files"),
     "list_files": ("looked at the files", "looked at the files"),
     "read_file": ("read a file", "read {n} files"),
+    "read_quiz": ("read a source quiz", "read {n} source quizzes"),
     "write_file": ("wrote a file", "wrote {n} files"),
+    "edit_file": ("edited a file", "made {n} edits"),
     "make_directory": ("made a folder", "made {n} folders"),
     "move_path": ("moved a file", "moved {n} files"),
     "delete_path": ("deleted a file", "deleted {n} files"),
@@ -370,6 +376,8 @@ STEP_WORDS = {
     "list_skills": ("looked for skills", "looked for skills"),
     "save_skill": ("saved a skill", "saved {n} skills"),
     "render_worksheet": ("created a PDF", "created {n} PDFs"),
+    "render_answer_key": ("created an answer key", "created {n} answer keys"),
+    "open_file": ("requested a file open", "requested {n} file opens"),
 }
 
 

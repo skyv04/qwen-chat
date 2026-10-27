@@ -1,119 +1,109 @@
 ---
 name: worksheet-pdf
-description: Render reading quizzes and worksheets with coherent visual themes, color emoji, portrait pages and usable answer space. Use for new quiz PDFs or visual redesigns.
+description: Render reading quizzes, homework and worksheets with coherent visual themes, color emoji, portrait pages and usable answer space, plus a matching parent answer key in the same call. Use for new quiz PDFs or visual redesigns.
 compatibility: Qwen Chat with Files and Run enabled; uses its render_worksheet tool.
 ---
 
 # Worksheet PDF design
 
-Use this skill for reading-comprehension PDFs, quizzes, tests, activity sheets,
-and visual redesigns of those documents. Use the bundled `render_worksheet`
-tool, not a freshly invented ReportLab/FPDF script.
-For a new quiz, generate fresh content for the requested topic and grade normally.
-This skill handles the visual presentation, not a requirement to reuse old wording.
+Write the content as a JSON file, then call the bundled `render_worksheet` tool. Do not
+write a ReportLab/FPDF script. For a NEW worksheet that also needs a parent/teacher key,
+put the answers in the same JSON and pass `answer_key_path`: one call checks every
+answer, then makes the student PDF without answers and a key in the same theme. For a
+key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answer_key`.
 
-## Work in this order
+## Steps
 
-1. Establish the requested question mix before drafting. "3 multiple choice" means
-   exactly three separate questions with options, not one question with three options.
-   Keep the requested total as well: five questions including three multiple choice
-   means three with options and two written responses. Do not expand a short quiz
-   into ten questions plus an unrequested challenge. Check that answers are supported
-   by the passage; label predictions/inferences clearly.
-2. Read the source/reference and the latest saved file. When the request is
-   about appearance, copy the passage, questions and options exactly. Do not
-   rewrite, simplify, remove questions, invent an answer key, or alter difficulty.
-   PDF text extraction does not let you see a reference's visual appearance.
-   Reuse a worksheet's existing JSON specification when it matches the current
-   source, rather than rebuilding its content from decorative PDF headers and icons.
-3. Choose a coherent theme: a short name, one dark accent color, 3-5 related emoji,
-   and a margin motif. For example:
-   - Rainforest: `#176B56`, `leaves`, 🌿 🦜 🐆 🌎
-   - Ocean: `#086779`, `waves`, 🌊 🐙 🐠 🐚
-   - Space: `#5143A6`, `stars`, 🚀 🪐 ⭐ 🔭
-   - Another topic: pick suitable emoji and use `dots` if no other motif fits.
-   Decorations belong in headers, margins, section markers and question badges;
-   never behind the passage or across answer lines. More decoration should not
-   mean less room to read or write.
-4. Write a plain JSON specification in the workspace. Omit `max_pages` unless the
-   user requested a page limit; do not copy a limit from an example. With no limit,
-   the renderer uses the pages the content needs, up to ten. Keep each write_file call
-   below 8,000 characters; append at JSON field/item boundaries if necessary,
-   never inside quoted text. This is content
-   data, not code. Preserve an existing worksheet by using a new output filename.
-5. Call `render_worksheet(spec_path="practice/quiz.json", path="practice/quiz.pdf")`.
-   Pass `expected_multiple_choice=3` when the user requested three multiple-choice
-   questions, and `expected_questions=5` when they requested five total. These values
-   come from the request, not the draft's current counts. A mismatch is reported
-   before rendering, so correct the question mix, not the expected count.
-   The renderer gives portrait Letter pages, embedded fonts and actual color emoji,
-   numbered paragraphs, consistent headings, page numbers, thematic margin art,
-   and ruled answer areas. It starts with useful content, not a mostly empty cover.
-6. Read the result. It checks page limits, overflow, readable type, intact question
-   blocks, answer-line placement, visible color emoji, and that every supplied text
-   block survives PDF export. On failure, correct the indicated data/layout issue
-   and retry. When a page limit is too tight, the tool asks the user directly to allow
-   the pages needed, then finishes the same export if approved. Do not rewrite the
-   whole JSON, remove questions, shorten the passage or reduce writing room to avoid
-   that decision. For a previously failed page-limit run, reuse the saved JSON and
-   call render_worksheet again. If the user declines, stop and ask how they want to
-   revise the task. Never remove source text or shrink fonts to hide a failed check.
-   These checks are not a visual review: you cannot see images. Do not claim you
-   inspected the rendered pages or that the PDF is "beautiful" because a command
-   exited successfully. Report the actual file, page count and any limitation.
+1. Plan the exact question mix. "3 multiple choice" means three separate questions with
+   options. Five questions including three multiple choice means three with options and
+   two written. Do not add extra questions or an unrequested challenge.
+2. Make the content correct. A story may be invented, but its science, history and math
+   must be true. Each multiple-choice question needs exactly one correct option. When a
+   key is wanted, work out every answer first: do each sum, find the sentence that
+   proves each reading answer, and note the correct letter.
+3. For an appearance-only change, read the latest file and keep the passage, questions
+   and options exactly; reuse its JSON when it matches, and save the PDF under a new
+   name. PDF text cannot show you how a reference looks.
+4. Pick a theme: a short name, one dark accent color, 3-5 related emoji and a motif
+   (`leaves`, `waves`, `stars` or `dots`). For example: Rainforest `#176B56` leaves
+   🌿 🦜 🐆; Ocean `#086779` waves 🌊 🐙 🐠; Space `#5143A6` stars 🚀 🪐 ⭐. For other
+   topics pick matching emoji and `dots`.
+5. Write the JSON with write_file (it creates folders), with the answers in this first
+   write. Keep each call under 8,000 characters; append more at item boundaries if
+   needed. Omit `max_pages` unless the user set a page limit. Student and key budgets
+   are separate: three student pages plus a one-page key is `max_pages: 3` and
+   `answer_key_max_pages: 1`.
+6. Call `render_worksheet(spec_path="homework/quiz.json", path="homework/quiz.pdf",
+   answer_key_path="homework/quiz-key.pdf", expected_questions=5,
+   expected_multiple_choice=3)`. Take the counts from the user's request, not from the
+   draft. Leave out `answer_key_path` when no key is wanted. The three names must differ.
+7. If it fails, the error names the exact field or value and lists every answer problem.
+   Fix exactly those spots with edit_file, then render again. Do not rewrite the whole
+   file to change one value, and never resubmit unchanged JSON: the same error three
+   times stops the task.
+8. If a page limit is too tight, the tool asks the user to allow more pages. Do not
+   remove questions, shorten the reading or shrink writing space to avoid that. After a
+   failed page-limit run, render the saved JSON again. If the user says no, stop and ask.
+9. Report the actual files and page counts. The checks are not a visual review: you
+   cannot see the pages, so never claim you looked at them.
 
-## Specification
+## Format
 
-All text is literal: no HTML, CSS, Markdown markup, file URLs or scripts.
-Optional fields can be omitted; unknown fields are rejected.
+All text is plain: no HTML, Markdown or scripts. Unknown fields are rejected.
 
 ```json
 {
-  "title": "The Amazon Rainforest Mystery",
-  "subtitle": "A reading adventure",
-  "series": "Adventure Readers Club",
-  "student_line": "Name: ____________________    Date: ____________________",
-  "meta": "Time: 30-40 minutes",
-  "instructions": "Read the passage, then answer using evidence from the text.",
-  "theme": {
-    "name": "Rainforest explorers",
-    "accent": "#176B56",
-    "motif": "leaves",
-    "icons": ["🌿", "🦜", "🐆", "🌎"]
-  },
-  "reading_title": "Read & explore",
-  "reading": [
-    {"heading": "Optional section heading", "text": "The full original paragraph."},
-    {"text": "The next full paragraph. Each object stays together on a page."}
-  ],
-  "reading_note": "Optional reminder, copied from the original when restyling.",
-  "question_title": "Detective Questions",
+  "title": "A Day on the Farm",
+  "instructions": "Read the story, then answer the questions.",
+  "theme": {"name": "Farm day", "accent": "#2F6B2F", "motif": "dots",
+            "icons": ["🚜", "🐄", "🍎", "🌽"]},
+  "reading": ["Sam picked 3 big pumpkins and 2 small pumpkins at the farm.",
+              "The farmer gave Sam a red apple to take home."],
   "questions": [
-    {"prompt": "Which statement matches the passage?", "options": ["First option", "Second option", "Third option"], "lines": 0},
-    {"prompt": "Which detail supports that idea?", "options": ["First detail", "Second detail", "Third detail"], "lines": 0},
-    {"prompt": "Which conclusion follows from the evidence?", "options": ["First conclusion", "Second conclusion", "Third conclusion"], "lines": 0},
-    {"prompt": "Explain using two details from the passage.", "lines": 5, "icon": "🔍"},
-    {"prompt": "Compare the two ideas in the passage.", "lines": 4}
-  ],
-  "closing_note": "Check your evidence before you finish."
+    {"prompt": "What did the farmer give Sam?",
+     "options": ["A red apple", "A pumpkin pie", "A corn cob"],
+     "choice": "A", "evidence": "The farmer gave Sam a red apple"},
+    {"prompt": "3 + 2 = __", "lines": 1, "answer": "5",
+     "explanation": "3 big pumpkins and 2 small pumpkins make 5."},
+    {"prompt": "Draw your favorite pumpkin and give it a name.", "lines": 3,
+     "answer": "Answers will vary, for example: a round pumpkin called Sunny."}
+  ]
 }
 ```
 
-`reading` may also contain plain paragraph strings. A question can supply `label`
-to preserve a section/question label; otherwise it gets "Question 1:", etc.
-Do not add a challenge or reminder unless requested or present in the source.
-An optional `challenge` has the same shape as a question and is not included in the
-expected main-question counts.
+- `reading`: paragraphs as strings, or `{"heading": "...", "text": "..."}`. Leave it out
+  for a math or activity sheet; never add sentences to it just to quote them.
+- `prompt` is the question only and `options` are the choices only: the PDF adds
+  "Question 1:" and the A/B/C letters itself.
+- `lines`: Use about 4-6 answer lines for explanations and evidence, 1-2 for short facts
+  or sums, and 0 for multiple choice (1-12 without options, 0-12 with options).
+- Optional per question: `icon` (one emoji) and `label` (a custom label).
+- `challenge`: optional, same shape as a question, only when requested; it is not
+  counted in the expected question numbers.
+- Other optional fields: `subtitle`, `series`, `student_line`, `meta`, `reading_title`,
+  `reading_note`, `question_title`, `closing_note`, `max_pages`, `answer_key_max_pages`.
 
-Use about 4-6 answer lines for explanations, comparisons and evidence; fewer for
-brief facts, and zero for multiple choice. `lines` accepts 1-12 without options
-or 0-12 with options. Optional `max_pages` accepts 1-10. A specified limit is never
-increased without approval. An unrequested limit of three pages is not a design rule.
+Answer fields, only for a parent key (never printed on the student PDF):
+- `choice`: the correct option's letter (A is the first option); required for
+  multiple choice.
+- `answer`: the expected answer; required for written questions. For open or creative
+  prompts write "Answers will vary, for example: ...".
+- `evidence`: an exact quote, or a list of up to six, copied word for word from the
+  reading. Without a reading, put the reason in `explanation` instead.
+- `explanation`: an optional short reason, shown to the parent as "Why:". For a word
+  problem, write the steps with the question's numbers, ending at the answer:
+  `"$10 - $6 - $4 = $0"`.
 
-Theme icons are individual emoji, not words, flags or joined family sequences.
-If an icon fails its real rendering check, replace only that decoration with
-another suitable one. The renderer uses the existing Chromium printing engine
-because a phone's COLRv1 emoji font can be blank in ReportLab/Pillow.
-No web images, design subscriptions or large publishing toolchain are needed.
-Missing dependencies are reported explicitly; use check_programs/install_packages
-only if requested by the error (Chromium, poppler-utils or the named fonts).
+The tool checks that every question has an answer, each letter is a real option,
+quotes really appear, simple sums like `3 + 2 = __` or `What is 10 - 4?` are right, and
+written steps add up and end at the chosen answer.
+It cannot judge facts or reasoning, so check those yourself.
+
+## Emoji and output
+
+Each icon is one emoji picture, not words or two emoji. Joined emoji (👨‍🚀), skin tones,
+keycaps (1️⃣) and flags are fine; if the font cannot draw one, a similar emoji is swapped
+in automatically (`icon_substitutions`) and no retry is needed. Pages are portrait
+Letter with embedded fonts, color emoji, numbered paragraphs, page numbers, margin art
+and ruled answer space. If a program or font is missing, the error says what to
+install with install_packages.

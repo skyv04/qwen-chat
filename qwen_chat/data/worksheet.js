@@ -11,12 +11,14 @@
     await document.fonts.ready;
 
     // A loaded font can still draw nothing (notably COLRv1 with an incompatible
-    // renderer). Inspect actual pixels rather than trusting the font's presence.
+    // renderer), or draw an unsupported joined emoji as several pictures. Inspect
+    // actual pixels and widths rather than trusting the font's presence.
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = 150;
     const ctx = canvas.getContext("2d", {willReadFrequently: true});
     ctx.font = "80px QwenEmoji";
-    for (const icon of config.icons) {
+    const oneGlyph = ctx.measureText("\u{1F600}").width * 1.5;
+    function drawsAsOneColorPicture(icon) {
       ctx.clearRect(0, 0, 150, 150);
       ctx.fillText(icon, 8, 105);
       const pixels = ctx.getImageData(0, 0, 150, 150).data;
@@ -26,8 +28,21 @@
             Math.max(pixels[i], pixels[i + 1], pixels[i + 2]) -
             Math.min(pixels[i], pixels[i + 1], pixels[i + 2]) > 16) colored++;
       }
-      if (colored < 8) throw new Error(
+      return colored >= 8 && ctx.measureText(icon).width <= oneGlyph;
+    }
+    const substitutions = [];
+    for (const icon of config.icons) {
+      if (drawsAsOneColorPicture(icon)) continue;
+      const used = (config.fallbacks[icon] || []).find(drawsAsOneColorPicture);
+      if (!used) throw new Error(
         `Emoji ${icon} is missing or not rendered in color. Choose another icon; no PDF was saved.`);
+      substitutions.push({icon, used});
+      for (const root of [document.getElementById("page-template").content,
+                          document.getElementById("blocks")]) {
+        for (const span of root.querySelectorAll(".emoji")) {
+          if (span.textContent === icon) span.textContent = used;
+        }
+      }
     }
 
     function newPage() {
@@ -102,6 +117,7 @@
     audit.textContent = JSON.stringify({
       ok: true, pages: pages.length, portrait: true, layout_checked: true,
       color_emoji_checked: config.icons.length,
+      ...(substitutions.length ? {icon_substitutions: substitutions} : {}),
       min_body_font_pt: Math.round(Math.min(...fontSizes) * 100) / 100, answers
     });
   } catch (error) {

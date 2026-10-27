@@ -72,7 +72,13 @@ def main() -> None:
     model_launcher = (ROOT / "scripts/qwen").read_bytes()
     for name in ("qwen", "qwen-server"):
         install_file(bin_dir / name, model_launcher, 0o755)
-    install_file(data_dir / "qwen-chat/turnip-env.sh", (ROOT / "scripts/turnip-env.sh").read_bytes())
+    # Kept apart from the chats (data_dir/qwen-chat), so clearing them can't break the launcher.
+    gpu_env = (ROOT / "scripts/turnip-env.sh").read_bytes()
+    install_file(data_dir / "qwen-chat-harness/turnip-env.sh", gpu_env)
+    old = data_dir / "qwen-chat/turnip-env.sh"
+    if old.is_file() and not old.is_symlink() and old.read_bytes() == gpu_env:
+        old.unlink()
+        print(f"Removed the old copy beside the chats: {old}")
     icon = ROOT / f"qwen_chat/data/icons/hicolor/scalable/apps/{APP_ID}.svg"
     install_file(data_dir / f"icons/hicolor/scalable/apps/{APP_ID}.svg", icon.read_bytes())
     entry = (

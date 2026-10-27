@@ -114,6 +114,72 @@ class WorkspaceSandboxTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("disabled", out)
 
+    def test_edit_file_changes_exactly_one_place_and_keeps_json_valid(self):
+        f = self.ws.root / "sheet.json"
+        f.write_text('{\n  "title": "Farm day",\n  "theme": {"accent": "#D4A574"},\n  "questions": []\n}\n')
+        ok, out = self.run_tool("edit_file", path="sheet.json", old_text='"#D4A574"', new_text='"#2F6B2F"')
+        self.assertTrue(ok, out)
+        self.assertIn("Edited sheet.json at line 3 (9 characters replaced with 9). The old version "
+                      "is in the Trash.", out)
+        # Different spacing still finds the one place, and the file keeps its own indentation.
+        ok, out = self.run_tool("edit_file", path="sheet.json", old_text='  "title":   "Farm day",\n',
+                                new_text='  "title": "Harvest",\n')
+        self.assertTrue(ok, out)
+        self.assertNotIn("Trash", out)  # now Qwen's own file: no second backup
+        good = '{\n  "title": "Harvest",\n  "theme": {"accent": "#2F6B2F"},\n  "questions": []\n}\n'
+        self.assertEqual(f.read_text(), good)
+        self.assertEqual(len(list((self.ws.trash_dir / "files").iterdir())), 1)
+        for old, new, error in (
+                ("Farm day", "x", "old_text was not found"),
+                ('"t', '"T', "matches 2 places"),
+                ('"questions": []', '"questions": [', "Not changed: this edit would break the JSON"),
+                ('"Harvest"', '"[... 1,412 more characters removed to save context space]"',
+                 "Nothing was saved"),
+                ("  ", "x", "old_text is empty")):
+            with self.subTest(old=old):
+                ok, out = self.run_tool("edit_file", path="sheet.json", old_text=old, new_text=new)
+                self.assertFalse(ok)
+                self.assertIn(error, out)
+        self.assertEqual(f.read_text(), good)
+        ok, out = self.run_tool("edit_file", path="sheet.json", old_text="Harvest", new_text="Harvest")
+        self.assertIn("Unchanged", out)
+
+    def test_json_drafts_say_where_they_break_until_fixed(self):
+        ok, out = self.run_tool("write_file", path="broken.json", content='{"a": 1\n "b": 2}')
+        self.assertTrue(ok, out)
+        self.assertIn("Note: broken.json is not valid JSON yet (Expecting ',' delimiter at line 2, "
+                      "column 2", out)
+        ok, out = self.run_tool("edit_file", path="broken.json", old_text='"a": 1', new_text='"a": 1,')
+        self.assertTrue(ok, out)
+        self.assertIn("broken.json is now valid JSON.", out)
+        ok, out = self.run_tool("write_file", path="parts.json", content='{"questions": [\n')
+        self.assertIn("If more parts follow, append them", out)
+        ok, out = self.run_tool("write_file", path="parts.json", content='{"prompt": "Q?"}]}', append=True)
+        self.assertTrue(ok, out)
+        self.assertNotIn("Note:", out)
+        ok, out = self.run_tool("write_file", path="notes.txt", content='{"not": json')
+        self.assertNotIn("Note:", out)  # only .json files are checked
+
+    def test_notes_from_shortened_history_are_never_saved_as_content(self):
+        f = self.ws.root / "sheet.json"
+        f.write_text('{"title": "Farm day"}')
+        for note in ("[... 1,412 more characters removed to save context space]",
+                     "[Earlier tool output removed to save context space. Run the tool again if you need it.]",
+                     "[... 200 more characters removed to fit the context window]"):
+            with self.subTest(note=note):
+                ok, out = self.run_tool("write_file", path="sheet.json", content='{"title": "x", ' + note + "}")
+                self.assertFalse(ok)
+                self.assertIn("Nothing was saved", out)
+                self.assertIn("sheet.json keeps its previous content", out)
+                ok, out = self.run_tool("write_file", path="new.json", content=note)
+                self.assertFalse(ok)
+                self.assertIn("Write the complete content of new.json", out)
+        self.assertEqual(f.read_text(), '{"title": "Farm day"}')
+        self.assertFalse((self.ws.root / "new.json").exists())
+        self.assertFalse(self.ws.trash_dir.exists())
+        ok, out = self.run_tool("write_file", path="ok.txt", content="Use [brackets] to save space.")
+        self.assertTrue(ok, out)
+
 
 class WebGuardTest(unittest.TestCase):
     def test_blocks_local_and_non_http(self):
@@ -174,7 +240,7 @@ class ProgramToolsTest(unittest.TestCase):
 
     def test_offered_only_with_files_and_commands_on(self):
         names = lambda box: {t["function"]["name"] for t in box.schemas()}
-        for name in ("run_command", "render_worksheet"):
+        for name in ("run_command", "render_worksheet", "render_answer_key", "open_file"):
             self.assertIn(name, names(self.box))
             self.assertNotIn(name, names(ToolBox(self.ws, web=True, files=True)))
             self.assertNotIn(name, names(ToolBox(self.ws, files=False, commands=True)))
@@ -599,6 +665,356 @@ class ProgramToolsTest(unittest.TestCase):
         self.assertIn("destination changed", text)
         self.assertEqual(target.read_bytes(), b"edited by the user during rendering")
         self.assertFalse(self.ws.trash_dir.exists())
+
+    def _homework_spec(self):
+        data = {
+            "title": "Moon homework", "reading": ["Mia flew her rocket all the way to the Moon."],
+            "questions": [
+                {"prompt": "Where did Mia fly?", "options": ["To the Moon", "To the beach"],
+                 "choice": "A", "evidence": "Mia flew her rocket all the way to the Moon."},
+                {"prompt": "3 + 2 = __", "answer": "5", "lines": 1},
+            ],
+        }
+        (self.ws.root / "moon.json").write_text(json.dumps(data))
+        return data
+
+    def test_homework_and_answer_key_are_checked_then_created_together(self):
+        data = self._homework_spec()
+        staged = []
+
+        def render(argv, *_args):
+            staged.append(json.loads(Path(argv[-2]).read_text()))
+            return self._render_ok(argv)
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon.pdf",
+                                     answer_key_path="moon-key.pdf", expected_questions=2)
+        self.assertTrue(ok, text)
+        self.assertEqual([a[3] for a in self.asked], ["Create PDFs"])
+        self.assertIn('"answer_key_path": "moon-key.pdf"', self.asked[0][2])
+        student, key = staged
+        self.assertEqual(student, {**data, "questions": [
+            {k: v for k, v in q.items() if k not in ("choice", "answer", "evidence")}
+            for q in data["questions"]]})
+        key_text = json.dumps(key["reading"], ensure_ascii=False)
+        self.assertIn("Answer: A. To the Moon", key_text)
+        self.assertIn("Answer: 5", key_text)
+        self.assertIn('"arithmetic_checked": 1', text)
+        self.assertIn('"answer_entries": 2', text)
+        self.assertIn("student PDF has no answers", text)
+        both = [self.ws.root / "moon.pdf", self.ws.root / "moon-key.pdf"]
+        self.assertEqual(self.box.result_paths(
+            "render_worksheet", {"path": "moon.pdf", "answer_key_path": "moon-key.pdf"}, text), both)
+        self.assertTrue(all(p.read_bytes().startswith(b"%PDF-") for p in both))
+
+    def test_worksheet_near_misses_render_and_are_reported_without_touching_the_json(self):
+        raw = ('{"title": "Harvest math", "theme": {"motif": "pumpkins", "accent": "#D4A574"},\n'
+               ' "questions": [\n'
+               '  {"question": "1. Count the apples.\nHow many?", "type": "short", "lines": 0, "answer": "5"},\n'
+               '  {"text": "2. Which is more?", "choices": ["A. 3", "B. 4"], "correct_answer": "B"}]}')
+        (self.ws.root / "harvest.json").write_text(raw)  # note the raw newline inside a string
+        staged = []
+
+        def render(argv, *_args):
+            staged.append(json.loads(Path(argv[-2]).read_text()))
+            return self._render_ok(argv)
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", spec_path="harvest.json", path="harvest.pdf",
+                                     answer_key_path="harvest-key.pdf", expected_questions=2,
+                                     expected_multiple_choice=1)
+        self.assertTrue(ok, text)
+        student, key = staged
+        self.assertEqual(student, {"title": "Harvest math", "theme": {"motif": "dots", "accent": "#8A6B4B"},
+                                   "questions": [{"prompt": "Count the apples.\nHow many?", "lines": 1},
+                                                 {"prompt": "Which is more?", "options": ["3", "4"]}]})
+        self.assertIn("Answer: B. 4", json.dumps(key["reading"]))
+        self.assertIn("Handled automatically (no action needed; the JSON file was not changed): ", text)
+        for note in ("theme.motif 'pumpkins' is not available, so 'dots' was used",
+                     "theme.accent #D4A574 was too pale for headings, so #8A6B4B was used",
+                     "read question field 'choices' as 'options' (Question 2)",
+                     "removed typed numbers from prompts"):
+            self.assertIn(note, text)
+        self.assertEqual((self.ws.root / "harvest.json").read_text(), raw)
+
+    def test_broken_worksheet_json_names_the_spot_and_the_right_fix(self):
+        f = self.ws.root / "sheet.json"
+        for content, expected in (
+                ('{\n "title": "Farm day",\n "questions": [\n  {"prompt": "3 + 4 = __"}\n'
+                 '  {"prompt": "5 + 1 = __"}\n ]\n}\n',
+                 'Expecting \',\' delimiter at line 5, column 3: {"prompt": "5 + 1 = __"}. Fix just '
+                 'that spot with edit_file'),
+                ('{"title": "Farm day", "questions": [{"prompt": "3 + 4 = __"},\n'
+                 '[... 1,412 more characters removed to save context space]\n]}',
+                 "copied from shortened chat history, so real content is missing. Write the "
+                 "complete JSON again"),
+                ('{"title": "Farm day", "questions": [', "The JSON stops before it is complete")):
+            with self.subTest(expected=expected):
+                f.write_text(content)
+                ok, text = self.run_tool("render_worksheet", spec_path="sheet.json", path="sheet.pdf")
+                self.assertFalse(ok)
+                self.assertIn("Invalid JSON specification: ", text)
+                self.assertIn(expected, text)
+        self.assertEqual(self.asked, [])
+        self.assertFalse((self.ws.root / "sheet.pdf").exists())
+
+    def test_answer_problems_and_failed_key_render_leave_every_file_unchanged(self):
+        data = self._homework_spec()
+        data["questions"][1]["answer"] = "6"
+        (self.ws.root / "moon.json").write_text(json.dumps(data))
+        with mock.patch.object(tools, "run_streaming") as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon.pdf",
+                                     answer_key_path="moon-key.pdf")
+            self.assertFalse(ok)
+            self.assertIn("answer key is not ready", text)
+            self.assertIn("3 + 2 = __ gives 5", text)
+            for key_path in ("moon.json", "moon.pdf"):
+                ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon.pdf",
+                                         answer_key_path=key_path)
+                self.assertIn("three different file names", text)
+            run.assert_not_called()
+        self.assertEqual(self.asked, [])
+        self._homework_spec()
+        student = self.ws.root / "moon.pdf"
+        student.write_bytes(b"the user's original")
+        self.box.auto_approve = lambda: True
+        results = [self._render_ok, lambda *_: (1, "Chromium crashed", "")]
+        with mock.patch.object(tools, "run_streaming", side_effect=lambda *a: results.pop(0)(*a)):
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon.pdf",
+                                     answer_key_path="moon-key.pdf")
+        self.assertFalse(ok)
+        self.assertIn("answer key PDF was not saved", text)
+        self.assertEqual(student.read_bytes(), b"the user's original")
+        self.assertFalse((self.ws.root / "moon-key.pdf").exists())
+        self.assertFalse(self.ws.trash_dir.exists())
+        self.assertEqual(list(self.ws.root.glob(".qwen-pdf-*")), [])
+
+    def test_answer_key_hint_and_unchanged_rewrites_point_at_the_real_fix(self):
+        (self.ws.root / "quiz.json").write_text(json.dumps(
+            {"title": "Quiz", "theme": {"icons": ["rocket"]}, "questions": [{"prompt": "Q?"}]}))
+        ok, text = self.run_tool("render_worksheet", spec_path="quiz.json", path="quiz.pdf")
+        self.assertIn("theme.icons[0] must be one emoji", text)
+        self.assertNotIn("render_answer_key", text)
+        (self.ws.root / "key.json").write_text('{"source_path": "quiz.pdf", "answers": []}')
+        ok, text = self.run_tool("render_worksheet", spec_path="key.json", path="key.pdf")
+        self.assertIn("use render_answer_key", text)
+        content = (self.ws.root / "quiz.json").read_text()
+        ok, text = self.run_tool("write_file", path="quiz.json", content=content)
+        self.assertTrue(ok, text)
+        self.assertIn("Unchanged", text)
+        self.assertEqual(self.asked, [])
+        self.assertFalse(self.ws.trash_dir.exists())
+
+    def _key_spec(self):
+        (self.ws.root / "quiz.json").write_text(json.dumps({
+            "title": "The umbrella", "reading": ["Nora left her wet umbrella beside the door."],
+            "questions": [
+                {"prompt": "What did Nora leave?", "options": ["An umbrella", "A notebook"]},
+                {"prompt": "What might the wet umbrella suggest?", "lines": 4},
+            ],
+        }))
+        ok, result = self.run_tool("read_quiz", path="quiz.json")
+        self.assertTrue(ok, result)
+        source = json.loads(result.split("\n", 1)[1])
+        key = {
+            "source_path": source["source_path"], "source_sha256": source["source_sha256"],
+            "answers": [
+                {"question": 1, "choice": "A", "explanation": "The passage names the object.",
+                 "evidence": ["Nora left her wet umbrella beside the door."]},
+                {"question": 2, "answer": "It might have been raining outside.",
+                 "evidence": ["her wet umbrella beside the door."]},
+            ],
+        }
+        (self.ws.root / "key.json").write_text(json.dumps(key))
+        return key
+
+    def test_key_exports_source_questions_with_the_shared_pdf_safeguards(self):
+        self._key_spec()
+        self.box.auto_approve = lambda: True
+        target = self.ws.root / "key.pdf"
+        target.write_bytes(b"previous answer key")
+        drafts = []
+
+        def render(argv, *_args):
+            drafts.append(json.loads(Path(argv[-2]).read_text()))
+            return self._render_ok(argv)
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, result = self.run_tool("render_answer_key", spec_path="key.json", path="key.pdf")
+        self.assertTrue(ok, result)
+        self.assertIn('"questions_answered": 2', result)
+        self.assertIn('"answer_entries": 2', result)
+        self.assertIn('"semantic_accuracy_verified": false', result)
+        self.assertEqual(drafts[0]["reading"][0]["heading"], "Question 1:")
+        self.assertIn("What did Nora leave?", drafts[0]["reading"][0]["text"])
+        self.assertIn("Answer: A. An umbrella", drafts[0]["reading"][0]["text"])
+        self.assertEqual(self.box.result_paths("render_answer_key", {"path": "key.pdf"}), [target])
+        self.assertEqual((self.ws.trash_dir / "files/key.pdf").read_bytes(), b"previous answer key")
+
+    def test_stale_and_wrong_story_keys_do_not_touch_existing_outputs(self):
+        key = self._key_spec()
+        target = self.ws.root / "key.pdf"
+        target.write_bytes(b"existing teacher key")
+        self.box.auto_approve = lambda: True
+        key["answers"][0]["evidence"] = ["Detective Martinez found a rope ladder."]
+        (self.ws.root / "key.json").write_text(json.dumps(key))
+        with mock.patch.object(tools, "run_streaming") as render:
+            ok, result = self.run_tool("render_answer_key", spec_path="key.json", path="key.pdf")
+            self.assertFalse(ok)
+            self.assertIn("not in the source", result)
+            self._key_spec()
+            source = self.ws.root / "quiz.json"
+            source.write_text(source.read_text().replace("Nora", "Ada"))
+            ok, result = self.run_tool("render_answer_key", spec_path="key.json", path="key.pdf")
+            self.assertFalse(ok)
+            self.assertIn("current source", result)
+            render.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"existing teacher key")
+        self.assertFalse(self.ws.trash_dir.exists())
+
+    def test_source_changed_during_key_render_prevents_publication(self):
+        self._key_spec()
+        self.box.auto_approve = lambda: True
+        target = self.ws.root / "key.pdf"
+        target.write_bytes(b"previous key")
+
+        def edit_source(argv, *_args):
+            source = self.ws.root / "quiz.json"
+            source.write_text(source.read_text().replace("Nora", "Ada"))
+            return self._render_ok(argv)
+
+        with mock.patch.object(tools, "run_streaming", side_effect=edit_source):
+            ok, result = self.run_tool("render_answer_key", spec_path="key.json", path="key.pdf")
+        self.assertFalse(ok)
+        self.assertIn("source changed", result)
+        self.assertEqual(target.read_bytes(), b"previous key")
+        self.assertFalse(self.ws.trash_dir.exists())
+        self.assertIn("Ada", (self.ws.root / "quiz.json").read_text())
+
+    def test_answer_key_page_allowance_keeps_the_source_and_key_draft_unchanged(self):
+        key = self._key_spec()
+        key["max_pages"] = 1
+        source = self.ws.root / "key.json"
+        source.write_text(json.dumps(key))
+        original = source.read_bytes()
+        self.box.auto_approve = lambda: True
+        drafts = []
+
+        def render(argv, *_args):
+            drafts.append(json.loads(Path(argv[-2]).read_text()))
+            if len(drafts) == 1:
+                return self._page_limit(2, 1)
+            rc, report, reason = self._render_ok(argv)
+            return rc, json.dumps({**json.loads(report), "pages": 2}), reason
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, result = self.run_tool("render_answer_key", spec_path="key.json", path="key.pdf")
+        self.assertTrue(ok, result)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(drafts[0]["reading"], drafts[1]["reading"])
+        self.assertEqual(self.asked[0][3], "Use 2 Pages")
+        self.assertIn("2 source-matched answers", self.asked[0][2])
+
+    def test_reader_pages_are_fresh_and_companion_paths_stay_in_workspace(self):
+        self._key_spec()
+        self.box.commands = False
+        with mock.patch.object(tools, "MAX_READ_CHARS", 350):
+            ok, first = self.run_tool("read_quiz", path="quiz.json")
+        self.assertTrue(ok, first)
+        self.assertIn("Call read_quiz with start_line=", first)
+        (self.ws.root / "quiz.pdf").write_bytes(b"%PDF-1.7\nsource")
+        companion = self.ws.root / "quiz.json"
+        companion.unlink()
+        outside = Path(self.tmp.name) / "outside.json"
+        outside.write_text("{}")
+        companion.symlink_to(outside)
+        with mock.patch.object(tools, "pdf_to_text", return_value="Question 1:\nExplain."):
+            ok, result = self.run_tool("read_quiz", path="quiz.pdf")
+        self.assertFalse(ok)
+        self.assertIn("outside the workspace", result)
+
+    def test_answer_key_cannot_replace_its_source_pdf(self):
+        from qwen_chat.worksheet_pdf import source_texts, validate_spec
+        key = self._key_spec()
+        source_text = "\n".join(source_texts(validate_spec(json.loads(
+            (self.ws.root / "quiz.json").read_text()))))
+        target = self.ws.root / "quiz.pdf"
+        target.write_bytes(b"%PDF-1.7\nsource")
+        with mock.patch.object(tools, "pdf_to_text", return_value=source_text), \
+             mock.patch.object(tools, "run_streaming") as render:
+            ok, result = self.run_tool("read_quiz", path="quiz.pdf")
+            self.assertTrue(ok, result)
+            source = json.loads(result.split("\n", 1)[1])
+            key.update(source_path=source["source_path"], source_sha256=source["source_sha256"])
+            (self.ws.root / "key.json").write_text(json.dumps(key))
+            ok, result = self.run_tool("render_answer_key", spec_path="key.json", path="quiz.pdf")
+            self.assertFalse(ok)
+            self.assertIn("never replace the source quiz", result)
+            render.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"%PDF-1.7\nsource")
+
+    def test_open_missing_or_invalid_pdf_never_launches_a_viewer(self):
+        (self.ws.root / "bad.pdf").write_bytes(b"plain text is not a PDF")
+        with mock.patch.object(tools.subprocess, "Popen") as launch:
+            for name in ("missing.pdf", "bad.pdf", "../outside.pdf"):
+                ok, result = self.run_tool("open_file", path=name)
+                self.assertFalse(ok, result)
+            ok, result = self.run_tool("run_command", command="xdg-open missing.pdf &", why="Open")
+            self.assertFalse(ok)
+            self.assertIn("missing or empty", result)
+            launch.assert_not_called()
+        self.assertEqual(self.asked, [])
+
+    def test_open_reports_launch_acceptance_and_real_opener_errors(self):
+        target = self.ws.root / "a file.txt"
+        target.write_text("A document")
+        self.box.auto_approve = lambda: True
+        process = mock.Mock(returncode=0)
+        process.poll.return_value = 0
+        with mock.patch.object(tools.subprocess, "Popen", return_value=process) as launch:
+            ok, result = self.run_tool("open_file", path="a file.txt")
+            self.assertTrue(ok, result)
+            self.assertIn("Open requested", result)
+            self.assertIn("not verified", result)
+            self.assertEqual(launch.call_args.args[0][-2:], ["open", str(target)])
+            self.assertTrue(launch.call_args.kwargs["start_new_session"])
+            process.returncode = process.poll.return_value = 1
+            ok, result = self.run_tool("open_file", path="a file.txt")
+            self.assertFalse(ok)
+            self.assertIn("opener failed", result)
+
+    def test_open_refusal_changed_file_and_cancellation_do_not_hide_failure(self):
+        import threading
+        target = self.ws.root / "key.txt"
+        target.write_text("Before approval")
+        with mock.patch.object(tools.subprocess, "Popen") as launch:
+            self.allow = False
+            self.assertFalse(self.run_tool("open_file", path="key.txt")[0])
+            self.box.declined = False
+
+            def edit(*_):
+                target.write_text("Edited during approval")
+                return True
+
+            self.box.approve = edit
+            ok, result = self.run_tool("open_file", path="key.txt")
+            self.assertFalse(ok)
+            self.assertIn("changed before opening", result)
+            launch.assert_not_called()
+            self.box.auto_approve = lambda: True
+            self.box.cancel = threading.Event()
+            process = launch.return_value
+            process.poll.side_effect = lambda: self.box.cancel.set()
+            ok, result = self.run_tool("open_file", path="key.txt")
+            self.assertFalse(ok)
+            self.assertIn("stopped or timed out", result)
+            process.terminate.assert_called_once()
+
+    def test_pdf_extraction_does_not_accept_partial_stdout_on_failure(self):
+        failure = subprocess.CompletedProcess([], 1, b"Only part of the quiz", b"Damaged PDF")
+        with mock.patch.object(tools.subprocess, "run", return_value=failure):
+            with self.assertRaisesRegex(ToolError, "PDF text extraction failed"):
+                tools.pdf_to_text(self.ws.root / "source.pdf")
 
 
 if __name__ == "__main__":

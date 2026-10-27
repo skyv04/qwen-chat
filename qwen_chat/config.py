@@ -7,13 +7,16 @@ import os
 from pathlib import Path
 
 
-def _xdg(var: str, fallback: str) -> Path:
-    return Path(os.environ.get(var) or Path.home() / fallback) / "qwen-chat"
+def _xdg(var: str, fallback: str, name: str = "qwen-chat") -> Path:
+    return Path(os.environ.get(var) or Path.home() / fallback) / name
 
 
 CONFIG_DIR = _xdg("XDG_CONFIG_HOME", ".config")
-DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share")
+DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share")   # chats
 CACHE_DIR = _xdg("XDG_CACHE_HOME", ".cache")
+# What Qwen needs to work (saved skills, its Python environment, the GPU helper) is kept
+# apart from the chats, so clearing chat history can't remove it.
+HARNESS_DIR = _xdg("XDG_DATA_HOME", ".local/share", "qwen-chat-harness")
 
 DEFAULTS = {
     # The only folder the model can see. Changing it here is deliberate: the app

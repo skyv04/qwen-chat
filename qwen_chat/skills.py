@@ -1,6 +1,7 @@
 """Reusable, per-user Agent Skills packages; loading never executes their code."""
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 import hashlib
 import os
@@ -9,7 +10,7 @@ import re
 import stat
 from typing import Callable
 
-from .config import DATA_DIR
+from . import config
 
 BUNDLED_SKILLS = Path(__file__).with_name("data") / "skills"
 MAX_SKILL_BYTES = 16_000
@@ -139,9 +140,24 @@ def write_package(files: dict[str, bytes], destination: Path) -> None:
         path.chmod(0o600)
 
 
+def library_root() -> Path:
+    """The shared library, kept apart from the chats. Moves skills saved beside the chats
+    by older versions; anything that can't be moved stays where it was."""
+    root, old = config.HARNESS_DIR / "skills", config.DATA_DIR / "skills"
+    if old.is_dir() and not old.is_symlink():
+        with suppress(OSError):
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for entry in old.iterdir():
+                if not entry.name.startswith(".") and not os.path.lexists(root / entry.name):
+                    with suppress(OSError):
+                        os.rename(entry, root / entry.name)
+            old.rmdir()
+    return root
+
+
 class SkillRegistry:
     def __init__(self, user_root: Path | None = None, bundled_root: Path | None = None):
-        self.user_root = (Path(user_root) if user_root is not None else DATA_DIR / "skills").resolve()
+        self.user_root = (Path(user_root) if user_root is not None else library_root()).resolve()
         self.bundled_root = Path(bundled_root) if bundled_root is not None else BUNDLED_SKILLS
 
     @staticmethod

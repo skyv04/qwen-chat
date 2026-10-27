@@ -30,7 +30,11 @@ class InstallTests(unittest.TestCase):
         saved = self.home / ".local/share/qwen-chat/chats/keep.json"
         saved.parent.mkdir(parents=True)
         saved.write_text('{"title":"Keep my chat"}')
+        old_gpu_env = self.home / ".local/share/qwen-chat/turnip-env.sh"
+        old_gpu_env.write_bytes((ROOT / "scripts/turnip-env.sh").read_bytes())
         self.install()
+        self.assertFalse(old_gpu_env.exists())
+        self.assertTrue((self.home / ".local/share/qwen-chat-harness/turnip-env.sh").is_file())
         launcher = self.home / ".local/bin/qwen-chat"
         result = subprocess.run([str(launcher), "--version"], env=self.env, check=True,
                                 capture_output=True, text=True, timeout=10)

@@ -9,14 +9,25 @@ import time
 from typing import Protocol
 
 from .llm import Cancelled, ChatStream, LLMError, ServerManager
-from .tools import ToolBox
+from .tools import ToolBox, ToolError
 
-MAX_TOOL_ROUNDS = 12
+MAX_TOOL_ROUNDS = 20
+REPEAT_LIMIT = 3           # the same tool error this many times ends the turn
 MAX_OUT_TOKENS = 4096      # per reply, tool call arguments included
 CALL_CHARS = 8000          # what the model is told one tool call may hold (well under the cap)
 CHARS_PER_TOKEN = 3.0      # conservative; real English text is ~3.5-4
-OLD_TOOL_STUB = "[Earlier tool output removed to save context space.]"
 LONG_ARG = 1500            # tool call strings longer than this get shortened when space is tight
+# History trimming. Every note says "to save context space" in brackets: write tools refuse
+# text containing one (tools.CONTEXT_MARKER), because a copied note would replace real content.
+OLD_TOOL_STUB = "[Earlier tool output removed to save context space. Run the tool again if you need it.]"
+SKILL_STUB = "[Skill text removed to save context space. Call load_skill again before following it.]"
+REPEAT_STUB = "[Same as a later result of this tool; removed here to save context space.]"
+CUT_NOTE = "\n[... rest truncated here to save context space]"
+CACHE_NOTE = "\n[You already ran this exact call; use this result.]"
+CACHED_TOOLS = ("web_search", "fetch_url", "list_files", "read_file")
+# When history must shrink, shrink it to this share of the budget. The following rounds then
+# only append, so llama-server reuses its cache instead of re-reading the turn every round.
+TRIM_TARGET = 0.6
 
 
 class Events(Protocol):
@@ -72,10 +83,13 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "library. When the user asks you to create, save, write, "
             "export or edit a file, actually do it with the file tools (don't just show the "
             "content), then mention the file name. Read a file before changing it. Use clear "
-            "file names with the right extension (.md, .txt, .csv, .py, .html, ...). One tool "
+            "file names with the right extension (.md, .txt, .csv, .py, .html, ...). To change "
+            "part of an existing file, use edit_file instead of rewriting the whole file. One tool "
             f"call can hold at most about {CALL_CHARS:,} characters; longer calls get cut off and "
             "fail. Write a longer file in parts: write_file with the first part, then write_file "
-            "with append: true for each next part.")
+            "with append: true for each next part. Earlier tool calls and outputs in this chat may "
+            "be shortened to bracketed notes saying 'to save context space'. Such a note is not "
+            "content: never copy it into a file; read the file instead.")
     else:
         parts.append("\nFile access is turned off in this chat.")
     if toolbox.files and toolbox.commands:
@@ -104,14 +118,40 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "activity sheet, call load_skill with name 'worksheet-pdf'. Follow that skill and "
             "use render_worksheet with a JSON content/theme file, not an improvised PDF script. "
             "Pass expected_questions and expected_multiple_choice from the user's requested "
-            "counts when given. Do not invent a page cap: omit max_pages unless the user set "
-            "one. A page-limit conflict asks the user to allow the required pages directly; "
+            "counts when given. If the user sets a page limit, put it in max_pages; otherwise "
+            "omit max_pages. "
+            "For a NEW worksheet or quiz that also needs a parent/teacher answer key, put each "
+            "question's answer in the same JSON (choice letter for multiple choice, answer for "
+            "written questions, evidence quotes from the reading) and create BOTH PDFs with one "
+            "render_worksheet call that passes answer_key_path. It checks every answer, keeps "
+            "answers off the student PDF and makes the key in the same theme. Keep student and "
+            "answer-key budgets separate: 'three student pages plus one parent page' means "
+            "max_pages=3 and answer_key_max_pages=1, not four student pages. A page-limit "
+            "conflict asks the user to allow the required pages directly; "
             "rerun render_worksheet on an existing failed draft, rather than rewriting the "
-            "whole file or removing questions to fit. "
+            "whole file or removing questions to fit. If a tool names a field or value, change "
+            "exactly that value with edit_file before retrying; never resubmit unchanged JSON. "
             "For an appearance-only change, preserve the original passage, questions and options "
             "exactly. Match the topic with related emoji and margin artwork; keep text and writing "
             "areas clear. Read the renderer's report and fix failures before claiming the file is "
             "ready. Automated checks are not visual inspection; don't claim you saw the pages.")
+        parts.append(
+            "\n## Answer keys and opening files\n"
+            "For an answer key to an EXISTING quiz or worksheet, load_skill with name "
+            "'answer-key', then call read_quiz on the actual source PDF or quiz JSON, even in a "
+            "follow-up chat. Earlier drafts and chat memory are not reliable sources. Answer every "
+            "returned question using its actual options and exact evidence quotes; flag a "
+            "question with no correct option or contradictory evidence, never force an answer. "
+            "Write the source-bound answer-key JSON and use render_answer_key, NOT "
+            "render_worksheet. (A brand-new quiz plus key uses render_worksheet with "
+            "answer_key_path instead.) Work out each answer step by step before writing it; "
+            "keep explanations concise and do not invent points. Source "
+            "checks cannot certify reasoning: check that each quote supports the actual answer. "
+            "When asked to open a file, use open_file after successful creation; never "
+            "background xdg-open or claim a JSON/text draft is a finished PDF. If rendering "
+            "fails, report that the PDF is not ready and the actual error. Only a successful "
+            "open_file result means the desktop accepted an open request; it does not prove "
+            "that the user saw a window.")
     parts.append(
         "\n## Style\nAnswer in Markdown. Be direct and helpful; use headings, lists, tables and "
         "fenced code blocks (with a language) when they make the answer clearer.")
@@ -174,7 +214,8 @@ def clean_for_api(messages: list[dict]) -> list[dict]:
 
 
 def _shrink_call(call: dict) -> bool:
-    """Shortens long strings (like a whole file) in a tool call's arguments. True if it changed."""
+    """Replaces long strings (like a whole file) in a tool call's arguments with a short note.
+    No fragment is kept: a model continues a fragment, then copies it into a file."""
     try:
         args = json.loads(call["function"]["arguments"])
     except (KeyError, TypeError, ValueError):
@@ -184,48 +225,98 @@ def _shrink_call(call: dict) -> bool:
     changed = False
     for k, v in args.items():
         if isinstance(v, str) and len(v) > LONG_ARG:
-            args[k] = v[:300] + f"\n[... {len(v) - 300:,} more characters removed to save context space]"
+            args[k] = f"[{len(v):,} characters omitted here to save context space]"
             changed = True
     if changed:
         call["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
     return changed
 
 
-def fit_context(messages: list[dict], budget_chars: int) -> list[dict]:
-    """Shrinks history to fit: first old tool outputs and arguments, then whole old turns, then the
-    current turn's tool outputs, then its tool arguments."""
+def _stub(m: dict) -> None:
+    m["content"] = SKILL_STUB if m.get("name") == "load_skill" else OLD_TOOL_STUB
+
+
+def fit_context(messages: list[dict], budget_chars: int, target_chars: int | None = None) -> list[dict]:
+    """Shrinks history to fit: first repeated and old tool outputs and arguments, then whole old
+    turns, then the current turn's drafts and older outputs, keeping skill text and quiz sources
+    as long as possible. Above the budget it shrinks to target_chars, leaving room to append."""
     msgs = copy.deepcopy(messages)
     total = lambda: sum(_size(m) for m in msgs)
     if total() <= budget_chars:
         return msgs
+    goal = min(budget_chars, target_chars or budget_chars)
+    # An output that appears again later (the same file read twice) is needed only once.
+    later = set()
+    for m in reversed(msgs):
+        if m["role"] == "tool" and len(m.get("content") or "") > 200:
+            seen = (m.get("name"), m["content"].removesuffix(CACHE_NOTE))
+            if seen in later:
+                m["content"] = REPEAT_STUB
+            later.add(seen)
     last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=0)
     for i, m in enumerate(msgs[:last_user]):
         if m["role"] == "tool" and len(m.get("content") or "") > len(OLD_TOOL_STUB):
-            m["content"] = OLD_TOOL_STUB
+            _stub(m)
         for call in m.get("tool_calls") or []:
             _shrink_call(call)
     # Drop whole turns from the front (a turn = a user message and everything up to the next).
-    while total() > budget_chars:
+    while total() > goal:
         users = [i for i, m in enumerate(msgs) if m["role"] == "user"]
         if len(users) < 2:
             break
         del msgs[users[0]:users[1]]
-    # Still too big: trim the current turn's tool outputs, largest first.
+    last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=0)
+    for m in msgs[last_user:]:
+        if total() <= goal:
+            break
+        for call in m.get("tool_calls") or []:
+            _shrink_call(call)
+    # Then this turn's older outputs (stale file listings, superseded errors), oldest first.
+    for m in msgs[last_user:-4]:
+        if total() <= goal:
+            break
+        if (m["role"] == "tool" and m.get("name") not in ("read_quiz", "load_skill")
+                and len(m.get("content") or "") > len(OLD_TOOL_STUB)):
+            _stub(m)
+    # Last resort: cut the biggest output, but only as far as needed. A skill is cut before a
+    # quiz source, which is needed to check the answers.
     while total() > budget_chars:
         tools = [m for m in msgs if m["role"] == "tool" and len(m.get("content") or "") > 600]
         if not tools:
             break
-        big = max(tools, key=lambda m: len(m["content"]))
+        big = max(tools, key=lambda m: (m.get("name") != "read_quiz", m.get("name") != "load_skill",
+                                        len(m["content"])))
         over = total() - budget_chars
         keep = max(400, len(big["content"]) - over - 200)
-        big["content"] = big["content"][:keep] + "\n[...truncated to fit the context window]"
-    # Last resort: the current turn's long tool arguments (e.g. files written in parts), oldest first.
-    for m in msgs[last_user:]:
-        if total() <= budget_chars:
-            break
-        for call in m.get("tool_calls") or []:
-            _shrink_call(call)
+        big["content"] = big["content"][:keep] + CUT_NOTE
+        if big.get("name") == "read_quiz":
+            big["content"] += "\n[Quiz source incomplete. Use read_quiz continuation lines; do not guess.]"
+        elif big.get("name") == "load_skill":
+            big["content"] += "\n[Skill text incomplete. Call load_skill again if you need the rest.]"
     return msgs
+
+
+class ContextFitter:
+    """fit_context() across the rounds of a chat, keeping the trimmed history append-only.
+
+    Re-trimming every round changes early messages, and llama-server then re-reads everything
+    after the change (minutes per round on a phone). So a trimmed history is reused while new
+    messages still fit, and is re-trimmed with room to spare only when they don't."""
+
+    def __init__(self) -> None:
+        self._source: list[dict] = []
+        self._fitted: list[dict] = []
+
+    def __call__(self, messages: list[dict], budget_chars: int) -> list[dict]:
+        n = len(self._source)
+        if n and messages[:n] == self._source:
+            fitted = self._fitted + copy.deepcopy(messages[n:])
+            if sum(_size(m) for m in fitted) <= budget_chars:
+                self._source, self._fitted = copy.deepcopy(messages), fitted
+                return copy.deepcopy(fitted)
+        fitted = fit_context(messages, budget_chars, int(budget_chars * TRIM_TARGET))
+        self._source, self._fitted = copy.deepcopy(messages), fitted
+        return copy.deepcopy(fitted)
 
 
 def repair_history(messages: list[dict]) -> None:
@@ -247,7 +338,8 @@ def repair_history(messages: list[dict]) -> None:
                 i += 1
 
 
-_DRAFTING = {"write_file": "Drafting the file", "web_search": "Choosing what to search",
+_DRAFTING = {"write_file": "Drafting the file", "edit_file": "Drafting the change",
+             "web_search": "Choosing what to search",
              "fetch_url": "Choosing a page", "download_file": "Choosing a download",
              "run_command": "Writing a command", "install_packages": "Choosing software"}
 
@@ -275,6 +367,7 @@ class Agent:
         self.server = server
         self.toolbox = toolbox
         self.stream: ChatStream | None = None
+        self.fit = ContextFitter()
 
     def abort(self) -> None:
         if self.stream is not None:
@@ -296,12 +389,37 @@ class Agent:
         tool_chars = len(json.dumps(tools)) if tools else 0
         budget = int((n_ctx - max_out) * CHARS_PER_TOKEN) - len(sys_msg["content"]) - tool_chars
         rounds = 0
+        failed_outputs: dict[tuple[str, str], str] = {}
+        repeats: dict[tuple[str, str], int] = {}
+
+        def incomplete() -> str:
+            grouped: dict[tuple[str, str], list[str]] = {}
+            for (action, path), error in failed_outputs.items():
+                grouped.setdefault((action, error), []).append(f"`{path}`")
+            detail = "\n".join(f"- {action} {', '.join(paths)}: {error[:600]}"
+                               for (action, error), paths in grouped.items())
+            return ("**Task incomplete.** The following operations did not succeed; "
+                    "do not treat their drafts as finished or opened PDFs.\n\n" + detail)
+
+        def stop(text: str) -> None:
+            msg = {"role": "assistant", "content": text, "_meta": {"time": time.time()}}
+            messages.append(msg)
+            events.round_begin()
+            events.content(text)
+            events.round_end(msg, {})
+
         while True:
             if cancel.is_set():
                 raise Cancelled()
+            if rounds >= MAX_TOOL_ROUNDS:
+                stop((incomplete() + "\n\n" if failed_outputs else "")
+                     + f"Paused after {MAX_TOOL_ROUNDS} tool rounds. Completed steps and drafts "
+                     "are saved, but the task has not been confirmed complete. No further "
+                     "commands ran. Reply **continue** to let Qwen keep going from here.")
+                return
             rounds += 1
-            use_tools = tools and rounds <= MAX_TOOL_ROUNDS
-            history = fit_context(clean_for_api(messages), budget)
+            use_tools = tools
+            history = self.fit(clean_for_api(messages), budget)
             payload = {
                 "messages": [sys_msg] + history,
                 "max_tokens": max_out,
@@ -327,8 +445,10 @@ class Agent:
             if cancel.is_set():
                 raise Cancelled()
             try:
+                # Hold unverified completion text out of both the GUI and terminal.
+                guard_final = bool(failed_outputs)
                 result = self.stream.run(
-                    payload, events.reasoning, events.content,
+                    payload, events.reasoning, (lambda _delta: None) if guard_final else events.content,
                     lambda done, total: events.status(f"Reading {total:,} tokens… {100 * done // total}%"),
                     lambda name, chars: events.status(_drafting(name, chars)))
             except LLMError as e:
@@ -342,6 +462,10 @@ class Agent:
             cut_off = result["finish_reason"] == "length"
             if cut_off and not msg.get("tool_calls"):
                 msg["content"] = (msg.get("content") or "") + "\n\n*[Stopped: reached the response length limit.]*"
+            if not msg.get("tool_calls") and failed_outputs:
+                msg["content"] = incomplete()
+            if guard_final:
+                events.content(msg.get("content") or "")
             # Broken arguments (usually a call cut off by the length limit) must not be stored:
             # llama-server would reject every later request in this chat.
             broken: dict[str, int] = {}
@@ -359,6 +483,7 @@ class Agent:
             calls = msg.get("tool_calls") or []
             if not calls:
                 return
+            stuck = ""
             for call in calls:
                 if cancel.is_set():
                     raise Cancelled()
@@ -366,18 +491,63 @@ class Agent:
                 raw = call["function"]["arguments"]
                 try:
                     args = ToolBox.parse_args(raw)
-                except Exception:
+                except (ToolError, OSError, ValueError):
                     args = {}
                 events.tool_begin(call["id"], name, args)
                 key = name + ":" + json.dumps(args, sort_keys=True)
                 if call["id"] in broken:
                     ok, out = False, _broken_call_note(name, broken[call["id"]], cut_off)
-                elif key in seen and name in ("web_search", "fetch_url", "list_files", "read_file"):
-                    ok, out = True, seen[key] + "\n[You already ran this exact call; use this result.]"
+                elif key in seen and name in CACHED_TOOLS:
+                    ok, out = True, seen[key] + CACHE_NOTE
                 else:
                     ok, out = self.toolbox.run(name, raw)
-                    if ok:
+                    if ok and name in CACHED_TOOLS:
                         seen[key] = out
+                    elif name not in CACHED_TOOLS:
+                        # Anything else may have changed workspace files: read them afresh.
+                        for stale in [k for k in seen if k.startswith(("list_files:", "read_file:"))]:
+                            del seen[stale]
+                action, paths = "", [args.get("path")]
+                if name in ("render_worksheet", "render_answer_key"):
+                    action = "Create PDF"
+                    if name == "render_worksheet" and args.get("answer_key_path"):
+                        paths.append(args["answer_key_path"])
+                elif name == "open_file":
+                    action = "Open file"
+                elif name == "run_command":
+                    paths = [self.toolbox.open_command_path(args.get("command", ""))]
+                    action = "Open file" if paths[0] is not None else ""
+                for path in paths if action else []:
+                    try:
+                        path = self.toolbox.ws.display(self.toolbox.ws.resolve(path))
+                    except (ToolError, OSError, ValueError):
+                        path = str(path or "(no output path)")
+                    if ok:
+                        failed_outputs.pop((action, path), None)
+                    else:
+                        failed_outputs[action, path] = out
+                if ok:
+                    for seen_error in [k for k in repeats if k[0] == name]:
+                        del repeats[seen_error]
+                else:
+                    seen_before = repeats.get((name, out[:400]), 0)
+                    repeats[name, out[:400]] = seen_before + 1
+                    if seen_before + 1 >= REPEAT_LIMIT:
+                        stuck = stuck or out
+                    elif seen_before:
+                        out += ("\n[Same error as before: the last change did not fix it. Change "
+                                "exactly the field or value this error names, or explain the "
+                                "problem to the user. Do not resubmit unchanged content.]")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name,
                                  "content": out, "_meta": {"ok": ok}})
                 events.tool_end(call["id"], name, args, ok, out)
+            if stuck:
+                listed = stuck in failed_outputs.values()
+                stop((incomplete() if failed_outputs else "**Task incomplete.**")
+                     + f"\n\nStopped because the same error repeated {REPEAT_LIMIT} times; "
+                     "retrying it unchanged cannot succeed."
+                     + ("" if listed else "\n\n" + "\n".join(
+                         "> " + line for line in stuck[:600].splitlines()))
+                     + "\n\nReply **continue** to let Qwen try a different fix, "
+                     "or say how to proceed.")
+                return

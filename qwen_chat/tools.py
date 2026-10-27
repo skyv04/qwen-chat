@@ -14,6 +14,8 @@ shown to the user verbatim and run only if they allow them.
 from __future__ import annotations
 
 import codecs
+import contextlib
+import hashlib
 import html
 import inspect
 import ipaddress
@@ -54,6 +56,63 @@ class ToolError(Exception):
     """A failure the model is shown so it can recover (bad path, HTTP error, ...)."""
 
 
+# The bracketed notes the chat history uses where it shortened something (see agent.py).
+# A model can copy one into a file, which silently replaces real content, so writes refuse it.
+CONTEXT_MARKER = re.compile(
+    r"\[[^\[\]\n]{0,80}(?:to save context space|to fit the context window)[^\[\]\n]{0,120}\]")
+
+
+def _refuse_placeholder(text: str, name: str, existed: bool) -> None:
+    m = CONTEXT_MARKER.search(text)
+    if m:
+        raise ToolError(
+            f"Nothing was saved: the new text contains {m[0]!r}, a note from shortened chat "
+            "history, not real content. "
+            + (f"{name} keeps its previous content. Use read_file to see it, then change part of "
+               "it with edit_file or write the complete content." if existed else
+               f"Write the complete content of {name} instead."))
+
+
+def json_error(exc: json.JSONDecodeError) -> str:
+    """Where JSON breaks (message, line, column, excerpt), so one edit can fix it."""
+    lines = exc.doc.splitlines() if isinstance(exc.doc, str) else []
+    text = lines[exc.lineno - 1] if 0 < exc.lineno <= len(lines) else ""
+    start = max(0, exc.colno - 60)
+    excerpt = text[start:start + 100].strip()
+    if excerpt:
+        excerpt = ("…" if start else "") + excerpt + ("…" if start + 100 < len(text) else "")
+    return f"{exc.msg} at line {exc.lineno}, column {exc.colno}" + (f": {excerpt}" if excerpt else "")
+
+
+def _json_fix_hint(exc: json.JSONDecodeError) -> str:
+    doc = exc.doc if isinstance(exc.doc, str) else ""
+    if CONTEXT_MARKER.search(doc):
+        return ("The file contains a bracketed note copied from shortened chat history, so real "
+                "content is missing. Write the complete JSON again with write_file.")
+    if exc.pos >= len(doc.rstrip()):
+        return "The JSON stops before it is complete: append the rest, or write the complete file."
+    return ("Fix just that spot with edit_file (usually a missing comma, quote or bracket); do "
+            "not rewrite the whole file.")
+
+
+def _find_once(text: str, old: str, name: str) -> tuple[int, int]:
+    """The one place `old` occurs: exactly, or else with any run of spaces/newlines matching."""
+    count = text.count(old)
+    if count == 1:
+        start = text.index(old)
+        return start, start + len(old)
+    if not count:
+        found = [m.span() for m in re.finditer(r"\s+".join(map(re.escape, old.split())), text)]
+        if len(found) == 1:
+            return found[0]
+        count = len(found)
+    if count:
+        raise ToolError(f"old_text matches {count} places in {name}. Include more of the nearby "
+                        "text so it matches exactly one place.")
+    raise ToolError(f"old_text was not found in {name}. Use read_file and copy the current text "
+                    "exactly; the file may have changed.")
+
+
 def human_size(n: int) -> str:
     for unit in ("bytes", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -71,6 +130,27 @@ def _duration(seconds: int) -> str:
     if seconds < 120:
         return f"{seconds} seconds"
     return f"{round(seconds / 60)} minutes"
+
+
+def _text_page(text: str, name: str, start_line: int, tool: str = "read_file") -> str:
+    lines = text.splitlines()
+    if not lines:
+        return f"{name} is empty."
+    start = max(1, _as_int(start_line, 1))
+    if start > len(lines):
+        raise ToolError(f"start_line {start} is past the end ({len(lines)} lines).")
+    out, used = [], 0
+    for line in lines[start - 1:]:
+        if len(line) > MAX_READ_CHARS:
+            line = line[:MAX_READ_CHARS] + " [line truncated]"
+        if out and used + len(line) > MAX_READ_CHARS:
+            break
+        out.append(line)
+        used += len(line) + 1
+    end = start + len(out) - 1
+    footer = (f"\n[{len(lines) - end} more lines. Call {tool} with start_line={end + 1} to continue.]"
+              if end < len(lines) else "")
+    return f"{name} (lines {start}-{end} of {len(lines)}):\n" + "\n".join(out) + footer
 
 
 # --------------------------------------------------------------------------- workspace
@@ -238,27 +318,7 @@ class Workspace:
                 raise ToolError(f"'{path}' is a binary file ({human_size(f.stat().st_size)}); "
                                 "its contents can't be shown as text.")
             text = raw.decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        if not lines:
-            return f"{self.display(f)} is empty."
-        start = max(1, _as_int(start_line, 1))
-        if start > len(lines):
-            raise ToolError(f"start_line {start} is past the end ({len(lines)} lines).")
-        out, used = [], 0
-        for line in lines[start - 1:]:
-            if len(line) > MAX_READ_CHARS:
-                line = line[:MAX_READ_CHARS] + " [line truncated]"
-            if out and used + len(line) > MAX_READ_CHARS:
-                break
-            out.append(line)
-            used += len(line) + 1
-        end = start + len(out) - 1
-        header = f"{self.display(f)} (lines {start}-{end} of {len(lines)}):\n"
-        footer = ""
-        if end < len(lines):
-            footer = (f"\n[{len(lines) - end} more lines. Call read_file with "
-                      f"start_line={end + 1} to continue.]")
-        return header + "\n".join(out) + footer
+        return _text_page(text, self.display(f), start_line)
 
     def write_file(self, path: str, content: str, append: bool = False) -> str:
         if not isinstance(content, str):
@@ -271,6 +331,11 @@ class Workspace:
             raise ToolError(f"Content is too large ({human_size(len(data))}).")
         existed = f.exists()
         name = self.display(f)
+        _refuse_placeholder(content, name, existed)
+        if (existed and not append and f.is_file() and f.stat().st_size == len(data)
+                and f.read_bytes() == data):
+            return (f"Unchanged: {name} already has exactly this content. If a tool reported an "
+                    "error for this file, change the value that error names before retrying.")
         backup = ""
         if existed and not append:
             if not self.confirm("Replace a file?",
@@ -291,7 +356,98 @@ class Workspace:
             fh.write(data)
         self.mark_own(f)
         verb = "Appended to" if append and existed else ("Overwrote" if existed else "Created")
-        return f"{verb} {name} ({human_size(len(data))}).{backup}"
+        note = self._json_note(f, None if append else content)
+        return f"{verb} {name} ({human_size(len(data))}).{backup}{note}"
+
+    def _json_note(self, f: Path, text: str | None = None) -> str:
+        """For a .json file that doesn't parse yet: where it breaks, so the fix is one edit."""
+        if f.suffix.lower() != ".json":
+            return ""
+        try:
+            if text is None:
+                text = f.read_bytes()[:MAX_WRITE_BYTES + 1].decode("utf-8", errors="replace")
+            json.loads(text, strict=False)
+        except json.JSONDecodeError as exc:
+            return (f" Note: {self.display(f)} is not valid JSON yet ({json_error(exc)}). If more "
+                    "parts follow, append them; otherwise fix that spot with edit_file.")
+        except (OSError, ValueError, RecursionError):
+            pass
+        return ""
+
+    def edit_file(self, path: str, old_text: str, new_text: str) -> str:
+        if not isinstance(old_text, str) or not isinstance(new_text, str):
+            raise ToolError("old_text and new_text must be text.")
+        f = self.resolve(path)
+        if not f.exists():
+            raise ToolError(f"'{path}' does not exist. Use write_file to create it.")
+        if not f.is_file():
+            raise ToolError(f"'{path}' is a folder; give a file name.")
+        name = self.display(f)
+        if not old_text.strip():
+            raise ToolError("old_text is empty. Copy the exact text to change from read_file, "
+                            "with enough nearby words to match one place.")
+        _refuse_placeholder(new_text, name, True)
+        size = f.stat().st_size
+        if size > MAX_WRITE_BYTES:
+            raise ToolError(f"{name} is too large to edit ({human_size(size)}).")
+        raw = f.read_bytes()
+        try:
+            if b"\x00" in raw[:8192]:
+                raise UnicodeError
+            text = raw.decode("utf-8")
+        except UnicodeError:
+            raise ToolError(f"{name} is not a text file, so edit_file can't change it.") from None
+        start, end = _find_once(text, old_text, name)
+        if text[start:end] != old_text:
+            # Matched with different spacing: the file keeps its own surrounding whitespace.
+            lead = old_text[:len(old_text) - len(old_text.lstrip())]
+            trail = old_text[len(old_text.rstrip()):]
+            if lead and new_text.startswith(lead):
+                new_text = new_text[len(lead):]
+            if trail and new_text.endswith(trail):
+                new_text = new_text[:len(new_text) - len(trail)]
+        new = text[:start] + new_text + text[end:]
+        if new == text:
+            return f"Unchanged: {name} already has this text."
+        is_json = f.suffix.lower() == ".json"
+        was_valid = False
+        if is_json:
+            try:
+                json.loads(text, strict=False)
+                was_valid = True
+            except (ValueError, RecursionError):
+                pass
+            if was_valid:
+                try:
+                    json.loads(new, strict=False)
+                except json.JSONDecodeError as exc:
+                    raise ToolError(f"Not changed: this edit would break the JSON in {name} "
+                                    f"({json_error(exc)}). Keep quotes, commas and brackets "
+                                    "balanced in new_text.") from None
+                except (ValueError, RecursionError):
+                    pass
+        if not self.confirm("Change a file?",
+                            f"Qwen wants to edit {name} ({human_size(size)}). The old version "
+                            "goes to the Trash."):
+            raise ToolError(f"The user declined changing {name}. "
+                            "Ask what they want, or save under a new name.")
+        backup = ""
+        if not self._is_own(f) and size:
+            self.trash(f)
+            backup = " The old version is in the Trash."
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(new.encode("utf-8"))
+        self.mark_own(f)
+        note = self._json_note(f, new)
+        if is_json and not was_valid and not note:
+            note = f" {name} is now valid JSON."
+        left = CONTEXT_MARKER.search(new)
+        if left:
+            note += (f" {name} still contains {left[0]!r}, a note from shortened chat history; "
+                     "replace it with the real content.")
+        return (f"Edited {name} at line {text.count(chr(10), 0, start) + 1} "
+                f"({end - start:,} characters replaced with {len(new_text):,}).{backup}{note}")
 
     def make_directory(self, path: str) -> str:
         d = self.resolve(path)
@@ -347,18 +503,22 @@ def _as_int(v, default: int) -> int:
         return default
 
 
-def pdf_to_text(path: Path) -> str:
+def pdf_to_text(path: Path, *, raw: bool = False) -> str:
     if not shutil.which("pdftotext"):
         raise ToolError("PDF support needs pdftotext (poppler-utils), which isn't installed.")
     try:
-        res = subprocess.run(["pdftotext", "-q", str(path), "-"],
-                             capture_output=True, timeout=90, stdin=subprocess.DEVNULL)
+        res = subprocess.run(["pdftotext", *(["-raw"] if raw else []), "-q", str(path), "-"],
+                             capture_output=True, timeout=90, stdin=subprocess.DEVNULL,
+                             env=child_env())
     except subprocess.TimeoutExpired:
         raise ToolError("Extracting text from the PDF took too long.") from None
+    if res.returncode:
+        raise ToolError("PDF text extraction failed: "
+                        + res.stderr.decode("utf-8", errors="replace")[-1000:])
     text = res.stdout.decode("utf-8", errors="replace")
     if not text.strip():
         raise ToolError("The PDF has no extractable text (it may be scanned images).")
-    text = re.sub(r"[ \t]{2,}", " ", text.replace("\f", "\n"))
+    text = re.sub(r"[ \t]{2,}", " ", text if raw else text.replace("\f", "\n"))
     return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", text)).strip()
 
 
@@ -818,8 +978,8 @@ PROGRAM_PACKAGES = {
 
 
 def venv_dir() -> Path:
-    from .config import DATA_DIR
-    return DATA_DIR / "qwen-chat" / "venv"
+    from .config import HARNESS_DIR
+    return HARNESS_DIR / "venv"
 
 
 def child_env() -> dict:
@@ -1474,12 +1634,26 @@ FILE_TOOLS = [
     _fn("read_file", "Read a text, code, Markdown, CSV or PDF file from the workspace.",
         {"path": {**_S, "description": "File path relative to the workspace"},
          "start_line": {"type": "integer", "description": "Line to start from (default 1)"}}, ["path"]),
+    _fn("read_quiz", "Read the actual quiz before making an answer key. Returns exact questions, "
+        "options, source excerpts and a source hash for render_answer_key. Supports worksheet "
+        "JSON and text PDFs with numbered questions; checks matching companion JSON against "
+        "the PDF. Read all continuation lines. Never derive a key from an older draft or memory.",
+        {"path": {**_S, "description": "Existing source quiz .pdf or .json in the workspace"},
+         "start_line": {"type": "integer", "description": "Continuation line, default 1"}}, ["path"]),
     _fn("write_file", "Create or overwrite a text file in the workspace (parent folders are created). "
         "Set append=true to add to the end instead, e.g. to write a long file in parts.",
         {"path": {**_S, "description": "File path relative to the workspace, e.g. 'notes/plan.md'"},
          "content": {**_S, "description": "Full text to write"},
          "append": {"type": "boolean", "description": "Append instead of replacing"}},
         ["path", "content"]),
+    _fn("edit_file", "Change part of an existing text file: replaces old_text, which must match "
+        "exactly one place, with new_text. Use it to fix one value or line instead of "
+        "rewriting the whole file.",
+        {"path": {**_S, "description": "File path relative to the workspace"},
+         "old_text": {**_S, "description": "Exact current text to replace, copied from read_file, "
+                                           "with enough nearby words to be unique"},
+         "new_text": {**_S, "description": "Replacement text"}},
+        ["path", "old_text", "new_text"]),
     _fn("make_directory", "Create a folder in the workspace.",
         {"path": {**_S, "description": "Folder path relative to the workspace"}}, ["path"]),
     _fn("move_path", "Move or rename a file or folder inside the workspace.",
@@ -1493,7 +1667,8 @@ DOWNLOAD_TOOL = _fn(
      "path": {**_S, "description": "Destination path in the workspace (default: name from the URL)"}},
     ["url"])
 
-FILE_RESULT_TOOLS = {"write_file", "download_file", "make_directory", "move_path", "render_worksheet"}
+FILE_RESULT_TOOLS = {"write_file", "edit_file", "download_file", "make_directory", "move_path",
+                     "render_worksheet", "render_answer_key"}
 
 _LIST = {"type": "array", "items": _S}
 SKILL_TOOLS = [
@@ -1511,14 +1686,32 @@ PROGRAM_TOOLS = [
         "Load worksheet-pdf first for its format. Checks layout, page limit, color emoji and "
         "text preservation before saving. Pass the user's requested question counts, when given, "
         "to check the format. A page-limit conflict asks the user to allow the necessary pages; "
-        "do not rewrite or remove content to work around it.",
+        "do not rewrite or remove content to work around it. For a NEW worksheet plus a parent "
+        "or teacher answer key, put each question's answer in the same JSON and pass "
+        "answer_key_path: one call checks every answer and creates both PDFs, with no answers "
+        "on the student copy. For a key to an EXISTING quiz, use read_quiz and render_answer_key.",
         {"spec_path": {**_S, "description": "Workspace JSON file containing the worksheet data"},
          "path": {**_S, "description": "Destination .pdf file in the workspace"},
          "expected_questions": {"type": "integer", "minimum": 0, "maximum": 30,
                                 "description": "Total questions requested by the user, excluding a bonus challenge"},
          "expected_multiple_choice": {"type": "integer", "minimum": 0, "maximum": 30,
-                                      "description": "Multiple-choice question count requested by the user (not option count)"}},
+                                      "description": "Multiple-choice question count requested by the user (not option count)"},
+         "answer_key_path": {**_S, "description": "Optional second .pdf for the parent/teacher "
+                                                  "answer key, built from the answers in the JSON"}},
         ["spec_path", "path"]),
+    _fn("render_answer_key", "Create a teacher-facing answer-key PDF from source-bound JSON. "
+        "Load answer-key and call read_quiz first. Requires one answer per source question, "
+        "valid option letters and exact source evidence. Copies question/option text from "
+        "the source; flags invalid questions rather than forcing wrong choices. Checks the "
+        "source hash, coverage, layout, page limit and exported text before saving.",
+        {"spec_path": {**_S, "description": "Answer-key JSON with source_path, source_sha256, answers "
+                                             "and optional max_pages; see answer-key skill"},
+         "path": {**_S, "description": "Destination .pdf file in the workspace"}},
+        ["spec_path", "path"]),
+    _fn("open_file", "Request that the desktop open an existing workspace file. Rejects missing "
+        "or invalid PDFs and reports opener errors. Use instead of backgrounded xdg-open. "
+        "Success confirms the launch request, not that a window was visibly displayed.",
+        {"path": {**_S, "description": "Existing workspace file to open"}}, ["path"]),
     _fn("run_command", "Run a bash command in the workspace folder and get its output and exit "
         "code. Routine commands run right away; the user is asked first only for risky ones "
         "(admin rights, files outside the workspace, stopping programs). Do related steps in "
@@ -1599,7 +1792,9 @@ class ToolBox:
             "download_file": lambda url, path="": download_file(ws, url, path),
             "list_files": ws.list_files,
             "read_file": ws.read_file,
+            "read_quiz": self.read_quiz,
             "write_file": ws.write_file,
+            "edit_file": ws.edit_file,
             "make_directory": ws.make_directory,
             "move_path": ws.move_path,
             "delete_path": ws.delete_path,
@@ -1607,6 +1802,8 @@ class ToolBox:
             "load_skill": self.load_skill,
             "save_skill": self.save_skill,
             "render_worksheet": self.render_worksheet,
+            "render_answer_key": self.render_answer_key,
+            "open_file": self.open_file,
             "run_command": self.run_command,
             "install_packages": self.install_packages,
             "check_programs": self.check_programs,
@@ -1733,29 +1930,126 @@ class ToolBox:
                 "no restart is needed. Suggest it with /" + skill.name + " or the Skills picker."
                 + (" The previous version is in the Trash." if old is not None else ""))
 
+    @staticmethod
+    def _json_data(source: Path) -> tuple[dict, bytes]:
+        from .worksheet_pdf import MAX_SPEC_BYTES
+        if not source.is_file():
+            raise ToolError("The specification must be an existing JSON file.")
+        with source.open("rb") as fh:
+            raw = fh.read(MAX_SPEC_BYTES + 1)
+        if len(raw) > MAX_SPEC_BYTES:
+            raise ToolError("The JSON specification is too large.")
+        try:
+            data = json.loads(raw, strict=False)
+        except json.JSONDecodeError as exc:
+            raise ToolError(f"Invalid JSON specification: {json_error(exc)}. "
+                            + _json_fix_hint(exc)) from None
+        except (ValueError, UnicodeError) as exc:
+            raise ToolError(f"Invalid JSON specification: {exc}") from None
+        if not isinstance(data, dict):
+            raise ToolError("The JSON specification must be an object.")
+        return data, raw
+
+    def _quiz_source(self, path: str) -> tuple[dict, str, str, dict[Path, str]]:
+        from .answer_key import quiz_from_pdf, quiz_from_spec
+        from .worksheet_pdf import DesignError
+
+        source = self.ws.resolve(path)
+        if not source.is_file() or source.suffix.lower() not in (".pdf", ".json"):
+            raise ToolError("read_quiz needs an existing quiz .pdf or worksheet .json file.")
+        with source.open("rb") as fh:
+            raw = fh.read(MAX_PAGE_BYTES + 1)
+        if len(raw) > MAX_PAGE_BYTES:
+            raise ToolError("The source quiz is too large; split it into shorter documents.")
+        digest = hashlib.sha256(raw).hexdigest()
+        snapshots = {source: digest}
+        try:
+            if source.suffix.lower() == ".json":
+                quiz = quiz_from_spec(json.loads(raw, strict=False))
+            else:
+                if not raw.startswith(b"%PDF-"):
+                    raise ToolError("The source file is not a PDF.")
+                text = pdf_to_text(source, raw=True)
+                companion = self.ws.resolve(str(source.with_suffix(".json")))
+                if companion.is_file():
+                    data, companion_raw = self._json_data(companion)
+                    snapshots[companion] = hashlib.sha256(companion_raw).hexdigest()
+                    quiz = quiz_from_spec(data, text)
+                else:
+                    quiz = quiz_from_pdf(text, source.stem.replace("_", " "))
+        except (DesignError, ValueError, UnicodeError) as exc:
+            raise ToolError(f"Cannot use this quiz source: {exc}") from None
+        self._check_source_snapshots(snapshots)
+        return quiz, self.ws.display(source), digest, snapshots
+
+    def _check_source_snapshots(self, snapshots: dict[Path, str]) -> None:
+        for source, digest in snapshots.items():
+            if self.ws.resolve(str(source)) != source or not source.is_file():
+                raise ToolError("The quiz source changed. Call read_quiz again before retrying.")
+            with source.open("rb") as fh:
+                raw = fh.read(MAX_PAGE_BYTES + 1)
+            if len(raw) > MAX_PAGE_BYTES or hashlib.sha256(raw).hexdigest() != digest:
+                raise ToolError("The quiz source changed during this operation. No key was saved. "
+                                "Call read_quiz again before retrying.")
+
+    def read_quiz(self, path: str, start_line: int = 1) -> str:
+        self._check_declined()
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        quiz, name, digest, _ = self._quiz_source(path)
+        report = {
+            "source_path": name, "source_sha256": digest, "title": quiz["title"],
+            "source_excerpts": [
+                {"number": i, "text": text} for i, text in enumerate(quiz["passages"], 1)],
+            "questions": quiz["questions"],
+        }
+        return _text_page(json.dumps(report, ensure_ascii=False, indent=2), name, start_line, "read_quiz")
+
+    def render_answer_key(self, spec_path: str, path: str) -> str:
+        from .answer_key import key_document
+        from .worksheet_pdf import DesignError, validate_spec
+
+        self._check_declined()
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        source = self.ws.resolve(spec_path)
+        data, _ = self._json_data(source)
+        if not isinstance(data, dict) or not isinstance(data.get("source_path"), str):
+            raise ToolError("Load answer-key, then call read_quiz. The key JSON needs source_path, "
+                            "source_sha256 and an answers list, not rewritten worksheet questions.")
+        quiz, name, digest, snapshots = self._quiz_source(data["source_path"])
+        target = self.ws.resolve(path)
+        if target in snapshots or source in snapshots:
+            raise ToolError("Save the answer key separately; never replace the source quiz.")
+        try:
+            document, audit = key_document(data, quiz, name, digest)
+            spec = validate_spec(document)
+        except DesignError as exc:
+            raise ToolError(f"Invalid answer key: {exc}") from None
+        result = self._render_pdf(source, target, path, document, spec, "answer key",
+                                  lambda: self._check_source_snapshots(snapshots))
+        return result + "\nSource checks: " + json.dumps(audit, ensure_ascii=False)
+
     def render_worksheet(self, spec_path: str, path: str, expected_questions: int | None = None,
-                         expected_multiple_choice: int | None = None) -> str:
-        from .worksheet_pdf import DesignError, MAX_PAGES, MAX_SPEC_BYTES, validate_spec
+                         expected_multiple_choice: int | None = None,
+                         answer_key_path: str | None = None) -> str:
+        from .answer_key import worksheet_key
+        from .worksheet_pdf import DesignError, normalize_spec, validate_spec, without_answers
 
         self._check_declined()
         if self._cancelled():
             raise ToolError("Stopped by the user.")
         source, target = self.ws.resolve(spec_path), self.ws.resolve(path)
-        if not source.is_file():
-            raise ToolError("The worksheet specification must be an existing JSON file.")
-        if target.is_dir() or target.suffix.lower() != ".pdf":
-            raise ToolError("Give a .pdf output file, not a folder.")
-        if source == target:
-            raise ToolError("The specification and PDF need different file names.")
-        with source.open("rb") as fh:
-            raw = fh.read(MAX_SPEC_BYTES + 1)
-        if len(raw) > MAX_SPEC_BYTES:
-            raise ToolError("The worksheet JSON is too large.")
+        data, _ = self._json_data(source)
+        data, adjusted = normalize_spec(data)
         try:
-            data = json.loads(raw)
             spec = validate_spec(data)
         except (DesignError, ValueError, UnicodeError) as exc:
-            raise ToolError(f"Invalid worksheet specification: {exc}") from None
+            hint = (" This is answer-key JSON for an existing quiz: load answer-key and use "
+                    "render_answer_key." if isinstance(data, dict)
+                    and data.keys() & {"answers", "source_path", "source_sha256"} else
+                    " Fix that spot with edit_file, then render again.")
+            raise ToolError(f"Invalid worksheet specification: {exc}{hint}") from None
         for label, expected, actual in (
                 ("questions", expected_questions, len(spec["questions"])),
                 ("multiple-choice questions", expected_multiple_choice,
@@ -1769,123 +2063,285 @@ class ToolBox:
                                 f"but the saved worksheet has {actual}. Correct the question mix "
                                 "to match the request before rendering; do not change the expected "
                                 "count to match a mistaken draft.")
+        jobs = [(target, path, without_answers(data), spec, "worksheet")]
+        key_audit = None
+        if answer_key_path:
+            key_target = self.ws.resolve(answer_key_path)
+            if key_target in (source, target):
+                raise ToolError("Use three different file names: the JSON, the student PDF and "
+                                "the answer-key PDF.")
+            try:
+                document, key_audit = worksheet_key(spec)
+                key_spec = validate_spec(document)
+            except DesignError as exc:
+                raise ToolError(f"The answer key is not ready: {exc}") from None
+            jobs.append((key_target, answer_key_path, document, key_spec, "answer key"))
+        result = self._render_pdfs(source, jobs)
+        if adjusted:
+            result += ("\nHandled automatically (no action needed; the JSON file was not changed): "
+                       + "; ".join(adjusted) + ".")
+        if key_audit:
+            return (result + "\nAnswer checks: " + json.dumps(key_audit, ensure_ascii=False)
+                    + "\nThe student PDF has no answers; the answer key has every answer.")
+        if any(q["key"] for q in [*spec["questions"], *filter(None, [spec["challenge"]])]):
+            result += ("\nThe JSON's answers were kept off this student PDF. For a parent answer "
+                       "key, render again with answer_key_path.")
+        return result
 
-        def fingerprint():
+    def _render_pdf(self, source: Path, target: Path, path: str, data: dict, spec: dict,
+                    kind: str = "worksheet", check_source: Callable[[], None] | None = None) -> str:
+        return self._render_pdfs(source, [(target, path, data, spec, kind)], check_source)
+
+    def _render_pdfs(self, source: Path, jobs: list[tuple[Path, str, dict, dict, str]],
+                     check_source: Callable[[], None] | None = None) -> str:
+        """Render every PDF to scratch files; publish them together only if all passed."""
+        targets = [job[0] for job in jobs]
+        for target in targets:
+            if target.is_dir() or target.suffix.lower() != ".pdf":
+                raise ToolError("Give a .pdf output file, not a folder.")
+            if source == target:
+                raise ToolError("The specification and PDF need different file names.")
+        if len(set(targets)) != len(targets):
+            raise ToolError("The worksheet and its answer key need different PDF file names.")
+
+        def fingerprint(target: Path):
             if not target.exists():
                 return None
             st = target.stat()
             return st.st_ino, st.st_size, st.st_mtime_ns
 
-        before = fingerprint()
-        name = self.ws.display(target)
-        if before is not None and not self.ws.confirm(
-                "Replace a file?", f"Qwen wants to replace {name}. The old version goes to "
-                "the Trash only after the new PDF passes its layout and text checks."):
-            raise ToolError(f"The user declined overwriting {name}. Ask what they want, "
+        before = [fingerprint(t) for t in targets]
+        names = [self.ws.display(t) for t in targets]
+        existing = " and ".join(n for n, old in zip(names, before) if old is not None)
+        if existing and not self.ws.confirm(
+                "Replace a file?", f"Qwen wants to replace {existing}. Old versions go to the "
+                "Trash only after every new PDF passes its layout and text checks."):
+            raise ToolError(f"The user declined overwriting {existing}. Ask what they want, "
                             "or save under a new name.")
-        self._ask("Create this worksheet PDF?",
-                  f"Create {name} from {self.ws.display(source)} using the bundled local renderer. "
-                  "It uses a separate headless browser, not your open browser, for up to 2 minutes.",
-                  "render_worksheet(" + json.dumps({"spec_path": spec_path, "path": path}) + ")",
-                  "Create PDF", "The user said no to creating this PDF.")
+        kind = jobs[0][4]
+        call = {"spec_path": self.ws.display(source), "path": jobs[0][1]}
+        if len(jobs) > 1:
+            call["answer_key_path"] = jobs[1][1]
+        self._ask(f"Create this {kind} PDF?" if len(jobs) == 1 else "Create the worksheet and answer key?",
+                  f"Create {' and '.join(names)} from {self.ws.display(source)} using the bundled "
+                  "local renderer. It uses a separate headless browser, not your open browser, "
+                  "for up to 2 minutes per PDF.",
+                  f"render_{kind.replace(' ', '_')}(" + json.dumps(call) + ")",
+                  "Create PDF" if len(jobs) == 1 else "Create PDFs",
+                  "The user said no to creating this PDF.")
         if self._cancelled():
             raise ToolError("Stopped by the user.")
-        target.parent.mkdir(parents=True, exist_ok=True)
         env = child_env()
         python = shutil.which("python3", path=env["PATH"])
         if not python:
             raise ToolError("Python 3 is missing from the command environment.")
-        self.status("Laying out the worksheet and checking its pages…")
+        rendered = []
+        with contextlib.ExitStack() as scratch:
+            for target, _path, data, spec, kind in jobs:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                root = Path(scratch.enter_context(
+                    tempfile.TemporaryDirectory(prefix=".qwen-pdf-", dir=target.parent)))
+                rendered.append((root / "worksheet.pdf",
+                                 *self._render_one(python, env, root, data, spec, kind,
+                                                   self.ws.display(target))))
+            for (target, path, *_), old in zip(jobs, before):
+                if self.ws.resolve(path) != target or fingerprint(target) != old:
+                    raise ToolError("The destination changed while the PDF was being made. "
+                                    "It was not replaced; read it again before retrying.")
+            if not self.files or not self.commands or self._cancelled():
+                raise ToolError("PDF rendering was stopped or disabled. No file was replaced.")
+            if check_source:
+                check_source()
+            backups = []
+            for target, (staged, *_) in zip(targets, rendered):
+                backup = ""
+                if target.exists() and not self.ws._is_own(target) and target.stat().st_size:
+                    self.ws.trash(target)
+                    backup = " The old version is in the Trash."
+                os.replace(staged, target)
+                backups.append(backup)
+        lines = []
+        for (target, _p, _d, spec, kind), (_s, report, approved), backup in zip(jobs, rendered, backups):
+            self.ws.mark_own(target)
+            if kind == "answer key":
+                for field in ("questions", "multiple_choice", "challenge", "answers"):
+                    report.pop(field, None)
+                report["answer_entries"] = len(spec["reading"])
+            lines.append(f"Created {self.ws.display(target)} ({human_size(target.stat().st_size)})."
+                         f"{backup}\n"
+                         + (f"The user approved {approved} pages for this export; the source JSON "
+                            "was not changed.\n" if approved is not None else "")
+                         + f"Layout report: {json.dumps(report, ensure_ascii=False)}")
+        if any(report.get("icon_substitutions") for _s, report, _a in rendered):
+            lines.append("Emoji the font cannot draw as one picture were replaced automatically "
+                         "(see icon_substitutions).")
+        return "\n".join(lines) + "\nThese are automated layout/text/emoji checks, not a visual review."
+
+    def _render_one(self, python: str, env: dict, root: Path, data: dict, spec: dict,
+                    kind: str, name: str) -> tuple[dict, int | None]:
+        """Render one checked PDF into `root`; a page-limit conflict asks the user once."""
+        from .worksheet_pdf import MAX_PAGES
+
+        self.status(f"Laying out the {kind} and checking its pages…")
         approved_pages = None
-        with tempfile.TemporaryDirectory(prefix=".qwen-pdf-", dir=target.parent) as scratch:
-            root = Path(scratch)
-            staged_spec, staged_pdf = root / "spec.json", root / "worksheet.pdf"
-            staged_spec.write_bytes(raw)
-            for attempt in range(2):
-                if not self.files or not self.commands:
-                    raise ToolError("PDF rendering needs Files and Run enabled. No PDF was saved.")
-                if self._cancelled():
-                    raise ToolError("Stopped by the user. The existing PDF was not changed.")
-                rc, out, reason = run_streaming(
-                    [python, str(Path(__file__).with_name("worksheet_pdf.py")),
-                     str(staged_spec), str(staged_pdf)],
-                    self.ws.root, env, 120, self.cancel)
-                if reason == "cancelled" or self._cancelled():
-                    raise ToolError("Stopped by the user. The existing PDF was not changed.")
-                if reason == "timeout":
-                    raise ToolError("The PDF renderer timed out and was stopped. "
-                                    "The existing PDF was not changed.")
-                if rc not in (0, 2):
-                    raise ToolError(f"The PDF was not saved.\n{out[-3000:]}")
-                try:
-                    report = json.loads(out)
-                except ValueError:
-                    raise ToolError("The renderer returned no valid layout report; no PDF was saved.") from None
-                if rc == 0:
-                    break
-                if (not isinstance(report, dict) or report.get("code") != "page_limit"
-                        or report.get("ok") is not False or type(report.get("pages")) is not int
-                        or report.get("max_pages") != spec["max_pages"]
-                        or report["pages"] <= spec["max_pages"]):
-                    raise ToolError("The renderer returned an invalid page-limit report; no PDF was saved.")
-                pages = report["pages"]
-                if attempt or pages > MAX_PAGES:
-                    self.input_required = (
-                        f"The worksheet needs {pages} pages. No PDF was saved. "
-                        "Ask the user how to split it into shorter documents; "
-                        "do not remove questions or reduce writing space.")
-                    raise ToolError(self.input_required)
-                self._ask(
-                    f"Use {pages} pages for this worksheet?",
-                    f"The saved specification limits {name} to {spec['max_pages']} pages, but "
-                    f"the complete worksheet needs {pages}. Keep every passage, question and "
-                    "answer line at readable sizes. Only this export's page allowance changes; "
-                    "the source JSON stays untouched.",
-                    f"{len(spec['questions'])} question{'s' if len(spec['questions']) != 1 else ''} "
-                    f"({sum(bool(q['options']) for q in spec['questions'])} multiple choice)"
-                    + (" + a bonus challenge" if spec["challenge"] else ""),
-                    f"Use {pages} Pages",
-                    "The user did not allow more pages. No PDF was saved. Ask how they want to "
-                    "revise the worksheet; do not cut questions or writing space on your own.",
-                    reason="The worksheet cannot fit its page limit without changing the content or readability.")
-                if self._cancelled():
-                    raise ToolError("Stopped by the user. The existing PDF was not changed.")
-                approved_pages = spec["max_pages"] = pages
-                staged_spec.write_text(json.dumps({**data, "max_pages": pages}, ensure_ascii=False),
-                                       encoding="utf-8")
-                self.status(f"Creating the approved {pages}-page worksheet…")
-            if (not isinstance(report, dict) or report.get("ok") is not True
-                    or report.get("text_preserved") is not True
-                    or report.get("layout_checked") is not True
-                    or report.get("portrait") is not True
-                    or type(report.get("pages")) is not int
-                    or not 1 <= report["pages"] <= spec["max_pages"]
-                    or type(report.get("color_emoji_checked")) is not int
-                    or report["color_emoji_checked"] < 1
-                    or not staged_pdf.is_file()):
-                raise ToolError("The renderer did not confirm a valid PDF; no PDF was saved.")
-            with staged_pdf.open("rb") as fh:
+        staged_spec, staged_pdf = root / "spec.json", root / "worksheet.pdf"
+        staged_spec.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        for attempt in range(2):
+            if not self.files or not self.commands:
+                raise ToolError("PDF rendering needs Files and Run enabled. No PDF was saved.")
+            if self._cancelled():
+                raise ToolError("Stopped by the user. The existing PDF was not changed.")
+            rc, out, reason = run_streaming(
+                [python, str(Path(__file__).with_name("worksheet_pdf.py")),
+                 str(staged_spec), str(staged_pdf)],
+                self.ws.root, env, 120, self.cancel)
+            if reason == "cancelled" or self._cancelled():
+                raise ToolError("Stopped by the user. The existing PDF was not changed.")
+            if reason == "timeout":
+                raise ToolError("The PDF renderer timed out and was stopped. "
+                                "The existing PDF was not changed.")
+            if rc not in (0, 2):
+                raise ToolError(f"The {kind} PDF was not saved.\n{out[-3000:]}")
+            try:
+                report = json.loads(out)
+            except ValueError:
+                raise ToolError("The renderer returned no valid layout report; no PDF was saved.") from None
+            if rc == 0:
+                break
+            if (not isinstance(report, dict) or report.get("code") != "page_limit"
+                    or report.get("ok") is not False or type(report.get("pages")) is not int
+                    or report.get("max_pages") != spec["max_pages"]
+                    or report["pages"] <= spec["max_pages"]):
+                raise ToolError("The renderer returned an invalid page-limit report; no PDF was saved.")
+            pages = report["pages"]
+            if attempt or pages > MAX_PAGES:
+                self.input_required = (
+                    f"The {kind} needs {pages} pages. No PDF was saved. "
+                    "Ask the user how to split it into shorter documents; "
+                    "do not remove questions or reduce writing space.")
+                raise ToolError(self.input_required)
+            count_summary = (
+                f"{len(spec['reading'])} source-matched answers" if kind == "answer key" else
+                f"{len(spec['questions'])} question{'s' if len(spec['questions']) != 1 else ''} "
+                f"({sum(bool(q['options']) for q in spec['questions'])} multiple choice)"
+                + (" + a bonus challenge" if spec["challenge"] else ""))
+            self._ask(
+                f"Use {pages} pages for this {kind}?",
+                f"The saved specification limits {name} to {spec['max_pages']} pages, but "
+                f"the complete {kind} needs {pages}. Keep all content "
+                "at readable sizes. Only this export's page allowance changes; "
+                "the source JSON stays untouched.",
+                count_summary,
+                f"Use {pages} Pages",
+                "The user did not allow more pages. No PDF was saved. Ask how they want to "
+                "revise the worksheet; do not cut questions or writing space on your own.",
+                reason=f"The {kind} cannot fit its page limit without changing the content or readability.")
+            if self._cancelled():
+                raise ToolError("Stopped by the user. The existing PDF was not changed.")
+            approved_pages = spec["max_pages"] = pages
+            staged_spec.write_text(json.dumps({**data, "max_pages": pages}, ensure_ascii=False),
+                                   encoding="utf-8")
+            self.status(f"Creating the approved {pages}-page {kind}…")
+        if (not isinstance(report, dict) or report.get("ok") is not True
+                or report.get("text_preserved") is not True
+                or report.get("layout_checked") is not True
+                or report.get("portrait") is not True
+                or type(report.get("pages")) is not int
+                or not 1 <= report["pages"] <= spec["max_pages"]
+                or type(report.get("color_emoji_checked")) is not int
+                or report["color_emoji_checked"] < 1
+                or not staged_pdf.is_file()):
+            raise ToolError("The renderer did not confirm a valid PDF; no PDF was saved.")
+        with staged_pdf.open("rb") as fh:
+            if fh.read(5) != b"%PDF-":
+                raise ToolError("The renderer output is not a PDF; no file was replaced.")
+        return report, approved_pages
+
+    def open_file(self, path: str) -> str:
+        self._check_declined()
+        target = self.ws.resolve(path)
+        if not target.is_file() or not target.stat().st_size:
+            raise ToolError(f"Cannot open {path}: the file is missing or empty. Create it successfully first.")
+        def fingerprint():
+            st = target.stat()
+            return st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode
+
+        before = fingerprint()
+        env = child_env()
+        opener = shutil.which("gio", path=env["PATH"])
+        if not opener:
+            raise ToolError("The desktop opener is missing (gio from libglib2.0-bin).")
+        if self._cancelled():
+            raise ToolError("Stopped by the user.")
+        if target.suffix.lower() == ".pdf":
+            with target.open("rb") as fh:
                 if fh.read(5) != b"%PDF-":
-                    raise ToolError("The renderer output is not a PDF; no file was replaced.")
-            if self.ws.resolve(path) != target or fingerprint() != before:
-                raise ToolError("The destination changed while the PDF was being made. "
-                                "It was not replaced; read it again before retrying.")
-            backup = ""
-            if target.exists() and not self.ws._is_own(target) and target.stat().st_size:
-                self.ws.trash(target)
-                backup = " The old version is in the Trash."
-            os.replace(staged_pdf, target)
-        self.ws.mark_own(target)
-        return (f"Created {name} ({human_size(target.stat().st_size)}).{backup}\n"
-                + (f"The user approved {approved_pages} pages for this export; the source JSON "
-                   "was not changed.\n" if approved_pages is not None else "")
-                + f"Layout report: {json.dumps(report, ensure_ascii=False)}\n"
-                "These are automated layout/text/emoji checks, not a visual review.")
+                    raise ToolError("Cannot open: this file is not a PDF.")
+            if not shutil.which("pdfinfo", path=env["PATH"]):
+                raise ToolError("Checking this PDF needs pdfinfo (poppler-utils).")
+            try:
+                info = subprocess.run(["pdfinfo", str(target)], env=env, capture_output=True,
+                                      stdin=subprocess.DEVNULL, timeout=15)
+            except subprocess.TimeoutExpired:
+                raise ToolError("The PDF check timed out; no open request was sent.") from None
+            if info.returncode:
+                raise ToolError("Cannot open an invalid PDF: "
+                                + info.stderr.decode("utf-8", errors="replace")[-1000:])
+        executable = os.access(target, os.X_OK) or target.suffix.lower() == ".desktop"
+        self._ask("Open this file?", f"Ask the desktop to open {self.ws.display(target)}.",
+                  shlex.join([opener, "open", str(target)]), "Open",
+                  "The user said no to opening this file.",
+                  reason="This file can execute code." if executable else None)
+        if self._cancelled() or not self.files or not self.commands:
+            raise ToolError("Opening was stopped or disabled; no open request was sent.")
+        if self.ws.resolve(path) != target or not target.is_file() or fingerprint() != before:
+            raise ToolError("The file changed before opening. Read it again before retrying.")
+        # Do not use run_streaming: its process-group cleanup would kill a newly opened viewer.
+        with tempfile.TemporaryFile() as log:
+            proc = subprocess.Popen([opener, "open", str(target)], cwd=self.ws.root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+            deadline = time.monotonic() + 15
+            while proc.poll() is None:
+                if self._cancelled() or not self.files or not self.commands or time.monotonic() >= deadline:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    raise ToolError("Opening was stopped or timed out. The desktop may already "
+                                    "have received the request; window visibility is not verified.")
+                time.sleep(.05)
+            if proc.returncode:
+                log.seek(0)
+                detail = log.read(2000).decode("utf-8", errors="replace")
+                raise ToolError(f"The desktop opener failed (exit {proc.returncode}): {detail}")
+        return (f"Open requested for {self.ws.display(target)}. The file exists and the desktop "
+                "opener accepted the request; whether a window appeared is not verified.")
+
+    @staticmethod
+    def open_command_path(command: str) -> str | None:
+        if not isinstance(command, str):
+            return None
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            return None
+        if words[-1:] == ["&"]:
+            words = words[:-1]
+        if ((len(words) == 2 and words[0] == "xdg-open")
+                or (len(words) == 3 and words[:2] == ["gio", "open"])):
+            return words[-1]
+        return None
 
     def run_command(self, command: str, why: str = "", timeout_seconds: int = RUN_TIMEOUT) -> str:
         if not isinstance(command, str) or not command.strip():
             raise ToolError("No command given.")
         self._check_declined()
+        open_path = self.open_command_path(command)
+        if open_path is not None:
+            return self.open_file(open_path)
         if len(command) > 20000:
             raise ToolError("The command is too long. Save it as a script with write_file and run that.")
         try:
@@ -2192,7 +2648,9 @@ class ToolBox:
             "download_file": ("Downloading", "Downloaded", q("url", 60)),
             "list_files": ("Looking in", "Looked in", path),
             "read_file": ("Reading", "Read", path),
+            "read_quiz": ("Reading source quiz", "Read source quiz", path),
             "write_file": (("Appending to", "Appended to") if a.get("append") else ("Writing", "Wrote")) + (path,),
+            "edit_file": ("Editing", "Edited", path),
             "make_directory": ("Creating folder", "Created folder", path),
             "move_path": ("Moving", "Moved", f"{q('source', 40)} → {q('destination', 40)}"),
             "delete_path": ("Deleting", "Deleted", path),
@@ -2202,16 +2660,22 @@ class ToolBox:
             "load_skill": ("Reading skill", "Read skill", q("name")),
             "list_skills": ("Finding skills", "Found skills", q("query") or "in the shared library"),
             "save_skill": ("Saving skill", "Saved skill", path),
-            "render_worksheet": ("Designing PDF", "Created PDF", path),
+            "render_worksheet": ("Designing PDF", "Created PDF",
+                                 path + (" + answer key" if a.get("answer_key_path") else "")),
+            "render_answer_key": ("Checking and creating answer key", "Created answer-key PDF", path),
+            "open_file": ("Requesting desktop open", "Requested desktop open", path),
         }
         tried = {"run_command": "Tried to run", "install_packages": "Tried to install",
                  "render_worksheet": "Could not create PDF", "load_skill": "Could not read skill",
+                 "render_answer_key": "Could not create answer key",
+                 "read_quiz": "Could not read source quiz", "open_file": "Could not open",
                  "save_skill": "Could not save skill", "list_skills": "Could not list skills",
+                 "edit_file": "Tried to edit",
                  "write_file": "Tried to append to" if a.get("append") else "Tried to write"}
         if name not in verbs:
             return f"Using {name}" if running else f"Used {name}"
         now, done, obj = verbs[name]
-        if name == "write_file" and not a.get("path"):
+        if name in ("write_file", "edit_file") and not a.get("path"):
             obj = "a file"
         if not running and not ok and name in tried:
             return f"{tried[name]} {obj}"
@@ -2238,8 +2702,12 @@ class ToolBox:
                 if p.is_file() and p.resolve().is_relative_to(self.ws.root):
                     found.append(p)
             return found[:5]
-        key = {"write_file": "path", "make_directory": "path", "move_path": "destination",
-               "download_file": "path", "render_worksheet": "path"}.get(name)
+        if name == "render_worksheet" and (args or {}).get("answer_key_path"):
+            return [p for key_path in (args.get("path"), args["answer_key_path"])
+                    for p in self.result_paths("render_answer_key", {"path": key_path})]
+        key = {"write_file": "path", "edit_file": "path", "make_directory": "path",
+               "move_path": "destination", "download_file": "path", "render_worksheet": "path",
+               "render_answer_key": "path"}.get(name)
         if not key:
             return []
         val = (args or {}).get(key) or ""

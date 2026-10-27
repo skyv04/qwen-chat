@@ -48,8 +48,9 @@ started it.
   how many tools are on.
 - **Web**: searches DuckDuckGo, reads pages and downloads files. Each page comes with its
   list of links, so answers can link to the exact article.
-- **Files**: list, read, write, move and delete files, plus create folders, all inside the
-  workspace folder only.
+- **Files**: list, read, write, edit, move and delete files, plus create folders, all inside
+  the workspace folder only. **edit** changes one exact passage of a file, so fixing a
+  value doesn't mean rewriting the whole file.
 - **Run** (needs Files on): Qwen can run shell commands in the workspace, for example to
   convert images, merge PDFs, run OCR or a Python script, and install the programs a task
   needs: Debian packages with apt, or Python packages with pip. Routine commands and small
@@ -58,7 +59,11 @@ started it.
 - PDF worksheets and quizzes have an on-demand **worksheet-pdf** design skill and
   reusable renderer: related color emoji, themed margins, consistent headings,
   portrait pages, numbered paragraphs and ruled answer areas, instead of a new
-  hand-written PDF script for every request.
+  hand-written PDF script for every request. A new worksheet and its parent answer key
+  are checked and created together in one step.
+- Answer keys have their own **answer-key** skill and source-checked renderer:
+  exact question/option identities, complete answer coverage, quoted evidence and
+  explicit flags for defective questions, not a student worksheet with empty lines.
 - **Skills**: suggest reusable guidance with `/skill-name`, a searchable picker or
   **Ctrl+K**. Create skills or package a successful workflow for use in every chat.
   Suggestions never limit Qwen to just those skills or disable its other tools.
@@ -75,7 +80,8 @@ started it.
 - Long files are written in parts: one reply holds at most about 4,000 tokens, so Qwen is
   told to keep each tool call under about 8,000 characters and append the rest. If a call
   is cut off anyway, nothing is written. Qwen is told why and tries again in parts, and
-  the broken call is never saved, so the chat keeps working.
+  the broken call is never saved, so the chat keeps working. A `.json` file that doesn't
+  parse yet comes back with the line and column where it breaks.
 - **Think**: optional step-by-step reasoning, shown in a collapsible "Thoughts" section.
 - Attach files with the paperclip button or drag and drop. They're copied into
   `workspace/attachments`.
@@ -122,8 +128,9 @@ and symlinks are rejected.
 
 `save_skill` shows the instructions and packaged file list for approval, even when
 routine commands run automatically. After approval, the package is saved to
-`~/.local/share/qwen-chat/skills/<name>/`. It immediately appears in **every new and
-existing chat**, including other open windows; reopening the picker refreshes it.
+`~/.local/share/qwen-chat-harness/skills/<name>/`, apart from the chats. It
+immediately appears in **every new and existing chat**, including other open windows;
+reopening the picker refreshes it.
 There is no per-chat copy of the library and no restart is needed to discover a new
 skill. Updating a saved skill requires the same approval and keeps the previous
 version in the Trash. Built-ins are read-only; customize one under a new name.
@@ -161,6 +168,26 @@ checks the page budget, text bounds, actual color-emoji pixels, answer-line plac
 and that every supplied text block survives PDF export. These are automated checks,
 not a visual review or a check of educational correctness.
 
+Icons may be any single emoji, including joined ones such as 👨‍🚀, skin tones, keycaps
+and flags. When the font can't draw a joined emoji as one picture, the renderer swaps
+in a related single emoji and reports it, instead of failing the whole worksheet.
+Errors name the exact field to fix, such as `theme.icons[1]` or `Question 3 icon`,
+and an unknown field error lists the allowed ones.
+
+Common near-misses don't cost a rewrite and another render. `passage` or `story` is
+read as `reading`; `question` or `text` as `prompt`; `choices` as `options`;
+`correct_answer` as `answer`. Fields such as `type` or `points` are ignored. Typed
+`A.` option letters and `1.` question numbers are removed, since the PDF adds its own.
+A theme given as plain text becomes the theme's name, top-level `icons` move into the
+theme, and extra fields that are empty or only about looks (such as `margin_art` or
+`font_size`) are dropped; extra fields that might hold content are still reported. An
+`answer_text` beside a letter `answer` is read as the option text, so the two are
+checked against each other.
+An unavailable motif becomes `dots`, a too-pale accent is darkened, and line breaks
+typed inside JSON text are accepted. The result lists these under "Handled
+automatically"; the JSON file itself is not changed. A real JSON mistake is reported
+with its line, column and text, so one `edit_file` call can fix it.
+
 By default, the document uses as many pages as it needs, up to ten; there is no
 arbitrary three-page cap. Set `max_pages` only for a limit the user requested.
 If that limit is too small, Qwen Chat shows **Use N Pages** with the required count.
@@ -180,6 +207,66 @@ Input and output paths stay in the workspace. Rendering follows the command-appr
 preference and Stop button; overwriting follows the normal file confirmation and
 Trash/Restore rules. A failed or cancelled render leaves an existing PDF untouched.
 Successful PDFs get an **Open** chip like other generated files.
+
+### Homework with a parent answer key
+
+For a new worksheet plus a key, Qwen writes each answer into the same JSON: `choice`
+for multiple choice, `answer` for written questions, and optional `explanation` and
+exact `evidence` quotes. One `render_worksheet` call with `answer_key_path` then:
+
+- checks every answer first: each question answered, real option letters, quotes that
+  really occur in the reading, and simple sums such as `3 + 2 = __` recomputed;
+- recomputes worked steps written in an explanation, such as `$10 - $6 - $4 = $0`, and
+  for "how many" or "how much" questions requires them to reach the chosen answer, so
+  a letter that points at the wrong option is caught;
+- lists every problem in one message, so one edit fixes them all, and renders nothing
+  until they are fixed;
+- creates the student PDF with no answers and a matching-theme key, after one approval,
+  and replaces neither file unless both pass their checks.
+
+On a sheet with no reading, such as a math page, there is nothing to quote: a reason
+written as `evidence` is shown in the key as the explanation ("Why: …") and listed in
+the audit. With a reading, evidence must quote it exactly.
+
+`max_pages` and `answer_key_max_pages` keep the two page budgets separate.
+
+### Answer keys for an existing quiz
+
+Ask normally, or suggest `/answer-key Make a PDF answer key for practice/quiz.pdf`.
+Qwen is instructed to reread the actual quiz using `read_quiz`, even in an old chat.
+The reader uses worksheet JSON, checks a matching JSON companion against the PDF,
+or extracts sequential numbered questions and lettered options from a text PDF.
+Scans and unclear numbering need OCR or a verified structured source; failures are
+reported rather than filled with invented questions.
+
+`render_answer_key` binds the key to the source hash, requires every question
+exactly once, copies prompts and selected option text from the quiz, and checks
+that evidence quotations occur in the source. Missing answers, fabricated quotes,
+invalid option letters and stale sources are rejected. Questions with no defensible
+choice can be flagged rather than assigned a forced answer. These are grounding and
+coverage checks, **not proof of semantic correctness**; review the explanations,
+especially if the quiz itself contains contradictions.
+
+Keys reuse the themed PDF engine and the same page-limit, cancellation, overwrite
+and Trash safeguards. Simple sums in the quiz are recomputed for these keys too.
+See the [answer-key format](qwen_chat/data/skills/answer-key/SKILL.md).
+`open_file` checks that a file exists (and a PDF is readable), then reports whether
+the desktop accepted the launch request, not whether a window was visibly displayed.
+Simple legacy `xdg-open file &` calls go through this checked opener too.
+
+An unresolved PDF render/open failure cannot end with an unqualified model-generated
+success message. On reaching the 20-tool-round limit, the app pauses explicitly and
+keeps completed steps; reply **continue** to resume. It does not ask a tool-less model
+to print pretend commands. A second identical tool error tells Qwen its last change
+didn't fix it; a third stops the reply with the error, instead of looping. Rewriting
+a file with identical content is reported as "Unchanged".
+
+When a chat outgrows the context window, older tool outputs and long file contents
+are replaced with bracketed notes that end in "to save context space". Writes and
+edits refuse text containing such a note, so a copied note can never replace real
+content in a file. History is trimmed with room to spare and then only appended to,
+so the server keeps its cached prompt instead of re-reading it every round. A file
+read again after any change is read afresh, never from an earlier result.
 
 Relaunch Qwen Chat after updating the application to load new tools and instructions.
 Existing conversations can use them; a new chat is not required.
@@ -222,7 +309,7 @@ Existing conversations can use them; a new chat is not required.
 - A command that starts a program that isn't installed is refused before you're asked,
   and Qwen is told which Debian package provides it.
 - apt installs run as PRoot's fake root (`proot -0`), or `sudo -n` outside Termux. pip
-  installs go into Qwen's own environment, `~/.local/share/qwen-chat/qwen-chat/venv`
+  installs go into Qwen's own environment, `~/.local/share/qwen-chat-harness/venv`
   (it can still use the system's Python packages), so the system Python isn't changed.
 - The web tools only fetch `http`/`https` URLs. Local and private addresses are refused,
   including through redirects.
@@ -246,6 +333,13 @@ Existing conversations can use them; a new chat is not required.
 
 Chats are stored in `~/.local/share/qwen-chat/chats`. The server log is
 `~/.cache/qwen-chat/server.log`.
+
+Everything Qwen needs to work is kept in a separate folder,
+`~/.local/share/qwen-chat-harness`: saved skills (`skills/`), Qwen's Python
+environment (`venv/`) and the GPU helper (`turnip-env.sh`). Deleting chats, even the
+whole `qwen-chat` folder, doesn't touch it. Skills that an older version saved beside
+the chats move there on the next start. The older `~/.local/share/qwen-chat/qwen-chat/venv`
+is no longer used and can be deleted; Qwen reinstalls packages when it needs them.
 
 ## GPU notes
 

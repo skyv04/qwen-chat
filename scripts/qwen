@@ -6,7 +6,7 @@ unset LD_PRELOAD
 llama_bin="${QWEN_LLAMA_BIN:-$HOME/Documents/GitHub/llama.cpp/build-vulkan/bin}"
 model="${QWEN_MODEL:-$HOME/models/Qwen3.5-9B-Q4_K_M.gguf}"
 ctx="${QWEN_CTX:-16384}"
-gpu_env="${QWEN_GPU_ENV:-${XDG_DATA_HOME:-$HOME/.local/share}/qwen-chat/turnip-env.sh}"
+gpu_env="${QWEN_GPU_ENV:-${XDG_DATA_HOME:-$HOME/.local/share}/qwen-chat-harness/turnip-env.sh}"
 
 case "$(basename "$0")" in
     qwen-server) tool=llama-server ;;

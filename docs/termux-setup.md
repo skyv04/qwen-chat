@@ -170,7 +170,7 @@ all phones equivalent. Do not treat an always-busy GPU as a performance target.
 |---|---|
 | `QWEN_LLAMA_BIN` | `~/Documents/GitHub/llama.cpp/build-vulkan/bin` |
 | `QWEN_MODEL` | `~/models/Qwen3.5-9B-Q4_K_M.gguf` |
-| `QWEN_GPU_ENV` | `~/.local/share/qwen-chat/turnip-env.sh` (respects `XDG_DATA_HOME`) |
+| `QWEN_GPU_ENV` | `~/.local/share/qwen-chat-harness/turnip-env.sh` (respects `XDG_DATA_HOME`) |
 | `MESA_ADRENO_PREFIX` | `/opt/mesa-adreno` for the bundled Turnip helper |
 | `QWEN_CTX` | `16384` for manual launches; the GUI uses `context_size` from settings |
 | `QWEN_SKIP_MEM_CHECK` | Unset. `1` bypasses the memory check, at your own risk |
