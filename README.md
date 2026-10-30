@@ -188,6 +188,18 @@ typed inside JSON text are accepted. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
 with its line, column and text, so one `edit_file` call can fix it.
 
+A theme can also set `background` (`plain`, or `rainbow` for a pastel rainbow fading
+behind the text) and a `mascot` emoji shown first in the header. To change only the
+look of an existing worksheet ("same quiz, but with a mermaid and a rainbow"), Qwen
+passes the existing JSON and a `theme` with just the changes to `render_worksheet`.
+Nothing is retyped, so the passage, questions and answers stay exactly the same. A new
+mascot replaces the old animal and character icons. The restyled JSON is saved next to
+the new PDF, and the report's `Look:` line shows the theme that was used. A mascot can
+be an emoji or a name such as `mermaid`. Rainbow or mascot fields written in other ways,
+such as `rainbow_fading: true`, are read too. If a failing draft retypes a worksheet
+that already has a PDF beside it, the error points Qwen back to that worksheet and the
+`theme` argument.
+
 By default, the document uses as many pages as it needs, up to ten; there is no
 arbitrary three-page cap. Set `max_pages` only for a limit the user requested.
 If that limit is too small, Qwen Chat shows **Use N Pages** with the required count.
@@ -267,6 +279,24 @@ edits refuse text containing such a note, so a copied note can never replace rea
 content in a file. History is trimmed with room to spare and then only appended to,
 so the server keeps its cached prompt instead of re-reading it every round. A file
 read again after any change is read afresh, never from an earlier result.
+
+### Follow-ups and separate chats
+
+A short follow-up such as "try harder", "fifth grade, not first" or "make it better"
+continues the work in progress instead of starting over. When space runs out, older
+turns are first shortened to the request and its final answer. Only turns before the
+last three are dropped, so the latest requests stay in view. Each new message also
+carries a short note that the app writes once and saves. The note lists the last three
+requests, how each ended (answered, incomplete with its error, stopped), and the files
+this chat made, changed or read. Qwen is told the note isn't the user's words, and file
+tools refuse to copy it into a file.
+
+Each chat works with its own files. Files made in other chats are left out of
+`list_files`, which says how many were hidden and from which chat. File tools refuse
+to read, change, move or delete them, and won't move or delete a folder that holds
+them. A file becomes available again once the user names it, its folder path or the
+other chat's title. Generic words such as "homework" or "first grade" don't count.
+Files no chat made, such as your own, stay visible.
 
 Relaunch Qwen Chat after updating the application to load new tools and instructions.
 Existing conversations can use them; a new chat is not required.

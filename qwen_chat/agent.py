@@ -6,8 +6,10 @@ import json
 import re
 import threading
 import time
+import traceback
 from typing import Protocol
 
+from .history import NOTE_HEAD, NOTE_SEP, context_note
 from .llm import Cancelled, ChatStream, LLMError, ServerManager
 from .tools import ToolBox, ToolError
 
@@ -28,6 +30,11 @@ CACHED_TOOLS = ("web_search", "fetch_url", "list_files", "read_file")
 # When history must shrink, shrink it to this share of the budget. The following rounds then
 # only append, so llama-server reuses its cache instead of re-reading the turn every round.
 TRIM_TARGET = 0.6
+# Earlier turns kept, as request and final answer, when history must shrink: enough for a
+# follow-up like "try harder" to show what it follows. Long ones are shortened to these sizes.
+KEEP_TURNS = 3
+TURN_USER_CHARS = 1200
+TURN_REPLY_CHARS = 1500
 
 
 class Events(Protocol):
@@ -49,6 +56,16 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
         # Date only: a stable prompt lets llama-server reuse its expensive cached prefix.
         f"Today is {time.strftime('%A, %B %-d, %Y', now)}.",
     ]
+    parts.append(
+        "\n## Continuing the conversation\n"
+        "Read each new message together with the earlier messages of this chat. A short "
+        "follow-up such as 'try again', 'try harder', 'not that one', 'make it better', 'fifth "
+        "grade, not first' or 'yes' continues the latest request: keep its goal, its files and "
+        "the user's corrections, and fix what went wrong instead of starting over with new "
+        "content. The app may add a 'Chat context' note under the user's message with the "
+        "earlier requests, how each ended and the files this chat made. Use it to pick up where "
+        "the work stopped, but it is not the user's words: never copy it into files or replies. "
+        "If it is still unclear what the user means, ask one short question.")
     parts.append(
         "\n## Reusable skills\n"
         "Use list_skills to discover relevant reusable skills, and load_skill to read the ones "
@@ -89,7 +106,10 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "fail. Write a longer file in parts: write_file with the first part, then write_file "
             "with append: true for each next part. Earlier tool calls and outputs in this chat may "
             "be shortened to bracketed notes saying 'to save context space'. Such a note is not "
-            "content: never copy it into a file; read the file instead.")
+            "content: never copy it into a file; read the file instead. Each chat has its own "
+            "files: files made in other chats are hidden from list_files and refused by the file "
+            "tools unless the user names them (by file name, folder or chat title). Don't look "
+            "for them with run_command; if the user seems to mean one, ask them to name it.")
     else:
         parts.append("\nFile access is turned off in this chat.")
     if toolbox.files and toolbox.commands:
@@ -131,8 +151,13 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "rerun render_worksheet on an existing failed draft, rather than rewriting the "
             "whole file or removing questions to fit. If a tool names a field or value, change "
             "exactly that value with edit_file before retrying; never resubmit unchanged JSON. "
-            "For an appearance-only change, preserve the original passage, questions and options "
-            "exactly. Match the topic with related emoji and margin artwork; keep text and writing "
+            "To change only the look of an existing worksheet (theme, mascot, colors, rainbow "
+            "background), call render_worksheet with its EXISTING spec_path and a theme object "
+            "holding only the fields to change, plus answer_key_path when it has a key; use new "
+            "PDF names unless the user asks to replace the old ones. Never retype or rewrite the "
+            "passage, questions or answers for a look change, and describe the new look only as "
+            "the report's Look line confirms. Match the topic with related emoji and margin "
+            "artwork; keep text and writing "
             "areas clear. Read the renderer's report and fix failures before claiming the file is "
             "ready. Automated checks are not visual inspection; don't claim you saw the pages.")
         parts.append(
@@ -201,7 +226,8 @@ def _api_call(call: dict) -> dict:
 
 
 def clean_for_api(messages: list[dict]) -> list[dict]:
-    """Drops UI-only fields; earlier reasoning is not sent back (Qwen's template ignores it)."""
+    """Drops UI-only fields; earlier reasoning is not sent back (Qwen's template ignores it).
+    A user message's chat-context note (see history.context_note) goes under its text."""
     out = []
     for m in messages:
         c = {k: v for k, v in m.items() if not k.startswith("_") and k != "reasoning_content"}
@@ -209,6 +235,9 @@ def clean_for_api(messages: list[dict]) -> list[dict]:
             c["content"] = ""
         if c.get("tool_calls"):
             c["tool_calls"] = [_api_call(tc) for tc in c["tool_calls"]]
+        note = (m.get("_meta") or {}).get("context") if c.get("role") == "user" else None
+        if note and isinstance(c.get("content"), str):
+            c["content"] += NOTE_SEP + note
         out.append(c)
     return out
 
@@ -236,15 +265,28 @@ def _stub(m: dict) -> None:
     m["content"] = SKILL_STUB if m.get("name") == "load_skill" else OLD_TOOL_STUB
 
 
+def _cut(m: dict, limit: int) -> None:
+    content = m.get("content")
+    if isinstance(content, str) and len(content) > limit + len(CUT_NOTE):
+        m["content"] = content[:limit] + CUT_NOTE
+
+
 def fit_context(messages: list[dict], budget_chars: int, target_chars: int | None = None) -> list[dict]:
-    """Shrinks history to fit: first repeated and old tool outputs and arguments, then whole old
-    turns, then the current turn's drafts and older outputs, keeping skill text and quiz sources
-    as long as possible. Above the budget it shrinks to target_chars, leaving room to append."""
+    """Shrinks history to fit: first repeated and old tool outputs and arguments, then earlier
+    turns down to their request and final answer (the last few are kept, so a follow-up still
+    shows what it follows), then the current turn's drafts and older outputs, keeping skill
+    text and quiz sources as long as possible. Above the budget it shrinks to target_chars,
+    leaving room to append."""
     msgs = copy.deepcopy(messages)
     total = lambda: sum(_size(m) for m in msgs)
     if total() <= budget_chars:
         return msgs
     goal = min(budget_chars, target_chars or budget_chars)
+    last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=0)
+    # The latest chat-context note supersedes the earlier ones.
+    for m in msgs[:last_user]:
+        if m["role"] == "user" and isinstance(m.get("content"), str):
+            m["content"] = m["content"].split(NOTE_SEP + NOTE_HEAD, 1)[0]
     # An output that appears again later (the same file read twice) is needed only once.
     later = set()
     for m in reversed(msgs):
@@ -253,18 +295,37 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
             if seen in later:
                 m["content"] = REPEAT_STUB
             later.add(seen)
-    last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=0)
     for i, m in enumerate(msgs[:last_user]):
         if m["role"] == "tool" and len(m.get("content") or "") > len(OLD_TOOL_STUB):
             _stub(m)
         for call in m.get("tool_calls") or []:
             _shrink_call(call)
-    # Drop whole turns from the front (a turn = a user message and everything up to the next).
-    while total() > goal:
+
+    def earlier_turns() -> list[tuple[int, int]]:
+        """(start, end) of each turn before the current one; a turn is a user message and
+        everything up to the next."""
         users = [i for i, m in enumerate(msgs) if m["role"] == "user"]
-        if len(users) < 2:
+        return list(zip(users, users[1:]))
+
+    def drop_oldest() -> None:
+        start, end = earlier_turns()[0]
+        del msgs[start:end]
+
+    # Earlier turns become their request and final answer, oldest first.
+    done = 0
+    while total() > goal and done < len(earlier_turns()):
+        start, end = earlier_turns()[done]
+        final = msgs[end - 1]
+        answered = end - 1 > start and final["role"] == "assistant" and not final.get("tool_calls")
+        msgs[start:end] = [msgs[start]] + ([final] if answered else [])
+        done += 1
+    while total() > goal and len(earlier_turns()) > KEEP_TURNS:
+        drop_oldest()
+    for start, end in earlier_turns():
+        if total() <= goal:
             break
-        del msgs[users[0]:users[1]]
+        for m in msgs[start:end]:
+            _cut(m, TURN_USER_CHARS if m["role"] == "user" else TURN_REPLY_CHARS)
     last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=0)
     for m in msgs[last_user:]:
         if total() <= goal:
@@ -278,6 +339,8 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
         if (m["role"] == "tool" and m.get("name") not in ("read_quiz", "load_skill")
                 and len(m.get("content") or "") > len(OLD_TOOL_STUB)):
             _stub(m)
+    while total() > goal and len(earlier_turns()) > 1:
+        drop_oldest()
     # Last resort: cut the biggest output, but only as far as needed. A skill is cut before a
     # quiz source, which is needed to check the answers.
     while total() > budget_chars:
@@ -293,6 +356,8 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
             big["content"] += "\n[Quiz source incomplete. Use read_quiz continuation lines; do not guess.]"
         elif big.get("name") == "load_skill":
             big["content"] += "\n[Skill text incomplete. Call load_skill again if you need the rest.]"
+    while total() > budget_chars and earlier_turns():
+        drop_oldest()
     return msgs
 
 
@@ -373,6 +438,21 @@ class Agent:
         if self.stream is not None:
             self.stream.abort()
 
+    def _add_context_note(self, messages: list[dict]) -> None:
+        """Saves a summary of the chat so far with a new user message (once: later rounds and
+        turns then send the same text, so llama-server can keep reusing its cache)."""
+        last = messages[-1] if messages else None
+        if not last or last.get("role") != "user" or "context" in (last.get("_meta") or {}):
+            return
+        box = self.toolbox
+        try:
+            note = context_note(messages, box.ws.root if box.files else None,
+                                box.scope.foreign if box.scope else ())
+        except Exception:  # a summary must never stop the reply
+            traceback.print_exc()
+            note = ""
+        last["_meta"] = {**(last.get("_meta") or {}), "context": note}
+
     def respond(self, messages: list[dict], events: Events, cancel: threading.Event,
                 thinking: bool = False) -> None:
         """Runs until the model gives a final answer. Appends assistant/tool messages to `messages`."""
@@ -381,6 +461,7 @@ class Agent:
         self.toolbox.status = events.status
         self.toolbox.declined = False
         self.toolbox.input_required = ""
+        self._add_context_note(messages)
         seen: dict[str, str] = {}
         tools = self.toolbox.schemas()
         sys_msg = {"role": "system", "content": system_prompt(self.toolbox, self.server.model_name)}
@@ -495,12 +576,14 @@ class Agent:
                     args = {}
                 events.tool_begin(call["id"], name, args)
                 key = name + ":" + json.dumps(args, sort_keys=True)
+                files = None
                 if call["id"] in broken:
                     ok, out = False, _broken_call_note(name, broken[call["id"]], cut_off)
                 elif key in seen and name in CACHED_TOOLS:
                     ok, out = True, seen[key] + CACHE_NOTE
                 else:
                     ok, out = self.toolbox.run(name, raw)
+                    files = self.toolbox.last_files
                     if ok and name in CACHED_TOOLS:
                         seen[key] = out
                     elif name not in CACHED_TOOLS:
@@ -539,7 +622,9 @@ class Agent:
                                 "exactly the field or value this error names, or explain the "
                                 "problem to the user. Do not resubmit unchanged content.]")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name,
-                                 "content": out, "_meta": {"ok": ok}})
+                                 "content": out,
+                                 "_meta": {"ok": ok, **({"files": files} if files
+                                                       and any(files.values()) else {})}})
                 events.tool_end(call["id"], name, args, ok, out)
             if stuck:
                 listed = stuck in failed_outputs.values()

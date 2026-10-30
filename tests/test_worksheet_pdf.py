@@ -296,6 +296,50 @@ class NormalizeSpecTest(unittest.TestCase):
                                     r"Allowed: answer, choice, evidence, explanation, icon, label"):
             pdf.validate_spec({"title": "Math", "questions": [{"prompt": "Q?", "hint": "x"}]})
 
+    def test_a_look_change_swaps_the_mascot_and_adds_a_rainbow(self):
+        old = {"name": "Whispering Woods", "accent": "#1B4D3E", "motif": "leaves",
+               "icons": ["\U0001f332", "\U0001f98a", "\U0001f338", "\U0001f50d"]}
+        theme, notes = pdf.restyle_theme(old, {"mascot": "mermaid", "background": "rainbow fade",
+                                               "motif": "ocean"})
+        mermaid = pdf.MASCOT_NAMES["mermaid"]
+        self.assertEqual(theme, {**old, "motif": "waves", "background": "rainbow", "mascot": mermaid,
+                                 "icons": ["\U0001f332", "\U0001f338", "\U0001f50d"]})
+        joined = "; ".join(notes)
+        for expected in (f"theme.mascot 'mermaid' was drawn as {mermaid}",
+                         "theme.background 'rainbow fade' is not available, so 'rainbow' was used",
+                         "theme.motif 'ocean' is not available, so 'waves' was used",
+                         "the new mascot replaced \U0001f98a in theme.icons"):
+            self.assertIn(expected, joined)
+        spec = pdf.validate_spec({**fixture(), "theme": theme})
+        self.assertEqual(spec["theme"]["icons"][0], mermaid)  # the mascot leads every page
+        with mock.patch.object(pdf, "_fonts", return_value=""):
+            self.assertIn('<body class="bg-rainbow">', pdf.make_html(spec))
+            self.assertIn("<body>", pdf.make_html(pdf.validate_spec(fixture())))
+
+    def test_a_retyped_restyle_draft_still_gets_its_look(self):
+        # Shaped like a real draft Qwen retyped for a mermaid restyle, which never rendered.
+        draft = {"title": "The Secret of the Whispering Woods", "theme": "ocean-mermaid",
+                 "accent_color": "#FF6B9D", "motif": "mermaid", "rainbow_fading": True,
+                 "rainbow_position": "behind_text", "margin_art": "mermaid",
+                 "color_emoji": ["\U0001f30a", "\U0001f9dc\u200d\u2640\ufe0f", "\U0001f41a",
+                                 "\U0001f308", "\u2b50", "\U0001f499", "\U0001fae7"],
+                 "reading": ["Maya packed her backpack."],
+                 "questions": [{"id": 1, "type": "multiple_choice", "question": "What did Maya pack?",
+                                "options": ["A map", "A cake"], "answer": "A", "lines": 2,
+                                "evidence": "Maya packed her backpack."}]}
+        data, notes = pdf.normalize_spec(draft)
+        theme = pdf.validate_spec(data)["theme"]
+        mermaid = pdf.MASCOT_NAMES["mermaid"]
+        self.assertEqual((theme["motif"], theme["background"], theme["mascot"], theme["icons"][0]),
+                         ("waves", "rainbow", mermaid, mermaid))
+        self.assertEqual(len(theme["icons"]), 6)
+        joined = "; ".join(notes)
+        for expected in ("read field 'rainbow_fading' as theme.background 'rainbow'",
+                         "ignored field 'margin_art' (the theme sets the look)",
+                         f"theme.motif 'mermaid' is not available, so 'waves' was used with "
+                         f"theme.mascot {mermaid}"):
+            self.assertIn(expected, joined)
+
 
 class AnswerKeySpecTest(unittest.TestCase):
     def compile(self, key):

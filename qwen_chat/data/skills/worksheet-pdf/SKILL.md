@@ -21,13 +21,18 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
    must be true. Each multiple-choice question needs exactly one correct option. When a
    key is wanted, work out every answer first: do each sum, find the sentence that
    proves each reading answer, and note the correct letter.
-3. For an appearance-only change, read the latest file and keep the passage, questions
-   and options exactly; reuse its JSON when it matches, and save the PDF under a new
-   name. PDF text cannot show you how a reference looks.
+3. For a look-only change (new theme, mascot, colors or a rainbow background), do not
+   retype the worksheet. Call `render_worksheet` with its EXISTING `spec_path`, new PDF
+   names, `answer_key_path` if it has a key, and a `theme` holding only what changes:
+   `theme={"mascot": "🧜‍♀️", "background": "rainbow", "motif": "waves"}`. The passage,
+   questions and answers stay exactly the same, and the restyled JSON is saved next to
+   the new PDF. PDF text cannot show you how a reference looks.
 4. Pick a theme: a short name, one dark accent color, 3-5 related emoji and a motif
    (`leaves`, `waves`, `stars` or `dots`). For example: Rainforest `#176B56` leaves
    🌿 🦜 🐆; Ocean `#086779` waves 🌊 🐙 🐠; Space `#5143A6` stars 🚀 🪐 ⭐. For other
-   topics pick matching emoji and `dots`.
+   topics pick matching emoji and `dots`. Optional: `background` (`plain`, or `rainbow`
+   for a pastel rainbow fading behind the text) and `mascot`, one emoji shown first in
+   the header. A new mascot replaces the old animal and character icons.
 5. Write the JSON with write_file (it creates folders), with the answers in this first
    write. Keep each call under 8,000 characters; append more at item boundaries if
    needed. Omit `max_pages` unless the user set a page limit. Student and key budgets
@@ -71,6 +76,7 @@ All text is plain: no HTML, Markdown or scripts. Unknown fields are rejected.
 }
 ```
 
+- `theme`: `name`, `accent`, `icons`, `motif`, and optionally `background` and `mascot`.
 - `reading`: paragraphs as strings, or `{"heading": "...", "text": "..."}`. Leave it out
   for a math or activity sheet; never add sentences to it just to quote them.
 - `prompt` is the question only and `options` are the choices only: the PDF adds

@@ -17,6 +17,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from . import APP_ID, APP_NAME  # noqa: E402
 from .agent import Agent, repair_history, salvage_args  # noqa: E402
+from .history import ChatFiles, ChatScope  # noqa: E402
 from .llm import Cancelled, LLMError, ServerError, gpu_busy_percent  # noqa: E402
 from .skill_picker import SkillPicker  # noqa: E402
 from .skills import slash_query  # noqa: E402
@@ -112,6 +113,7 @@ class ChatWindow(Adw.ApplicationWindow):
                                commands=settings["commands"], approve=self._approve,
                                auto_approve=self._auto_approve)
         self.agent = Agent(server, self.toolbox)
+        self.chat_files = ChatFiles(self.store.root)
         self.chat: dict | None = None
         self.running = False
         self.cancel = threading.Event()
@@ -1275,6 +1277,14 @@ class ChatWindow(Adw.ApplicationWindow):
         def worker():
             err = None
             cancelled = False
+            try:
+                # Other chats' files stay out of this one unless its user names them.
+                root = self.toolbox.ws.root
+                self.toolbox.scope = ChatScope.build(
+                    root, work, self.chat_files.others(chat.get("id", ""), root))
+            except Exception:
+                traceback.print_exc()
+                self.toolbox.scope = None
             try:
                 self.agent.respond(work, _UiEvents(self, turn), cancel, thinking=thinking)
             except Cancelled:

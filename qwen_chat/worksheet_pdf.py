@@ -139,22 +139,59 @@ def _darken(hex_color: str) -> str:
 
 
 MOTIFS = ("leaves", "waves", "stars", "dots")
+BACKGROUNDS = ("plain", "rainbow")
+THEME_FIELDS = frozenset({"name", "accent", "icons", "motif", "background", "mascot"})
+THEME_FORMAT = ("theme is an object: name, accent, icons, motif, background, mascot")
+# Words that suggest a motif when a draft asks for one that doesn't exist.
+_MOTIF_WORDS = {
+    "waves": {"ocean", "sea", "water", "wave", "mermaid", "mermaids", "fish", "beach", "bubble",
+              "bubbles", "underwater", "river", "lake", "shell", "shells", "coral", "pirate"},
+    "leaves": {"forest", "woods", "wood", "leaf", "tree", "trees", "garden", "nature", "autumn",
+               "jungle", "plant", "plants", "flower", "flowers", "farm"},
+    "stars": {"space", "star", "night", "galaxy", "sky", "moon", "planet", "planets", "rocket",
+              "astronaut", "sparkle", "sparkles", "magic"}}
+# Theme fields a draft may put at the top level or under another name.
+_THEME_AT_TOP = {"motif": "motif", "mascot": "mascot", "background": "background",
+                 "accent": "accent", "accent_color": "accent"}
+_THEME_ALIASES = {"accent_color": "accent", "color": "accent", "colour": "accent",
+                  "emoji": "icons", "emojis": "icons", "hero": "mascot", "hero_icon": "mascot",
+                  "character": "mascot"}
+MASCOT_NAMES = {
+    "mermaid": "\U0001f9dc\u200d\u2640\ufe0f", "merman": "\U0001f9dc\u200d\u2642\ufe0f",
+    "fox": "\U0001f98a", "unicorn": "\U0001f984", "dragon": "\U0001f409",
+    "dinosaur": "\U0001f995", "dino": "\U0001f996", "cat": "\U0001f431", "kitten": "\U0001f431",
+    "dog": "\U0001f436", "puppy": "\U0001f436", "owl": "\U0001f989", "robot": "\U0001f916",
+    "astronaut": "\U0001f9d1\u200d\U0001f680", "rocket": "\U0001f680", "alien": "\U0001f47d",
+    "octopus": "\U0001f419", "dolphin": "\U0001f42c", "whale": "\U0001f433",
+    "shark": "\U0001f988", "fish": "\U0001f420", "turtle": "\U0001f422", "bee": "\U0001f41d",
+    "butterfly": "\U0001f98b", "lion": "\U0001f981", "tiger": "\U0001f42f",
+    "panda": "\U0001f43c", "bear": "\U0001f43b", "penguin": "\U0001f427", "frog": "\U0001f438",
+    "monkey": "\U0001f435", "rabbit": "\U0001f430", "bunny": "\U0001f430",
+    "horse": "\U0001f434", "parrot": "\U0001f99c", "bird": "\U0001f426", "fairy": "\U0001f9da",
+    "wizard": "\U0001f9d9", "princess": "\U0001f478", "ghost": "\U0001f47b",
+    "rainbow": "\U0001f308", "star": "\u2b50", "sun": "\u2600\ufe0f", "moon": "\U0001f319"}
 DOCUMENT_FIELDS = frozenset({
     "title", "subtitle", "series", "student_line", "meta", "instructions", "reading_title",
     "reading", "reading_note", "question_title", "questions", "challenge", "closing_note",
     "theme", "max_pages", "answer_key_max_pages"})
 QUESTION_FIELDS = frozenset({"prompt", "label", "lines", "options", "icon", *KEY_FIELDS})
 _READING_ALIASES = ("passage", "story")
-_ICON_ALIASES = ("icons", "emoji", "emojis")
+_ICON_ALIASES = ("icons", "emoji", "emojis", "color_emoji")
 _QUESTION_ALIASES = {"question": "prompt", "text": "prompt", "choices": "options",
                      "correct_answer": "answer"}
 _IGNORED_QUESTION_FIELDS = ("type", "kind", "id", "number", "points", "difficulty")
+_IGNORED_DOCUMENT_FIELDS = ("version", "schema_version", "id")
+_PAGE_WORDS = {"page", "pages", "budget", "max", "maximum", "limit", "count", "total", "num",
+               "number", "of", "student", "worksheet", "quiz", "answer", "key", "parent", "teacher"}
 # Field-name words that only describe looks. The theme draws the page, so an extra field
 # such as "margin_art" or "font_size" can be dropped without losing any content.
 _LOOK_WORDS = {"art", "decor", "decoration", "decorations", "border", "borders", "frame",
                "clipart", "sticker", "stickers", "doodle", "doodles", "color", "colors",
                "colour", "colours", "palette", "font", "fonts", "style", "styles", "layout",
-               "design"}
+               "design", "background", "backgrounds", "pattern", "patterns", "gradient",
+               "fading", "fade", "effect", "effects", "spacing", "placement", "position",
+               "header", "footer"}
+_OFF = ("", "none", "no", "off", "false", "plain")
 _LETTERED = re.compile(r"\s*\(?([A-Ha-h])[.):]\s+(\S.*)", re.S)
 _LETTER_ONLY = re.compile(r"\s*\(?[A-Ha-h]\)?[.):]?\s*")
 _NUMBERED = re.compile(r"\s*(\d{1,2})[.):]\s+(\S.*)", re.S)
@@ -172,6 +209,124 @@ def _extra_field(field: str, value) -> str | None:
         return "empty"
     words = re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", field).casefold())
     return "the theme sets the look" if _LOOK_WORDS.intersection(words) else None
+
+
+def _top_extra(field: str, value) -> str | None:
+    """_extra_field for document and theme fields, where true/false can't be content."""
+    return _extra_field(field, value) or (
+        "an on/off switch; the renderer decides this" if isinstance(value, bool) else None)
+
+
+def _asks_rainbow(field: str, value) -> bool:
+    """A drafted field like rainbow_fading: true or page_background: "rainbow fade"."""
+    if "rainbow" in field.casefold():
+        if isinstance(value, bool):
+            return value
+        return (isinstance(value, (str, int, float)) and len(str(value)) <= 60
+                and str(value).strip().casefold() not in _OFF)
+    return (_extra_field(field, value) is not None and isinstance(value, str)
+            and "rainbow" in value.casefold())
+
+
+def _page_limit_field(field: str, value) -> str | None:
+    """max_pages or answer_key_max_pages for a renamed page limit such as student_budget_pages."""
+    words = set(re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", field).casefold()))
+    if type(value) is not int or not words & {"page", "pages"} or not words <= _PAGE_WORDS:
+        return None
+    return "answer_key_max_pages" if words & {"answer", "key", "parent", "teacher"} else "max_pages"
+
+
+def _is_character(icon: str) -> bool:
+    """Animals, people and creatures: the icons a new mascot replaces."""
+    c = ord(icon[0]) if icon else 0
+    return c not in (0x1F41A, 0x1F43D, 0x1F43E) and (
+        0x1F400 <= c <= 0x1F43F or 0x1F980 <= c <= 0x1F9AE or 0x1F9D1 <= c <= 0x1F9DF
+        or 0x1F466 <= c <= 0x1F478 or c in (0x1F47B, 0x1F47D, 0x1F47E, 0x1F916))
+
+
+def _mascot(value: str) -> str | None:
+    """One emoji for a mascot given as an emoji, as text with one emoji, or as a name."""
+    for token in [value.strip(), *value.split()]:
+        clusters = _emoji_clusters(token) if token else None
+        if clusters and len(clusters) == 1:
+            return token
+    for word in re.findall(r"[a-z]+", value.casefold()):
+        if word in MASCOT_NAMES or word.removesuffix("s") in MASCOT_NAMES:
+            return MASCOT_NAMES.get(word) or MASCOT_NAMES[word.removesuffix("s")]
+    return None
+
+
+def _normalize_theme(theme: dict, note) -> dict:
+    theme = dict(theme)
+    for alias, field in _THEME_ALIASES.items():
+        if alias in theme and field not in theme:
+            theme[field] = theme.pop(alias)
+            note(f"read theme field '{alias}' as theme.{field}")
+    for field in [k for k in theme if k not in THEME_FIELDS]:
+        value = theme[field]
+        if _asks_rainbow(field, value):
+            del theme[field]
+            theme.setdefault("background", "rainbow")
+            note(f"read theme field '{field}' as theme.background 'rainbow'")
+        elif _top_extra(field, value):
+            del theme[field]
+            note(f"ignored theme field '{field}' ({_top_extra(field, value)})")
+    motif = theme.get("motif")
+    if isinstance(motif, str) and motif not in MOTIFS:
+        words = re.findall(r"[a-z]+", motif.casefold())
+        chosen = next((m for m in MOTIFS if m in words or m[:-1] in words), None) or next(
+            (m for m, related in _MOTIF_WORDS.items() if related.intersection(words)), "dots")
+        theme["motif"] = chosen
+        also = []
+        if "rainbow" in words and "background" not in theme:
+            theme["background"] = "rainbow"
+            also.append("theme.background 'rainbow'")
+        character = _mascot(motif)
+        if character and _is_character(character) and "mascot" not in theme:
+            theme["mascot"] = character
+            also.append(f"theme.mascot {character}")
+        if motif.strip().casefold() != chosen:
+            note(f"theme.motif '{motif}' is not available, so '{chosen}' was used"
+                 + (f" with {' and '.join(also)}" if also else "")
+                 + f" (choices: {', '.join(MOTIFS)})")
+    icons = theme.get("icons")
+    if isinstance(icons, str):
+        icons = theme["icons"] = _emoji_clusters("".join(icons.split())) or icons
+    if isinstance(icons, list) and len(icons) > 6:
+        theme["icons"] = icons[:6]
+        note(f"theme.icons had {len(icons)} emoji, so the first 6 were used")
+    background = theme.get("background")
+    if isinstance(background, str) and background not in BACKGROUNDS:
+        theme["background"] = "rainbow" if "rainbow" in background.casefold() else "plain"
+        note(f"theme.background '{background}' is not available, so '{theme['background']}' "
+             f"was used (choices: {', '.join(BACKGROUNDS)})")
+    mascot = theme.get("mascot")
+    if isinstance(mascot, str) and mascot.strip():
+        emoji = _mascot(mascot)
+        if emoji and emoji != mascot:
+            theme["mascot"] = emoji
+            note(f"theme.mascot '{mascot}' was drawn as {emoji}")
+    accent = theme.get("accent")
+    if isinstance(accent, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", accent) \
+            and _contrast(accent) < 4.5:
+        theme["accent"] = _darken(accent)
+        note(f"theme.accent {accent} was too pale for headings, so {theme['accent']} was used")
+    return theme
+
+
+def restyle_theme(old, change: dict) -> tuple[dict, list[str]]:
+    """The theme for a look-only change: `change` over the worksheet's theme. A new mascot
+    replaces the old animal and character icons unless `change` lists icons too."""
+    notes: list[str] = []
+    change = _normalize_theme(change, lambda text, where="": notes.append(text))
+    theme = {**(old if isinstance(old, dict) else {}), **change}
+    if change.get("mascot") and "icons" not in change and isinstance(theme.get("icons"), list):
+        kept = [i for i in theme["icons"] if not (isinstance(i, str) and _is_character(i))]
+        if len(kept) < len(theme["icons"]):
+            notes.append("the new mascot replaced " + "".join(
+                i for i in theme["icons"] if i not in kept) + " in theme.icons")
+            theme["icons"] = kept
+    return theme, notes
 
 
 def normalize_spec(value) -> tuple[dict, list[str]]:
@@ -200,15 +355,13 @@ def normalize_spec(value) -> tuple[dict, list[str]]:
         name = " ".join(theme.split())
         if name.casefold() in MOTIFS:
             data["theme"] = {"motif": name.casefold()}
-            note("theme was text, so it was used as theme.motif (theme is an object: "
-                 "name, accent, icons, motif)")
+            note(f"theme was text, so it was used as theme.motif ({THEME_FORMAT})")
         elif name:
             name = name[:1].upper() + name[1:]
             if len(name) > 36:
                 name = name[:36].rsplit(" ", 1)[0].strip() or name[:36]
             data["theme"] = {"name": name}
-            note("theme was text, so it was used as theme.name (theme is an object: "
-                 "name, accent, icons, motif)")
+            note(f"theme was text, so it was used as theme.name ({THEME_FORMAT})")
         else:
             del data["theme"]
             note("ignored an empty theme")
@@ -225,24 +378,37 @@ def normalize_spec(value) -> tuple[dict, list[str]]:
             else:
                 theme["icons"] = icons
                 note(f"moved '{field}' into theme.icons")
+        for field, target in _THEME_AT_TOP.items():
+            if field not in data:
+                continue
+            value = data.pop(field)
+            theme = data["theme"] = dict(data.get("theme", {}))
+            if target in theme:
+                note(f"ignored '{field}' (theme.{target} is already set)")
+            else:
+                theme[target] = value
+                note(f"moved '{field}' into theme.{target}")
     for field in [k for k in data if k not in DOCUMENT_FIELDS]:
-        why = _extra_field(field, data[field])
-        if why:
+        value, target = data[field], _page_limit_field(field, data[field])
+        if field in _IGNORED_DOCUMENT_FIELDS:
             del data[field]
-            note(f"ignored field '{field}' ({why})")
-    theme = data.get("theme")
-    if isinstance(theme, dict):
-        theme = data["theme"] = dict(theme)
-        motif = theme.get("motif")
-        if isinstance(motif, str) and motif not in MOTIFS:
-            theme["motif"] = "dots"
-            note(f"theme.motif '{motif}' is not available, so 'dots' was used "
-                 f"(choices: {', '.join(MOTIFS)})")
-        accent = theme.get("accent")
-        if isinstance(accent, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", accent) \
-                and _contrast(accent) < 4.5:
-            theme["accent"] = _darken(accent)
-            note(f"theme.accent {accent} was too pale for headings, so {theme['accent']} was used")
+            note(f"ignored field '{field}'")
+        elif target:
+            del data[field]
+            if target in data:
+                note(f"ignored '{field}' ({target} is already set)")
+            else:
+                data[target] = value
+                note(f"read '{field}' as '{target}'")
+        elif _asks_rainbow(field, value) and isinstance(data.get("theme", {}), dict):
+            del data[field]
+            data["theme"] = {"background": "rainbow", **data.get("theme", {})}
+            note(f"read field '{field}' as theme.background 'rainbow'")
+        elif _top_extra(field, value):
+            del data[field]
+            note(f"ignored field '{field}' ({_top_extra(field, value)})")
+    if isinstance(data.get("theme"), dict):
+        data["theme"] = _normalize_theme(data["theme"], note)
 
     def question(item, where: str):
         if not isinstance(item, dict):
@@ -334,7 +500,7 @@ def validate_spec(value) -> dict:
     spec["answer_key_max_pages"] = (
         _integer(value["answer_key_max_pages"], "answer_key_max_pages", 1, MAX_PAGES)
         if "answer_key_max_pages" in value else None)
-    theme = _object(value.get("theme", {}), {"name", "accent", "icons", "motif"}, "theme")
+    theme = _object(value.get("theme", {}), THEME_FIELDS, "theme")
     accent = theme.get("accent", "#176B56")
     if not isinstance(accent, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", accent):
         raise DesignError("theme.accent must be a six-digit hex color such as #176B56.")
@@ -344,14 +510,23 @@ def validate_spec(value) -> dict:
     motif = theme.get("motif", "dots")
     if motif not in MOTIFS:
         raise DesignError("theme.motif must be leaves, waves, stars or dots.")
-    icons = theme.get("icons", DEFAULT_ICONS)
-    if not isinstance(icons, list) or not 1 <= len(icons) <= 6:
+    background = theme.get("background", "plain")
+    if background not in BACKGROUNDS:
+        raise DesignError("theme.background must be plain or rainbow.")
+    mascot = _icon(theme["mascot"], "theme.mascot") if "mascot" in theme else None
+    icons = theme.get("icons", [] if mascot else DEFAULT_ICONS)
+    if not isinstance(icons, list) or not (0 if mascot else 1) <= len(icons) <= 6:
         raise DesignError("theme.icons must contain 1-6 related emoji.")
+    icons = [_icon(icon, f"theme.icons[{i}]") for i, icon in enumerate(icons)]
     spec["theme"] = {
         "name": _text(theme.get("name", "Discovery"), "theme.name", 36, True),
-        "accent": accent, "motif": motif,
-        "icons": [_icon(icon, f"theme.icons[{i}]") for i, icon in enumerate(icons)],
+        "accent": accent, "motif": motif, "background": background,
+        # The mascot is the main picture: first in icons, so it leads every page.
+        "icons": list(dict.fromkeys([mascot, *icons] if mascot else icons))[:6],
     }
+    if mascot:
+        spec["theme"]["mascot"] = mascot
+    icons = spec["theme"]["icons"]
     reading = value.get("reading", [])
     if not isinstance(reading, list) or len(reading) > 60:
         raise DesignError("reading must be a list of at most 60 paragraphs.")
@@ -381,7 +556,7 @@ def validate_spec(value) -> dict:
             "lines": _integer(item.get("lines", 0 if options else 5), f"{where} lines",
                               0 if options else 1, 12),
             "options": [_text(o, f"{where} option", 1000, True) for o in options],
-            "icon": _icon(item.get("icon", spec["theme"]["icons"][(number - 1) % len(icons)]),
+            "icon": _icon(item.get("icon", icons[(number - 1) % len(icons)]),
                           f"{where} icon"),
             # Parent-key data: checked by answer_key.worksheet_key, never rendered here.
             "key": {k: item[k] for k in KEY_FIELDS if k in item},
@@ -520,13 +695,14 @@ def make_html(spec: dict) -> str:
     css = (DATA / "worksheet.css").read_text()
     js = (DATA / "worksheet.js").read_text()
     accent = spec["theme"]["accent"]
+    body = ' class="bg-rainbow"' if spec["theme"].get("background") == "rainbow" else ""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
         'style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; font-src data:; '
         'img-src data:; connect-src \'none\'; frame-src \'none\'; object-src \'none\'">'
         f"<title>{_e(spec['title'])}</title><style>{_fonts()}\n{css}\n"
-        f":root{{--accent:{accent}}}</style></head><body>"
+        f":root{{--accent:{accent}}}</style></head><body{body}>"
         '<div id="document"></div><template id="page-template"><article class="page">'
         + _decor(spec["theme"]["motif"])
         + f'<header class="page-header"><div class="series">{_e(spec["series"])}</div>'

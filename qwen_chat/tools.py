@@ -39,7 +39,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
 
+from .history import NOTE_HEAD, ChatScope, call_files
 from .skills import SkillError, SkillRegistry, package_files, write_package
+from .worksheet_pdf import BACKGROUNDS, MOTIFS
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
@@ -63,6 +65,9 @@ CONTEXT_MARKER = re.compile(
 
 
 def _refuse_placeholder(text: str, name: str, existed: bool) -> None:
+    if NOTE_HEAD in text:
+        raise ToolError(f"Nothing was saved: the new text contains the app's “{NOTE_HEAD}” "
+                        "note, which is for you, not file content. Leave it out.")
     m = CONTEXT_MARKER.search(text)
     if m:
         raise ToolError(
@@ -257,14 +262,23 @@ class Workspace:
         return "the workspace root" if rel == "." else rel
 
     # -- operations -------------------------------------------------------------------
-    def list_files(self, path: str = ".", recursive: bool = False) -> str:
+    def list_files(self, path: str = ".", recursive: bool = False,
+                   hide: Callable[[Path], str | None] | None = None) -> str:
+        """`hide(p)` names the other chat that made p, to leave it out of the listing."""
         d = self.resolve(path)
         if not d.exists():
             raise ToolError(f"'{path}' does not exist.")
         if not d.is_dir():
             raise ToolError(f"'{path}' is a file, not a folder.")
         entries: list[str] = []
+        hidden: list[str] = []
         more = False
+
+        def skip(p: Path) -> bool:
+            owner = hide(p) if hide is not None else None
+            if owner:
+                hidden.append(owner)
+            return bool(owner)
 
         def add(p: Path) -> bool:
             nonlocal more
@@ -285,22 +299,31 @@ class Workspace:
 
         if recursive:
             for top, dirs, files in os.walk(d, followlinks=False):
-                dirs.sort()
-                for name in dirs + sorted(files):
+                dirs[:] = sorted(n for n in dirs if not skip(Path(top) / n))
+                for name in dirs + sorted(n for n in files if not skip(Path(top) / n)):
                     if not add(Path(top) / name):
                         break
                 if more:
                     break
         else:
             for p in sorted(d.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                if skip(p):
+                    continue
                 if not add(p):
                     break
         where = self.display(d)
+        chats = ", ".join(f"“{t}”" for t in dict.fromkeys(hidden))
         if not entries:
+            if hidden:
+                return (f"{where} has only files made in other chats ({chats}), so they are not "
+                        "shown. Use them only if the user names them.")
             return f"{where} is empty."
         out = [f"Contents of {where}:"] + entries
         if more:
             out.append(f"... more entries not shown (limit {MAX_LIST_ENTRIES}).")
+        if hidden:
+            out.append(f"Not shown: {len(hidden)} item{'s' if len(hidden) != 1 else ''} made in "
+                       f"other chats ({chats}). Use them only if the user names them.")
         return "\n".join(out)
 
     def read_file(self, path: str, start_line: int = 1) -> str:
@@ -1669,6 +1692,17 @@ DOWNLOAD_TOOL = _fn(
 
 FILE_RESULT_TOOLS = {"write_file", "edit_file", "download_file", "make_directory", "move_path",
                      "render_worksheet", "render_answer_key"}
+# Arguments naming workspace files, where another chat's files are refused unless the user
+# named them (read_quiz and open_file check their own paths). True also refuses a folder
+# holding one: deleting, moving or packaging the folder would take that file along.
+SCOPED_ARGS = {
+    "read_file": {"path": False},
+    "write_file": {"path": False}, "edit_file": {"path": False}, "download_file": {"path": False},
+    "delete_path": {"path": True}, "save_skill": {"path": True},
+    "move_path": {"source": True, "destination": False},
+    "render_worksheet": {"spec_path": False, "path": False, "answer_key_path": False},
+    "render_answer_key": {"spec_path": False, "path": False},
+}
 
 _LIST = {"type": "array", "items": _S}
 SKILL_TOOLS = [
@@ -1689,7 +1723,9 @@ PROGRAM_TOOLS = [
         "do not rewrite or remove content to work around it. For a NEW worksheet plus a parent "
         "or teacher answer key, put each question's answer in the same JSON and pass "
         "answer_key_path: one call checks every answer and creates both PDFs, with no answers "
-        "on the student copy. For a key to an EXISTING quiz, use read_quiz and render_answer_key.",
+        "on the student copy. To change only the LOOK of an existing worksheet (new mascot, "
+        "colors, background), pass its existing spec_path plus theme; never retype its content. "
+        "For a key to an EXISTING quiz, use read_quiz and render_answer_key.",
         {"spec_path": {**_S, "description": "Workspace JSON file containing the worksheet data"},
          "path": {**_S, "description": "Destination .pdf file in the workspace"},
          "expected_questions": {"type": "integer", "minimum": 0, "maximum": 30,
@@ -1697,7 +1733,21 @@ PROGRAM_TOOLS = [
          "expected_multiple_choice": {"type": "integer", "minimum": 0, "maximum": 30,
                                       "description": "Multiple-choice question count requested by the user (not option count)"},
          "answer_key_path": {**_S, "description": "Optional second .pdf for the parent/teacher "
-                                                  "answer key, built from the answers in the JSON"}},
+                                                  "answer key, built from the answers in the JSON"},
+         "theme": {"type": "object", "description":
+                   "Optional look-only change: only the theme fields to change, e.g. "
+                   "{\"mascot\": \"mermaid\", \"background\": \"rainbow\", \"motif\": \"waves\"}. "
+                   "The passage, questions and answers stay exactly as in spec_path, and the "
+                   "restyled JSON is saved next to the PDF with the same name.",
+                   "properties": {
+                       "name": {**_S, "description": "Theme name"},
+                       "accent": {**_S, "description": "Dark heading color, #RRGGBB"},
+                       "icons": {**_LIST, "description": "Up to 6 decoration emoji"},
+                       "motif": {**_S, "enum": list(MOTIFS)},
+                       "background": {**_S, "enum": list(BACKGROUNDS),
+                                      "description": "rainbow adds soft rainbow fades behind headings and the passage"},
+                       "mascot": {**_S, "description": "An animal or character emoji or name, "
+                                                       "e.g. mermaid; replaces the old one"}}}},
         ["spec_path", "path"]),
     _fn("render_answer_key", "Create a teacher-facing answer-key PDF from source-bound JSON. "
         "Load answer-key and call read_quiz first. Requires one answer per source question, "
@@ -1745,6 +1795,33 @@ def _as_list(value) -> list[str]:
     return [str(v).strip() for v in value if str(v).strip()]
 
 
+def _theme_change(value) -> dict | None:
+    """render_worksheet's theme argument as theme fields to change, or None for no change."""
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
+    if value is None or value == "" or value == {}:
+        return None
+    if not isinstance(value, dict):
+        raise ToolError("theme must be an object with only the theme fields to change, for "
+                        'example {"mascot": "mermaid", "background": "rainbow", "motif": "waves"}.')
+    return value
+
+
+def _write_atomic(path: Path, content: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".qwen-save-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 class ToolBox:
     def __init__(self, workspace: Workspace, web: bool = True, files: bool = True,
                  commands: bool = False,
@@ -1768,6 +1845,11 @@ class ToolBox:
         # Once the user says no, nothing else is asked in that turn: the model has to reply.
         self.declined = False
         self.input_required = ""
+        # Set by the app for each turn: other chats' files, kept out of this one.
+        self.scope: ChatScope | None = None
+        # Workspace files the last tool call created, changed or removed, when it can't be
+        # read from the call itself: {"created": [...], "changed": [...], "removed": [...]}.
+        self.last_files: dict[str, list[str]] | None = None
 
     def schemas(self) -> list[dict]:
         out = list(SKILL_TOOLS)
@@ -1790,7 +1872,7 @@ class ToolBox:
             "web_search": web_search,
             "fetch_url": fetch_url,
             "download_file": lambda url, path="": download_file(ws, url, path),
-            "list_files": ws.list_files,
+            "list_files": self.list_files,
             "read_file": ws.read_file,
             "read_quiz": self.read_quiz,
             "write_file": ws.write_file,
@@ -1808,6 +1890,45 @@ class ToolBox:
             "install_packages": self.install_packages,
             "check_programs": self.check_programs,
         }.get(name)
+
+    # -- this chat's files ------------------------------------------------------------------
+    def list_files(self, path: str = ".", recursive: bool = False) -> str:
+        scope = self.scope
+        if scope is None or not scope.foreign:
+            return self.ws.list_files(path, recursive)
+        return self.ws.list_files(path, recursive, hide=scope.owner)
+
+    def _not_foreign(self, real: Path, given: str, whole: bool = False) -> None:
+        """Refuse a file another chat made (or, with whole, a folder holding one)."""
+        scope = self.scope
+        if scope is None or not scope.foreign:
+            return
+        title, what = scope.owner(real), "was made in another chat"
+        if not title and whole:
+            title, what = scope.inside(real), "holds files made in another chat"
+        if title:
+            raise ToolError(
+                f"'{given}' {what} (“{title}”), so it is not used here. "
+                "Each chat works with its own files. If the user wants it, ask them to name the "
+                "file or that chat; otherwise continue with this chat's files.")
+
+    def _check_scope(self, name: str, args: dict) -> None:
+        for key, whole in SCOPED_ARGS.get(name, {}).items():
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                try:
+                    real = self.ws.resolve(value)
+                except ToolError:
+                    continue  # the tool itself reports a bad path
+                self._not_foreign(real, value, whole)
+
+    def _claim(self, name: str, args: dict, ok: bool, text: str) -> None:
+        """Files this chat just made or changed stay usable here, even if another chat made them."""
+        if self.scope is None:
+            return
+        meta = {"files": self.last_files} if self.last_files else None
+        found = call_files(name, args, text, ok, meta, self.ws.root)
+        self.scope.claim(found["created"] + found["changed"] + [d for _, d in found["moved"]])
 
     # -- programs -----------------------------------------------------------------------
     def _cancelled(self) -> bool:
@@ -1955,6 +2076,7 @@ class ToolBox:
         from .worksheet_pdf import DesignError
 
         source = self.ws.resolve(path)
+        self._not_foreign(source, path)
         if not source.is_file() or source.suffix.lower() not in (".pdf", ".json"):
             raise ToolError("read_quiz needs an existing quiz .pdf or worksheet .json file.")
         with source.open("rb") as fh:
@@ -2032,23 +2154,33 @@ class ToolBox:
 
     def render_worksheet(self, spec_path: str, path: str, expected_questions: int | None = None,
                          expected_multiple_choice: int | None = None,
-                         answer_key_path: str | None = None) -> str:
+                         answer_key_path: str | None = None, theme=None) -> str:
         from .answer_key import worksheet_key
-        from .worksheet_pdf import DesignError, normalize_spec, validate_spec, without_answers
+        from .worksheet_pdf import (DesignError, normalize_spec, restyle_theme, validate_spec,
+                                    without_answers)
 
         self._check_declined()
         if self._cancelled():
             raise ToolError("Stopped by the user.")
         source, target = self.ws.resolve(spec_path), self.ws.resolve(path)
+        change = _theme_change(theme)
         data, _ = self._json_data(source)
         data, adjusted = normalize_spec(data)
+        if change:
+            new_theme, notes = restyle_theme(data.get("theme"), change)
+            data, again = normalize_spec({**data, "theme": new_theme})
+            adjusted = list(dict.fromkeys([*adjusted, *notes, *again]))
         try:
             spec = validate_spec(data)
         except (DesignError, ValueError, UnicodeError) as exc:
             hint = (" This is answer-key JSON for an existing quiz: load answer-key and use "
                     "render_answer_key." if isinstance(data, dict)
                     and data.keys() & {"answers", "source_path", "source_sha256"} else
+                    " Fix the theme argument and render again." if change
+                    and "theme" in str(exc) else
                     " Fix that spot with edit_file, then render again.")
+            if not change:
+                hint += self._restyle_hint(source, data)
             raise ToolError(f"Invalid worksheet specification: {exc}{hint}") from None
         for label, expected, actual in (
                 ("questions", expected_questions, len(spec["questions"])),
@@ -2074,27 +2206,81 @@ class ToolBox:
                 document, key_audit = worksheet_key(spec)
                 key_spec = validate_spec(document)
             except DesignError as exc:
-                raise ToolError(f"The answer key is not ready: {exc}") from None
+                raise ToolError(f"The answer key is not ready: {exc}"
+                                + ("" if change else self._restyle_hint(source, data))) from None
             jobs.append((key_target, answer_key_path, document, key_spec, "answer key"))
-        result = self._render_pdfs(source, jobs)
+        extra = []
+        if change:
+            companion = target.with_suffix(".json")
+            self._not_foreign(companion, self.ws.display(companion))
+            extra.append((companion, "the restyled worksheet JSON",
+                          json.dumps(data, ensure_ascii=False, indent=2) + "\n"))
+        result = self._render_pdfs(source, jobs, extra=extra)
+        if change:
+            result += (f"\nRestyled: the passage, questions and answers are unchanged from "
+                       f"{self.ws.display(source)}; only the look changed.")
+        result += "\nLook: " + json.dumps(spec["theme"], ensure_ascii=False)
         if adjusted:
-            result += ("\nHandled automatically (no action needed; the JSON file was not changed): "
+            result += ("\nHandled automatically (no action needed"
+                       + ("" if change else "; the JSON file was not changed") + "): "
                        + "; ".join(adjusted) + ".")
         if key_audit:
             return (result + "\nAnswer checks: " + json.dumps(key_audit, ensure_ascii=False)
                     + "\nThe student PDF has no answers; the answer key has every answer.")
-        if any(q["key"] for q in [*spec["questions"], *filter(None, [spec["challenge"]])]):
-            result += ("\nThe JSON's answers were kept off this student PDF. For a parent answer "
-                       "key, render again with answer_key_path.")
         return result
+
+    def _restyle_hint(self, source: Path, data) -> str:
+        """When a failing draft retypes a worksheet that was already rendered next to it (same
+        title or most of the same questions), points to the theme argument instead."""
+        if not isinstance(data, dict):
+            return ""
+        from .worksheet_pdf import normalize_spec
+
+        def words(text) -> str:
+            return " ".join(re.findall(r"\w+", str(text or "").casefold()))
+
+        def prompts(spec: dict) -> set[str]:
+            return {words(q.get("prompt")) for q in spec.get("questions") or []
+                    if isinstance(q, dict)} - {""}
+
+        title, mine = words(data.get("title")), prompts(data)
+        try:
+            siblings = sorted((f for f in source.parent.glob("*.json") if f != source
+                               and f.with_suffix(".pdf").is_file()),
+                              key=lambda f: f.stat().st_mtime, reverse=True)[:20]
+        except OSError:
+            return ""
+        for f in siblings:
+            if self.scope and self.scope.owner(f):
+                continue
+            try:
+                if f.stat().st_size > 262144:
+                    continue
+                other, _ = normalize_spec(json.loads(f.read_text(encoding="utf-8")))
+            except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
+                continue
+            if not isinstance(other, dict) or not isinstance(other.get("questions"), list):
+                continue
+            theirs, name = prompts(other), words(other.get("title"))
+            if (name and title and (name in title or title in name)) \
+                    or (theirs and 2 * len(mine & theirs) >= len(theirs)):
+                shown = self.ws.display(f)
+                return (f" This draft retypes {shown}, which already rendered. If only the look "
+                        f"should change, do not fix this draft: call render_worksheet with "
+                        f"spec_path \"{shown}\", a new path and a theme object (for example "
+                        "{\"mascot\": \"🧜‍♀️\", \"background\": \"rainbow\"}), so its content stays "
+                        "exactly the same.")
+        return ""
 
     def _render_pdf(self, source: Path, target: Path, path: str, data: dict, spec: dict,
                     kind: str = "worksheet", check_source: Callable[[], None] | None = None) -> str:
         return self._render_pdfs(source, [(target, path, data, spec, kind)], check_source)
 
     def _render_pdfs(self, source: Path, jobs: list[tuple[Path, str, dict, dict, str]],
-                     check_source: Callable[[], None] | None = None) -> str:
-        """Render every PDF to scratch files; publish them together only if all passed."""
+                     check_source: Callable[[], None] | None = None,
+                     extra: list[tuple[Path, str, str]] = ()) -> str:
+        """Render every PDF to scratch files; publish them together only if all passed.
+        `extra`: (file, label, text) saved along with them, such as a restyled worksheet JSON."""
         targets = [job[0] for job in jobs]
         for target in targets:
             if target.is_dir() or target.suffix.lower() != ".pdf":
@@ -2103,6 +2289,18 @@ class ToolBox:
                 raise ToolError("The specification and PDF need different file names.")
         if len(set(targets)) != len(targets):
             raise ToolError("The worksheet and its answer key need different PDF file names.")
+        saves, kept = [], []
+        for file, label, text in extra:
+            if file.is_dir() or file in targets:
+                raise ToolError(f"Cannot save {label} as {self.ws.display(file)}: that name is "
+                                "taken. Use a different PDF file name.")
+            content = text.encode("utf-8")
+            with contextlib.suppress(OSError):
+                if file.is_file() and file.read_bytes() == content:
+                    kept.append(f"{label[0].upper()}{label[1:]} is already saved as "
+                                f"{self.ws.display(file)}.")
+                    continue
+            saves.append((file, label, content))
 
         def fingerprint(target: Path):
             if not target.exists():
@@ -2110,8 +2308,9 @@ class ToolBox:
             st = target.stat()
             return st.st_ino, st.st_size, st.st_mtime_ns
 
-        before = [fingerprint(t) for t in targets]
-        names = [self.ws.display(t) for t in targets]
+        files = targets + [file for file, *_ in saves]
+        before = [fingerprint(t) for t in files]
+        names = [self.ws.display(t) for t in files]
         existing = " and ".join(n for n, old in zip(names, before) if old is not None)
         if existing and not self.ws.confirm(
                 "Replace a file?", f"Qwen wants to replace {existing}. Old versions go to the "
@@ -2148,18 +2347,30 @@ class ToolBox:
                 if self.ws.resolve(path) != target or fingerprint(target) != old:
                     raise ToolError("The destination changed while the PDF was being made. "
                                     "It was not replaced; read it again before retrying.")
+            for (file, *_), old in zip(saves, before[len(jobs):]):
+                if self.ws.resolve(str(file)) != file or fingerprint(file) != old:
+                    raise ToolError(f"{self.ws.display(file)} changed while the PDF was being "
+                                    "made. Nothing was replaced; read it again before retrying.")
             if not self.files or not self.commands or self._cancelled():
                 raise ToolError("PDF rendering was stopped or disabled. No file was replaced.")
             if check_source:
                 check_source()
-            backups = []
-            for target, (staged, *_) in zip(targets, rendered):
-                backup = ""
+
+            def trash_old(target: Path) -> str:
                 if target.exists() and not self.ws._is_own(target) and target.stat().st_size:
                     self.ws.trash(target)
-                    backup = " The old version is in the Trash."
+                    return " The old version is in the Trash."
+                return ""
+
+            backups = []
+            for target, (staged, *_) in zip(targets, rendered):
+                backups.append(trash_old(target))
                 os.replace(staged, target)
-                backups.append(backup)
+            for file, _label, content in saves:
+                backups.append(trash_old(file))
+                _write_atomic(file, content)
+        self.last_files = {"created": [n for n, old in zip(names, before) if old is None],
+                           "changed": [n for n, old in zip(names, before) if old is not None]}
         lines = []
         for (target, _p, _d, spec, kind), (_s, report, approved), backup in zip(jobs, rendered, backups):
             self.ws.mark_own(target)
@@ -2172,6 +2383,11 @@ class ToolBox:
                          + (f"The user approved {approved} pages for this export; the source JSON "
                             "was not changed.\n" if approved is not None else "")
                          + f"Layout report: {json.dumps(report, ensure_ascii=False)}")
+        for (file, label, _c), backup in zip(saves, backups[len(jobs):]):
+            self.ws.mark_own(file)
+            lines.append(f"Saved {label} as {self.ws.display(file)} "
+                         f"({human_size(file.stat().st_size)}).{backup}")
+        lines += kept
         if any(report.get("icon_substitutions") for _s, report, _a in rendered):
             lines.append("Emoji the font cannot draw as one picture were replaced automatically "
                          "(see icon_substitutions).")
@@ -2260,6 +2476,7 @@ class ToolBox:
     def open_file(self, path: str) -> str:
         self._check_declined()
         target = self.ws.resolve(path)
+        self._not_foreign(target, path)
         if not target.is_file() or not target.stat().st_size:
             raise ToolError(f"Cannot open {path}: the file is missing or empty. Create it successfully first.")
         def fingerprint():
@@ -2364,6 +2581,9 @@ class ToolBox:
             ["/bin/bash", "-c", command], self.ws.root, child_env(), timeout, self.cancel,
             lambda line: self.status(f"Running… {line}"))
         changed, deleted = _changes(before, _snapshot(self.ws.root))
+        self.last_files = {"created": [p for p in changed[:200] if p not in before],
+                           "changed": [p for p in changed[:200] if p in before],
+                           "removed": deleted[:200]}
         notes = []
         if changed:
             shown = ", ".join(f"{p} ({human_size(self._size(p))})" for p in changed[:15])
@@ -2599,6 +2819,8 @@ class ToolBox:
 
     def run(self, name: str, arguments) -> tuple[bool, str]:
         """Run a tool call; returns (ok, text for the model). Never raises ToolError."""
+        self.last_files = None
+        args: dict = {}
         try:
             self._check_declined()
             if self.input_required:
@@ -2613,15 +2835,21 @@ class ToolBox:
                        if p.default is inspect.Parameter.empty and p.name not in args]
             if missing:
                 raise ToolError(f"Missing argument(s): {', '.join(missing)}.")
-            return True, fn(**args)
+            self._check_scope(name, args)
+            ok, text = True, fn(**args)
         except ToolError as e:
-            return False, f"Error: {e}"
+            ok, text = False, f"Error: {e}"
         except PermissionError as e:
-            return False, f"Error: permission denied ({e.filename})."
+            ok, text = False, f"Error: permission denied ({e.filename})."
         except OSError as e:
-            return False, f"Error: {e.strerror or e}"
+            ok, text = False, f"Error: {e.strerror or e}"
         except Exception as e:  # a tool bug must not end the conversation
-            return False, f"Error: {type(e).__name__}: {e}"
+            ok, text = False, f"Error: {type(e).__name__}: {e}"
+        try:
+            self._claim(name, args, ok, text)
+        except Exception:
+            pass  # only affects which files the chat can use; never the result
+        return ok, text
 
     @staticmethod
     def describe(name: str, args: dict, running: bool = False, ok: bool = True) -> str:

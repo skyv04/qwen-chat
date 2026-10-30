@@ -737,6 +737,115 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn(note, text)
         self.assertEqual((self.ws.root / "harvest.json").read_text(), raw)
 
+    def test_a_look_change_keeps_the_content_and_saves_the_restyled_json(self):
+        data = self._homework_spec()
+        data["theme"] = {"name": "Moon trip", "motif": "stars", "icons": ["\U0001f98a", "\U0001f680"]}
+        (self.ws.root / "moon.json").write_text(json.dumps(data))
+        original = (self.ws.root / "moon.json").read_text()
+        staged = []
+
+        def render(argv, *_args):
+            staged.append(json.loads(Path(argv[-2]).read_text()))
+            return self._render_ok(argv)
+
+        restyle = dict(spec_path="moon.json", path="moon-mermaid.pdf",
+                       answer_key_path="moon-mermaid-key.pdf",
+                       theme={"mascot": "mermaid", "background": "rainbow", "motif": "waves"})
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", **restyle)
+        self.assertTrue(ok, text)
+        mermaid = "\U0001f9dc\u200d\u2640\ufe0f"
+        theme = {"name": "Moon trip", "motif": "waves", "icons": ["\U0001f680"], "mascot": mermaid,
+                 "background": "rainbow"}
+        self.assertEqual(staged[0]["theme"], theme)
+        self.assertEqual(staged[0]["reading"], data["reading"])
+        self.assertEqual([q["prompt"] for q in staged[0]["questions"]],
+                         [q["prompt"] for q in data["questions"]])
+        self.assertEqual(json.loads((self.ws.root / "moon-mermaid.json").read_text()),
+                         {**data, "theme": theme})
+        self.assertEqual((self.ws.root / "moon.json").read_text(), original)
+        self.assertIn("Saved the restyled worksheet JSON as moon-mermaid.json", text)
+        self.assertIn("Restyled: the passage, questions and answers are unchanged from moon.json; "
+                      "only the look changed.", text)
+        self.assertIn("the new mascot replaced \U0001f98a in theme.icons", text)
+        look = json.loads(next(line[6:] for line in text.splitlines() if line.startswith("Look: ")))
+        self.assertEqual((look["icons"], look["background"]), ([mermaid, "\U0001f680"], "rainbow"))
+        self.assertEqual(self.box.last_files, {
+            "created": ["moon-mermaid.pdf", "moon-mermaid-key.pdf", "moon-mermaid.json"],
+            "changed": []})
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", **restyle)
+        self.assertTrue(ok, text)
+        self.assertIn("The restyled worksheet JSON is already saved as moon-mermaid.json.", text)
+        self.assertEqual(self.box.last_files["changed"], ["moon-mermaid.pdf", "moon-mermaid-key.pdf"])
+        ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="x.pdf",
+                                 theme=["rainbow"])
+        self.assertFalse(ok)
+        self.assertIn("theme must be an object", text)
+        # A retyped copy whose story drifted points back to the rendered worksheet instead.
+        draft = {**data, "title": "Moon homework - mermaid edition",
+                 "reading": ["Mia flew her shiny rocket to the Moon."]}
+        (self.ws.root / "moon-draft.json").write_text(json.dumps(draft))
+        ok, text = self.run_tool("render_worksheet", spec_path="moon-draft.json", path="d.pdf",
+                                 answer_key_path="d-key.pdf")
+        self.assertFalse(ok)
+        self.assertIn("evidence is not in the source", text)
+        self.assertIn('This draft retypes moon-mermaid.json, which already rendered. If only the '
+                      'look should change, do not fix this draft: call render_worksheet with '
+                      'spec_path "moon-mermaid.json"', text)
+        other = {"title": "Sun facts", "reading": ["The Sun is a star."], "questions": [
+            {"prompt": "What is the Sun?", "options": ["A star", "A moon"], "choice": "A",
+             "evidence": "The Sun is a big star."}]}
+        (self.ws.root / "sun.json").write_text(json.dumps(other))
+        ok, text = self.run_tool("render_worksheet", spec_path="sun.json", path="s.pdf",
+                                 answer_key_path="s-key.pdf")
+        self.assertFalse(ok)
+        self.assertIn("evidence is not in the source", text)
+        self.assertNotIn("retypes", text)
+
+    def test_other_chats_files_are_hidden_and_refused_until_named(self):
+        from qwen_chat.history import ChatScope
+        root = self.ws.root
+        for rel in ("apples.png", "notes.txt", "homework/first-grade/space.json",
+                    "homework/first-grade/harvest.json", "grade1-only/cookies.png"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("x")
+        self.box.scope = ChatScope(root, {"apples.png": "grade1", "grade1-only/cookies.png": "grade1",
+                                          "homework/first-grade/space.json": "grade1"})
+        ok, text = self.run_tool("list_files")
+        self.assertTrue(ok, text)
+        self.assertIn("notes.txt", text)
+        self.assertIn("homework/", text)  # it also holds a file no chat claims
+        self.assertNotIn("apples.png", text)
+        self.assertNotIn("grade1-only", text)
+        self.assertIn("Not shown: 2 items made in other chats (“grade1”).", text)
+        ok, text = self.run_tool("list_files", path="homework", recursive=True)
+        self.assertIn("harvest.json", text)
+        self.assertNotIn("space.json", text)
+        ok, text = self.run_tool("list_files", path="grade1-only")
+        self.assertIn("has only files made in other chats (“grade1”)", text)
+        with mock.patch.object(tools, "run_streaming") as run:
+            for name, args in (("read_file", {"path": "apples.png"}),
+                               ("write_file", {"path": "homework/first-grade/space.json", "content": "y"}),
+                               ("delete_path", {"path": "homework"}),
+                               ("move_path", {"source": "grade1-only", "destination": "mine"}),
+                               ("render_worksheet", {"spec_path": "homework/first-grade/space.json",
+                                                     "path": "space.pdf"}),
+                               ("open_file", {"path": "apples.png"})):
+                with self.subTest(name=name):
+                    ok, text = self.run_tool(name, **args)
+                    self.assertFalse(ok)
+                    self.assertIn("made in another chat (“grade1”), so it is not used here", text)
+            run.assert_not_called()
+        self.assertEqual((root / "homework/first-grade/space.json").read_text(), "x")
+        self.assertTrue((root / "homework").is_dir())
+        self.assertTrue(self.run_tool("read_file", path="homework/first-grade/harvest.json")[0])
+        # A file this chat's own command changes is this chat's from then on.
+        ok, text = self.run_tool("run_command", command="printf mine > apples.png", why="Test.")
+        self.assertTrue(ok, text)
+        self.assertEqual(self.box.last_files, {"created": [], "changed": ["apples.png"], "removed": []})
+        self.assertIn("apples.png", self.run_tool("list_files")[1])
+
     def test_broken_worksheet_json_names_the_spot_and_the_right_fix(self):
         f = self.ws.root / "sheet.json"
         for content, expected in (

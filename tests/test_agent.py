@@ -7,6 +7,7 @@ from unittest import mock
 
 from qwen_chat import agent
 from qwen_chat.agent import Agent, clean_for_api, fit_context
+from qwen_chat.history import NOTE_HEAD, NOTE_SEP
 from qwen_chat.tools import CONTEXT_MARKER, ToolBox, Workspace
 
 CUT = '{"path": "practice/make_pdf.py", "content": "#!/usr/bin/env python3\\nimport os\\nstory = [\\"'
@@ -109,7 +110,7 @@ class CutOffToolCallTest(unittest.TestCase):
         ], msgs)
         prompt = self.payloads[0]["messages"][0]["content"]
         self.assertIn("load_skill", prompt)
-        self.assertIn("preserve the original passage", prompt)
+        self.assertIn("EXISTING spec_path and a theme object", prompt)
         self.assertNotIn("Use about 4-6 answer lines", prompt)
         skill_reply = next(m for m in self.payloads[1]["messages"] if m["role"] == "tool")
         self.assertIn("Use about 4-6 answer lines", skill_reply["content"])
@@ -117,6 +118,45 @@ class CutOffToolCallTest(unittest.TestCase):
         self.box.commands = False
         self.assertIn("load_skill", agent.system_prompt(self.box, "test"))
         self.assertNotIn("call load_skill with name 'worksheet-pdf'", agent.system_prompt(self.box, "test"))
+
+    def test_a_follow_up_is_sent_with_a_note_on_the_earlier_work(self):
+        (self.root / "quiz.json").write_text("{}")
+        msgs = [{"role": "user", "content": "Make a quiz."},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [_call('{"path": "quiz.json", "content": "{}"}')]},
+                {"role": "tool", "tool_call_id": "c1", "name": "write_file",
+                 "content": "Created quiz.json (2 bytes).", "_meta": {"ok": True}},
+                {"role": "assistant", "content": "I saved quiz.json."},
+                {"role": "user", "content": "try harder"}]
+        self._respond([_reply({"content": "Improving quiz.json."})], msgs)
+        note = msgs[4]["_meta"]["context"]
+        self.assertTrue(note.startswith(NOTE_HEAD), note)
+        self.assertIn('1. "Make a quiz." → answered: I saved quiz.json.', note)
+        self.assertIn("newest first: quiz.json", note)
+        self.assertEqual(self.payloads[0]["messages"][-1],
+                         {"role": "user", "content": "try harder" + NOTE_SEP + note})
+        # Made once and saved: every later request sends the same text, so the server's
+        # prompt cache stays valid.
+        (self.root / "quiz.json").unlink()
+        Agent(_Server(), self.box)._add_context_note(msgs[:5])
+        self.assertEqual(msgs[4]["_meta"]["context"], note)
+        first = [{"role": "user", "content": "hi"}]
+        self._respond([_reply({"content": "Hello!"})], first)
+        self.assertEqual(first[0]["_meta"]["context"], "")
+        self.assertEqual(self.payloads[1]["messages"][-1]["content"], "hi")
+
+    def test_files_a_command_made_are_saved_with_its_result(self):
+        self.box.commands = True
+        self.box.approve = lambda *_args: True
+        msgs = [{"role": "user", "content": "Make a note."}]
+        command = json.dumps({"command": "printf hi > made.txt", "why": "Saves the note."})
+        self._respond([_reply({"tool_calls": [_call(command, name="run_command")]}),
+                       _reply({"content": "Saved made.txt."})], msgs)
+        self.assertEqual(msgs[2]["_meta"], {"ok": True, "files": {
+            "created": ["made.txt"], "changed": [], "removed": []}})
+        msgs.append({"role": "user", "content": "Make it longer."})
+        Agent(_Server(), self.box)._add_context_note(msgs)
+        self.assertIn("newest first: made.txt", msgs[-1]["_meta"]["context"])
 
     def test_suggested_skills_stay_in_history_without_limiting_tools(self):
         self.box.commands = True
@@ -352,6 +392,31 @@ class HistoryRepairTest(unittest.TestCase):
                 self.assertLessEqual(size(out), budget * agent.TRIM_TARGET)
             prev = out
         self.assertLessEqual(retrims, 5)  # re-trimming every round would be 12
+
+    def test_a_follow_up_keeps_the_earlier_requests_and_only_the_newest_note(self):
+        msgs = []
+        for t in range(5):
+            msgs.append({"role": "user", "content": f"request {t}",
+                         "_meta": {"context": f"{NOTE_HEAD} note {t}"}})
+            for i in range(12):
+                cid = f"c{t}-{i}"
+                args = json.dumps({"path": f"f{i}.txt", "content": "x" * 2000})
+                msgs += [{"role": "assistant", "content": "", "tool_calls": [_call(args, cid)]},
+                         {"role": "tool", "tool_call_id": cid, "name": "write_file",
+                          "content": f"Created f{i}.txt " + "y" * 300}]
+            msgs.append({"role": "assistant", "content": f"final answer {t}"})
+        msgs.append({"role": "user", "content": "try harder",
+                     "_meta": {"context": NOTE_HEAD + " newest"}})
+        out = fit_context(clean_for_api(msgs), 9000)
+        # The oldest turns shrink to their request and answer instead of disappearing, so
+        # "try harder" still shows what it refers to.
+        self.assertEqual([m["content"] for m in out[:2]], ["request 0", "final answer 0"])
+        texts = [m["content"] for m in out]
+        for t in range(5):
+            self.assertIn(f"request {t}", texts)
+            self.assertIn(f"final answer {t}", texts)
+        self.assertEqual(sum(NOTE_HEAD in m["content"] for m in out), 1)
+        self.assertEqual(out[-1]["content"], "try harder" + NOTE_SEP + NOTE_HEAD + " newest")
 
 
 if __name__ == "__main__":

@@ -187,3 +187,26 @@ footer {
 .footer-icons { display: flex; gap: 9px; }
 .footer-icons .emoji { font-size: 17px; }
 .page-number { min-width: 65px; text-align: right; font-variant-numeric: tabular-nums; }
+/* theme.background "rainbow": pastel rainbow washes that fade out behind the header, section
+   bands and reading passage. Questions and answer lines stay plain white for writing. */
+.bg-rainbow .series {
+  background: linear-gradient(90deg, #ffd6e0, #ffe8c8, #fff4bd, #dbf3d3, #d3e9ff, #e6dcff);
+}
+.bg-rainbow .hero {
+  background: linear-gradient(100deg, #ffdbe4, #ffeacd 22%, #fff5c4 40%, #dff5d8 58%,
+                              #d7ebff 78%, #e9e0ff);
+}
+.bg-rainbow .band {
+  background: linear-gradient(90deg, #ffd6e0, #ffe8c8 20%, #fff4bd 38%, #dbf3d3 56%,
+                              #d3e9ff 76%, rgba(230, 220, 255, 0));
+}
+.bg-rainbow .reading-text {
+  padding: 6px 9px;
+  border-radius: 10px;
+  background: linear-gradient(100deg, rgba(255, 214, 224, .45), rgba(255, 244, 189, .4) 30%,
+                              rgba(219, 243, 211, .38) 55%, rgba(211, 233, 255, .34) 80%,
+                              rgba(230, 220, 255, 0));
+}
+.bg-rainbow footer {
+  border-image: linear-gradient(90deg, #f29bb2, #f5c27e, #ecd862, #92d18c, #86bdf0, #b49de9) 1;
+}
