@@ -16,7 +16,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from . import APP_ID, APP_NAME  # noqa: E402
-from .agent import Agent, repair_history, salvage_args  # noqa: E402
+from .agent import ATTACHED_LINE, Agent, repair_history, salvage_args  # noqa: E402
 from .history import ChatFiles, ChatScope  # noqa: E402
 from .llm import Cancelled, LLMError, ServerError, gpu_busy_percent  # noqa: E402
 from .skill_picker import SkillPicker  # noqa: E402
@@ -1225,7 +1225,7 @@ class ChatWindow(Adw.ApplicationWindow):
         content = text
         if atts:
             listed = ", ".join(f"`{a}`" for a in atts)
-            content = (text + "\n\n" if text else "") + f"Attached files (in the workspace): {listed}"
+            content = (text + "\n\n" if text else "") + ATTACHED_LINE + listed
             if not text:
                 content += "\nPlease look at them."
         if self.chat is None:
@@ -1233,7 +1233,8 @@ class ChatWindow(Adw.ApplicationWindow):
             self._clear_messages()
         if not self.chat["messages"]:
             self.chat["title"] = title_from(text or os.path.basename(content))
-        self.chat["messages"].append({"role": "user", "content": content, "_meta": {"time": time.time()}})
+        meta = {"time": time.time(), **({"attachments": list(atts)} if atts else {})}
+        self.chat["messages"].append({"role": "user", "content": content, "_meta": meta})
         self.store.save(self.chat)
         self._reload_chat_list(self.chat["id"])
         self.title.set_title(self.chat["title"])

@@ -28,6 +28,12 @@ REPEAT_STUB = "[Same as a later result of this tool; removed here to save contex
 CUT_NOTE = "\n[... rest truncated here to save context space]"
 CACHE_NOTE = "\n[You already ran this exact call; use this result.]"
 CACHED_TOOLS = ("web_search", "fetch_url", "list_files", "read_file")
+# Files attached to a new message are read before the first reply, up to this many characters
+# in all (one read_file page), so it starts from what they hold, not from earlier replies.
+ATTACHED_READ_CHARS = 12_500
+ATTACHED_LINE = "Attached files (in the workspace): "
+ATTACHED_READ_NOTE = ("[The app read this attached file just now: this is what it holds. Where an "
+                      "earlier reply in this chat says otherwise, trust this read.]\n")
 # When history must shrink, shrink it to this share of the budget. The following rounds then
 # only append, so llama-server reuses its cache instead of re-reading the turn every round.
 TRIM_TARGET = 0.6
@@ -66,6 +72,9 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
         "content. The app may add a 'Chat context' note under the user's message with the "
         "earlier requests, how each ended and the files this chat made. Use it to pick up where "
         "the work stopped, but it is not the user's words: never copy it into files or replies. "
+        "Your own earlier replies can be wrong. If the user says a file holds something you did "
+        "not find, believe them: read the file again and look closely instead of repeating your "
+        "earlier answer. Never describe a file's contents from memory. "
         "If it is still unclear what the user means, ask one short question.")
     parts.append(
         "\n## Reusable skills\n"
@@ -100,7 +109,9 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "File tools cannot access other folders; skill tools manage only the shared skill "
             "library. When the user asks you to create, save, write, "
             "export or edit a file, actually do it with the file tools (don't just show the "
-            "content), then mention the file name. Read a file before changing it. Use clear "
+            "content), then mention the file name. Read a file before changing it. Files attached "
+            "to a new message are read for you: the read_file result right after the message "
+            "shows what they hold now. Use clear "
             "file names with the right extension (.md, .txt, .csv, .py, .html, ...). To change "
             "part of an existing file, use edit_file instead of rewriting the whole file. One tool "
             f"call can hold at most about {CALL_CHARS:,} characters; longer calls get cut off and "
@@ -129,9 +140,9 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "install, don't try a workaround: stop and ask what they'd like instead. You can't see "
             "images: when a task depends on what images show (text, page or question numbers, "
             "order), read them first with OCR (`tesseract IMAGE -`; install tesseract-ocr "
-            "if it's missing). For a PDF, read_file already reads the words in its pictures "
-            "with OCR; tesseract cannot open a PDF. Never guess the order or contents from file "
-            "names. Commands get "
+            "if it's missing). For a PDF, use read_file: it also reads the words in the PDF's "
+            "pictures with OCR, which pdftotext misses; tesseract cannot open a PDF. Never guess "
+            "the order or contents from file names. Commands get "
             "no keyboard input, so use non-interactive options, and keep files in the workspace. "
             "For a long script, save it with write_file, then run it with run_command; keep it "
             "short by using loops, lists and helper functions instead of repeating code.")
@@ -319,7 +330,8 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
     later = set()
     for m in reversed(msgs):
         if m["role"] == "tool" and len(m.get("content") or "") > 200:
-            seen = (m.get("name"), m["content"].removesuffix(CACHE_NOTE))
+            content = m["content"].removesuffix(CACHE_NOTE).removeprefix(ATTACHED_READ_NOTE)
+            seen = (m.get("name"), content)
             if seen in later:
                 m["content"] = REPEAT_STUB
             later.add(seen)
@@ -452,6 +464,18 @@ def _drafting(name: str, chars: int) -> str:
     return f"{what}… {chars:,} characters" if chars >= 200 else f"{what}…"
 
 
+def attached_files(message: dict) -> list[str]:
+    """The workspace paths of the files attached to a user message (older chats saved them
+    only in the message text)."""
+    listed = (message.get("_meta") or {}).get("attachments")
+    if isinstance(listed, list):
+        return [p for p in listed if isinstance(p, str) and p.strip()]
+    content = message.get("content")
+    lines = [line for line in content.splitlines()
+             if line.startswith(ATTACHED_LINE)] if isinstance(content, str) else []
+    return re.findall(r"`([^`]+)`", lines[-1]) if lines else []
+
+
 def _broken_call_note(name: str, chars: int, cut_off: bool) -> str:
     """Tool result for a call whose arguments couldn't be read, telling the model how to recover."""
     if cut_off:
@@ -490,6 +514,48 @@ class Agent:
             note = ""
         last["_meta"] = {**(last.get("_meta") or {}), "context": note}
 
+    def _read_attachments(self, messages: list[dict], events: Events, cancel: threading.Event,
+                          seen: dict[str, str]) -> None:
+        """Reads the files attached to a new message before the first reply, saved in the chat as
+        read_file calls. Otherwise the model may repeat an earlier reply about the same file
+        (one made before OCR read a PDF's pictures called its questions a newsletter) instead
+        of looking again."""
+        last = messages[-1] if messages else None
+        if not last or last.get("role") != "user" or not self.toolbox.files:
+            return
+        reads, total = [], 0
+        for path in dict.fromkeys(attached_files(last)):
+            if cancel.is_set():
+                raise Cancelled()
+            events.status(f"Reading {path}…")
+            args = {"path": path}
+            ok, out = self.toolbox.run("read_file", json.dumps(args, ensure_ascii=False))
+            if cancel.is_set():
+                raise Cancelled()
+            # Anything not read here (a picture, too long) is left to the model.
+            if ok and total + len(out) <= ATTACHED_READ_CHARS:
+                total += len(out)
+                reads.append((args, out))
+        if not reads:
+            return
+        stamp = time.time()
+        calls = [{"id": f"attached-{int(stamp * 1000)}-{i}", "type": "function",
+                  "function": {"name": "read_file", "arguments": json.dumps(args, ensure_ascii=False)}}
+                 for i, (args, _out) in enumerate(reads)]
+        msg = {"role": "assistant", "content": "", "tool_calls": calls,
+               "_meta": {"time": stamp, "attachments_read": True}}
+        messages.append(msg)
+        events.round_begin()
+        events.round_end(msg, {})
+        for call, (args, out) in zip(calls, reads):
+            seen["read_file:" + json.dumps(args, sort_keys=True)] = out
+            events.tool_begin(call["id"], "read_file", args)
+            # Earlier replies (and the context note quoting them) may describe the file wrongly.
+            out = ATTACHED_READ_NOTE + out
+            messages.append({"role": "tool", "tool_call_id": call["id"], "name": "read_file",
+                             "content": out, "_meta": {"ok": True}})
+            events.tool_end(call["id"], "read_file", args, True, out)
+
     def respond(self, messages: list[dict], events: Events, cancel: threading.Event,
                 thinking: bool = False) -> None:
         """Runs until the model gives a final answer. Appends assistant/tool messages to `messages`."""
@@ -502,6 +568,7 @@ class Agent:
         self.toolbox.request_text = user_text(messages, last=REQUEST_TURNS)
         self._add_context_note(messages)
         seen: dict[str, str] = {}
+        self._read_attachments(messages, events, cancel, seen)
         tools = self.toolbox.schemas()
         sys_msg = {"role": "system", "content": system_prompt(self.toolbox, self.server.model_name)}
         n_ctx = self.server.n_ctx
@@ -510,7 +577,15 @@ class Agent:
         budget = int((n_ctx - max_out) * CHARS_PER_TOKEN) - len(sys_msg["content"]) - tool_chars
         rounds = 0
         failed_outputs: dict[tuple[str, str], str] = {}
+        # The (spec, student or key copy) jobs each failed PDF stands for.
+        failed_jobs: dict[tuple[str, str], set[tuple[str, str]]] = {}
         repeats: dict[tuple[str, str], int] = {}
+
+        def shown(path) -> str:
+            try:
+                return self.toolbox.ws.display(self.toolbox.ws.resolve(path))
+            except (ToolError, OSError, ValueError):
+                return str(path or "(no output path)")
 
         def incomplete() -> str:
             grouped: dict[tuple[str, str], list[str]] = {}
@@ -637,25 +712,36 @@ class Agent:
                         # Anything else may have changed workspace files: read them afresh.
                         for stale in [k for k in seen if k.startswith(("list_files:", "read_file:"))]:
                             del seen[stale]
-                action, paths = "", [args.get("path")]
+                action, outputs = "", [(args.get("path"), None)]
                 if name in ("render_worksheet", "render_answer_key"):
-                    action = "Create PDF"
+                    action, spec = "Create PDF", shown(args.get("spec_path"))
+                    outputs = [(args.get("path"),
+                                (spec, "key" if name == "render_answer_key" else "student"))]
                     if name == "render_worksheet" and args.get("answer_key_path"):
-                        paths.append(args["answer_key_path"])
+                        outputs.append((args["answer_key_path"], (spec, "key")))
                 elif name == "open_file":
                     action = "Open file"
                 elif name == "run_command":
-                    paths = [self.toolbox.open_command_path(args.get("command", ""))]
-                    action = "Open file" if paths[0] is not None else ""
-                for path in paths if action else []:
-                    try:
-                        path = self.toolbox.ws.display(self.toolbox.ws.resolve(path))
-                    except (ToolError, OSError, ValueError):
-                        path = str(path or "(no output path)")
+                    outputs = [(self.toolbox.open_command_path(args.get("command", "")), None)]
+                    action = "Open file" if outputs[0][0] is not None else ""
+                for path, job in outputs if action else []:
+                    path = shown(path)
                     if ok:
                         failed_outputs.pop((action, path), None)
+                        failed_jobs.pop((action, path), None)
                     else:
                         failed_outputs[action, path] = out
+                        if job:
+                            failed_jobs.setdefault((action, path), set()).add(job)
+                if ok and action == "Create PDF":
+                    # A retry of the same worksheet under new names (after "use three different
+                    # file names", say) does the job the failed call could not.
+                    made = {job for _path, job in outputs}
+                    for entry, jobs in list(failed_jobs.items()):
+                        jobs -= made
+                        if not jobs:
+                            del failed_jobs[entry]
+                            failed_outputs.pop(entry, None)
                 if ok:
                     for seen_error in [k for k in repeats if k[0] == name]:
                         del repeats[seen_error]

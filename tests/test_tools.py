@@ -903,7 +903,8 @@ class ProgramToolsTest(unittest.TestCase):
             if argv[0] == "pdftoppm":
                 Path(argv[-1] + ".png").write_bytes(b"png")
             else:
-                Path(argv[2] + ".txt").write_text("Featured this week\nMultiply:\n2 x 20 = __\n|~\n")
+                Path(argv[2] + ".txt").write_text("Featured this week\nMultiply:\n2 x 20 = __\n"
+                                                  "49\nx 84\n+ 36\n|~\n")
             return 0, "", ""
 
         with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp.name}), \
@@ -914,10 +915,24 @@ class ProgramToolsTest(unittest.TestCase):
             for _ in range(2):
                 ok, text = self.run_tool("read_file", path="boost.pdf")
                 self.assertTrue(ok, text)
+                # The stacked numbers of a written-out sum are short, but they are the problem.
                 self.assertIn("[Page 1]\nFeatured this week\n[Page 1 pictures, read by OCR; may "
-                              "contain errors]\nMultiply:\n2 x 20 = __", text)
+                              "contain errors]\nMultiply:\n2 x 20 = __\n49\nx 84\n+ 36", text)
                 self.assertNotIn("|~", text)
         self.assertEqual(ran, ["pdftoppm", "tesseract"])  # the second read came from the cache
+
+    def test_text_layer_commands_point_to_read_file_for_pdf_pictures(self):
+        (self.ws.root / "boost.pdf").write_bytes(b"%PDF-1.4 email with pasted screenshots")
+        with mock.patch.object(tools, "_pdftotext", return_value="Weekly Boost\fMultiply:\f"), \
+                mock.patch.object(tools, "_picture_pages", return_value={2}):
+            ok, text = self.run_tool("run_command", command="echo pdftotext -layout boost.pdf -",
+                                     why="Read the PDF.")
+            self.assertTrue(ok, text)
+            self.assertIn("Pictures that may hold words, such as questions, were not read: "
+                          "boost.pdf page(s) 2. Call read_file on the PDF", text)
+            ok, text = self.run_tool("run_command", command="echo pdftoppm boost.pdf p", why="t")
+            self.assertTrue(ok, text)
+            self.assertNotIn("Call read_file", text)
 
     def test_a_look_change_keeps_the_content_and_saves_the_restyled_json(self):
         data = self._homework_spec()

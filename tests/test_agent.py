@@ -321,6 +321,60 @@ class CutOffToolCallTest(unittest.TestCase):
         self.assertEqual(messages[-1]["content"], "Created quiz.pdf.")
         self.assertTrue((self.root / "quiz.pdf").is_file())
 
+    def test_a_renamed_retry_of_the_same_worksheet_resolves_its_failure(self):
+        self.box.commands = True
+        self.box.auto_approve = lambda: True
+        (self.root / "quiz.json").write_text(
+            '{"title":"Quiz","questions":[{"prompt":"3 + 2 = __","answer":"5","lines":1}]}')
+        clash = '{"spec_path":"quiz.json","path":"key.pdf","answer_key_path":"key.pdf"}'
+
+        def render(argv, *_):
+            Path(argv[-1]).write_bytes(b"%PDF-1.7\nrendered")
+            return 0, json.dumps({"ok": True, "text_preserved": True, "portrait": True,
+                                  "layout_checked": True, "pages": 1, "color_emoji_checked": 4}), ""
+
+        # Only the student copy was remade, so the key is still missing; then both are.
+        for retry, final in (('{"spec_path":"quiz.json","path":"s1.pdf"}', "**Task incomplete.**"),
+                             ('{"spec_path":"quiz.json","path":"s2.pdf","answer_key_path":"k2.pdf"}',
+                              "Made both PDFs.")):
+            messages = [{"role": "user", "content": "Make the quiz and its answer key."}]
+            with mock.patch("qwen_chat.tools.run_streaming", side_effect=render):
+                self._respond([
+                    _reply({"tool_calls": [_call(clash, "c1", "render_worksheet")]}),
+                    _reply({"tool_calls": [_call(retry, "c2", "render_worksheet")]}),
+                    _reply({"content": "Made both PDFs."}),
+                ], messages)
+            self.assertIn("Use three different file names", messages[2]["content"])
+            self.assertTrue(messages[4]["_meta"]["ok"], messages[4]["content"])
+            self.assertTrue(messages[-1]["content"].startswith(final), messages[-1]["content"])
+
+    def test_attached_files_are_read_before_the_first_reply(self):
+        (self.root / "attachments").mkdir()
+        (self.root / "attachments/boost.txt").write_text("The cook made 11 cheese pizzas. " * 8)
+        (self.root / "attachments/photo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00")
+        # Chats saved before attachments were stored in _meta list them in the text only.
+        msgs = [{"role": "user", "content": "Use its questions.\n\n" + agent.ATTACHED_LINE
+                 + "`attachments/boost.txt`, `attachments/photo.png`"}]
+        self._respond([
+            _reply({"tool_calls": [_call('{"path":"attachments/boost.txt"}', "c1", "read_file")]}),
+            _reply({"content": "It has a pizza word problem."}),
+        ], msgs)
+        sent = self.payloads[0]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["system", "user", "assistant", "tool"])
+        self.assertEqual([json.loads(c["function"]["arguments"]) for c in sent[2]["tool_calls"]],
+                         [{"path": "attachments/boost.txt"}])  # a picture is left to the model
+        self.assertIn("11 cheese pizzas", sent[3]["content"])
+        self.assertTrue(sent[3]["content"].startswith(agent.ATTACHED_READ_NOTE))
+        self.assertTrue(msgs[1]["_meta"]["attachments_read"])
+        self.assertEqual(msgs[4]["content"],
+                         sent[3]["content"].removeprefix(agent.ATTACHED_READ_NOTE) + agent.CACHE_NOTE)
+        # Once the model reads it again, the automatic read is the duplicate that is trimmed.
+        fitted = agent.fit_context(msgs, sum(agent._size(m) for m in msgs) - 1)
+        self.assertEqual([m["content"] for m in fitted if m["role"] == "tool"],
+                         [agent.REPEAT_STUB, msgs[4]["content"]])
+        self.assertEqual(agent.attached_files({"content": "Hi", "_meta": {"attachments": ["a b.pdf"]}}),
+                         ["a b.pdf"])
+
 
 class HistoryRepairTest(unittest.TestCase):
     def test_broken_arguments_in_saved_chats_are_made_valid(self):

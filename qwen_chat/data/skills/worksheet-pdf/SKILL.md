@@ -22,7 +22,8 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
    key is wanted, work out every answer first: do each sum, find the sentence that
    proves each reading answer, and note the correct letter. For a quiz made from an
    existing PDF's questions, `read_file` the PDF first (it reads pictures of questions
-   by OCR) and copy those questions exactly; never invent replacements.
+   by OCR, which pdftotext misses) and copy those questions exactly; never invent
+   replacements.
 3. For a look-only change (new theme, mascot, colors or a rainbow background), do not
    retype the worksheet. Call `render_worksheet` with its EXISTING `spec_path`, new PDF
    names, `answer_key_path` if it has a key, and a `theme` holding only what changes:

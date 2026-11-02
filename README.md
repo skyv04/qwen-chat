@@ -84,7 +84,8 @@ started it.
   parse yet comes back with the line and column where it breaks.
 - **Think**: optional step-by-step reasoning, shown in a collapsible "Thoughts" section.
 - Attach files with the paperclip button or drag and drop. They're copied into
-  `workspace/attachments`.
+  `workspace/attachments` and read for Qwen before it answers (a PDF's pictures by OCR),
+  so it works from what the files hold now, not from an earlier reply about them.
 - Chats are saved, with a sidebar grouped by date (Today, Yesterday, …) to switch, delete
   and undo a delete. The pencil beside a chat renames it; for the current chat you can
   also use **F2** or menu → **Rename Chat...**. Renaming keeps its messages, settings
@@ -264,7 +265,9 @@ The reader uses worksheet JSON, checks a matching JSON companion against the PDF
 or extracts sequential numbered questions and lettered options from a text PDF.
 Failures are reported rather than filled with invented questions. `read_file` reads a
 PDF's text and, for pages whose questions are pictures (screenshots, scans), the words
-in those pictures by OCR, marked as such and cached. To make a new quiz from those
+in those pictures by OCR (short numbers included, such as a written-out sum's), marked
+as such and cached. A `pdftotext`-style command on such a PDF gets a note that its
+pictures were not read. To make a new quiz from those
 questions, Qwen copies them exactly into worksheet JSON with each answer in its
 question and renders both PDFs from it.
 
@@ -287,7 +290,9 @@ the desktop accepted the launch request, not whether a window was visibly displa
 Simple legacy `xdg-open file &` calls go through this checked opener too.
 
 An unresolved PDF render/open failure cannot end with an unqualified model-generated
-success message. On reaching the 30-tool-round limit, the app pauses explicitly and
+success message. A failed render is resolved by a later successful render of the same
+worksheet JSON, also under new file names (as after "use three different file names").
+On reaching the 30-tool-round limit, the app pauses explicitly and
 keeps completed steps; reply **continue** to resume. It does not ask a tool-less model
 to print pretend commands. A second identical tool error tells Qwen its last change
 didn't fix it; a third stops the reply with the error, instead of looping. Rewriting

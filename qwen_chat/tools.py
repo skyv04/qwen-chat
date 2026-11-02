@@ -637,6 +637,9 @@ OCR_MIN_AREA, OCR_MIN_SIDE = 40_000, 60
 # A page with this much text already has its words in the text layer.
 OCR_TEXT_PAGE = 2000
 OCR_MAX_PAGES = 20
+# Commands and libraries that read only a PDF's text layer, not the words in its pictures.
+PDF_TEXT_ONLY = re.compile(r"\b(pdftotext|pdf2txt|pdfplumber|pdfminer|pypdf\w*|fitz|pymupdf|"
+                           r"extract_text|get_text)\b", re.I)
 
 
 def _ocr_cache() -> Path:
@@ -666,18 +669,30 @@ def _picture_pages(path: Path) -> set[int] | None:
     return pages
 
 
+def _ocr_wanted(path: Path, texts: list[str]) -> list[int]:
+    """The pages read_file reads with OCR: every page of a PDF without a text layer, else the
+    pages with a picture that may hold words and too little text to hold them already."""
+    if not any(texts):
+        return list(range(1, len(texts) + 1))
+    pictures = _picture_pages(path)
+    return [n for n in range(1, len(texts) + 1)
+            if pictures and n in pictures and len(texts[n - 1]) < OCR_TEXT_PAGE]
+
+
 def _plain(text: str) -> str:
     return re.sub(r"\W+", "", text.casefold())
 
 
 def _ocr_lines(ocr: str, layer: str) -> str:
-    """OCR lines that add something to a page's text layer; noise and repeats are left out."""
+    """OCR lines that add something to a page's text layer; noise and repeats are left out.
+    Short numbers stay: in a written-out sum they are the numbers to work with."""
     known, known_lines = _plain(layer), {_plain(line) for line in layer.splitlines()}
     keep = []
     for line in ocr.splitlines():
         line = " ".join(line.split())
         plain, visible = _plain(line), line.replace(" ", "")
-        if (len(plain) < 3 or plain in known_lines or len(plain) >= 12 and plain in known
+        if (len(plain) < 3 and not plain.isdigit() or plain in known_lines
+                or len(plain) >= 12 and plain in known
                 or sum(c.isalnum() for c in visible) < 0.5 * len(visible)):
             continue
         keep.append(line)
@@ -2226,9 +2241,7 @@ class ToolBox:
         texts = [_tidy_text(p) for p in pages]
         has_text = any(texts)
         plain = _tidy_text(full.replace("\f", "\n"))
-        pictures = _picture_pages(f) if has_text else None
-        wanted = [n for n in range(1, len(texts) + 1) if not has_text
-                  or pictures and n in pictures and len(texts[n - 1]) < OCR_TEXT_PAGE]
+        wanted = _ocr_wanted(f, texts)
         if not wanted:
             if not has_text:
                 raise ToolError("The PDF has no extractable text (it may be scanned images).")
@@ -3105,7 +3118,39 @@ class ToolBox:
                 hint = ("\nIf a program is missing, check_programs shows what's installed and "
                         "install_packages can install it.")
             raise ToolError(f"The command failed with exit code {rc}.\n{body}{tail}{hint}")
-        return f"Exit code 0.\n{body}{tail}"
+        return f"Exit code 0.\n{body}{tail}{self._unread_pictures_note(command)}"
+
+    def _unread_pictures_note(self, command: str) -> str:
+        """After a command read a PDF's text layer: the pages whose pictures it could not read,
+        where questions pasted in as screenshots hide from it."""
+        if not PDF_TEXT_ONLY.search(command) or re.search(r"\b(tesseract|ocrmypdf)\b", command):
+            return ""
+        try:
+            lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            words = list(lex)
+        except ValueError:
+            words = command.split()
+        named = [w for w in words if w.lower().endswith(".pdf")]
+        named += re.findall(r"""["']([^"'\n]+\.pdf)["']""", command, re.I)
+        found = []
+        for name in dict.fromkeys(named):
+            try:
+                f = self.ws.resolve(name)
+                pages = _pdftotext(f).split("\f") if f.is_file() else []
+                if len(pages) > 1 and not pages[-1].strip():
+                    pages.pop()
+                unread = _ocr_wanted(f, [_tidy_text(p) for p in pages]) if pages else []
+            except (ToolError, OSError, ValueError):
+                continue
+            if unread:
+                found.append(f"{self.ws.display(f)} page(s) {_page_list(unread)}")
+        if not found:
+            return ""
+        return ("\n[This command read only the PDF's text layer. Pictures that may hold words, "
+                f"such as questions, were not read: {'; '.join(found)}. Call read_file on the "
+                "PDF: it also reads its pictures with OCR. Don't decide what the PDF contains "
+                "until you have.]")
 
     def _size(self, rel: str) -> int:
         try:
