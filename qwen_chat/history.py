@@ -323,13 +323,14 @@ def names_chat(title: str, text: str) -> bool:
     return _specific(words) and _phrase(words, text)
 
 
-def user_text(messages: list[dict]) -> str:
-    """Everything the user typed in a chat, casefolded. A short "yes" also counts the reply it
-    answers, so "yes" to "Should I use apples.png from your other chat?" names apples.png."""
+def user_text(messages: list[dict], last: int | None = None) -> str:
+    """Everything the user typed in a chat (or in its `last` user messages), casefolded. A
+    short "yes" also counts the reply it answers, so "yes" to "Should I use apples.png from
+    your other chat?" names apples.png."""
+    users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     parts = []
-    for i, m in enumerate(messages):
-        if m.get("role") != "user":
-            continue
+    for i in users[-last:] if last else users:
+        m = messages[i]
         text = _content(m)
         parts.append(text)
         if len(text) <= 60 and _AFFIRM.fullmatch(text.strip()):

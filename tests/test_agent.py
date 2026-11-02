@@ -9,6 +9,7 @@ from qwen_chat import agent
 from qwen_chat.agent import Agent, clean_for_api, fit_context
 from qwen_chat.history import NOTE_HEAD, NOTE_SEP
 from qwen_chat.tools import CONTEXT_MARKER, ToolBox, Workspace
+from qwen_chat.worksheet_pdf import MAX_PAGES
 
 CUT = '{"path": "practice/make_pdf.py", "content": "#!/usr/bin/env python3\\nimport os\\nstory = [\\"'
 
@@ -185,7 +186,7 @@ class CutOffToolCallTest(unittest.TestCase):
         source.write_text('{"title":"Quiz","max_pages":3,"questions":[{"prompt":"Explain."}]}')
         original = source.read_bytes()
         failure = json.dumps({"ok": False, "code": "page_limit", "pages": 5, "max_pages": 3})
-        msgs = [{"role": "user", "content": "Make the worksheet PDF."}]
+        msgs = [{"role": "user", "content": "Make the worksheet PDF, three pages at most."}]
         with mock.patch("qwen_chat.tools.run_streaming", return_value=(2, failure, "")):
             self._respond([
                 _reply({"tool_calls": [_call('{"spec_path":"quiz.json","path":"quiz.pdf"}',
@@ -199,6 +200,10 @@ class CutOffToolCallTest(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
         self.assertFalse((self.root / "quiz.pdf").exists())
         self.assertTrue(all(not m["_meta"]["ok"] for m in msgs if m["role"] == "tool"))
+        # The model's question stays, with what is still waiting for the user's decision.
+        self.assertIn("How would you like to revise it?", msgs[-1]["content"])
+        self.assertIn("Not done yet: create pdf `quiz.pdf`", msgs[-1]["content"])
+        self.assertNotIn("Task incomplete", msgs[-1]["content"])
 
     def test_oversized_worksheet_pauses_until_the_user_can_choose_a_split(self):
         self.box.commands = True
@@ -206,7 +211,8 @@ class CutOffToolCallTest(unittest.TestCase):
         source = self.root / "quiz.json"
         source.write_text('{"title":"Quiz","questions":[{"prompt":"Explain."}]}')
         original = source.read_bytes()
-        failure = json.dumps({"ok": False, "code": "page_limit", "pages": 12, "max_pages": 10})
+        failure = json.dumps({"ok": False, "code": "page_limit", "pages": MAX_PAGES + 1,
+                              "max_pages": MAX_PAGES})
         msgs = [{"role": "user", "content": "Make the worksheet PDF."}]
         with mock.patch("qwen_chat.tools.run_streaming", return_value=(2, failure, "")):
             self._respond([
@@ -218,7 +224,7 @@ class CutOffToolCallTest(unittest.TestCase):
             ], msgs)
         self.assertEqual(self.payloads[1]["tool_choice"], "none")
         self.assertEqual(source.read_bytes(), original)
-        self.assertIn("12 pages", self.box.input_required)
+        self.assertIn(f"{MAX_PAGES + 1} pages", self.box.input_required)
         msgs.append({"role": "user", "content": "Keep the draft for now. List the files."})
         self._respond([
             _reply({"tool_calls": [_call("{}", "c3", name="list_files")]}),
@@ -361,6 +367,24 @@ class HistoryRepairTest(unittest.TestCase):
         trimmed = fit_context(messages, 6500)
         self.assertEqual(trimmed[1]["content"], source)
         self.assertIn("to save context space", trimmed[2]["tool_calls"][0]["function"]["arguments"])
+
+    def test_newest_draft_of_each_file_outlasts_older_drafts_and_outputs(self):
+        write = lambda cid, text, **extra: {"role": "assistant", "content": "", "tool_calls": [
+            _call(json.dumps({"path": "sheet.json", "content": text * 400, **extra}), cid)]}
+        done = lambda cid: {"role": "tool", "tool_call_id": cid, "name": "write_file",
+                            "content": "Saved sheet.json"}
+        messages = [{"role": "user", "content": "Make the worksheet."},
+                    write("c1", "old draft "), done("c1"),
+                    {"role": "tool", "name": "list_files", "content": "listing " * 300},
+                    write("c2", "new draft "), done("c2"),
+                    write("c3", "more ", append=True), done("c3"),
+                    {"role": "tool", "name": "render_worksheet", "content": "Invalid: fix it."}]
+        trimmed = fit_context(messages, 8000)
+        args = lambda i: json.loads(trimmed[i]["tool_calls"][0]["function"]["arguments"])["content"]
+        self.assertIn("omitted here to save context space", args(1))  # superseded
+        self.assertEqual(trimmed[3]["content"], agent.OLD_TOOL_STUB)
+        # Without the current content, Qwen cannot fix the file and writes a note over it.
+        self.assertEqual((args(4), args(6)), ("new draft " * 400, "more " * 400))
 
     def test_skill_text_outlasts_stale_outputs_of_the_same_turn(self):
         skill = "Worksheet rules. " * 300

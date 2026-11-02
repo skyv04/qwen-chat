@@ -20,7 +20,9 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
 2. Make the content correct. A story may be invented, but its science, history and math
    must be true. Each multiple-choice question needs exactly one correct option. When a
    key is wanted, work out every answer first: do each sum, find the sentence that
-   proves each reading answer, and note the correct letter.
+   proves each reading answer, and note the correct letter. For a quiz made from an
+   existing PDF's questions, `read_file` the PDF first (it reads pictures of questions
+   by OCR) and copy those questions exactly; never invent replacements.
 3. For a look-only change (new theme, mascot, colors or a rainbow background), do not
    retype the worksheet. Call `render_worksheet` with its EXISTING `spec_path`, new PDF
    names, `answer_key_path` if it has a key, and a `theme` holding only what changes:
@@ -35,20 +37,26 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
    the header. A new mascot replaces the old animal and character icons.
 5. Write the JSON with write_file (it creates folders), with the answers in this first
    write. Keep each call under 8,000 characters; append more at item boundaries if
-   needed. Omit `max_pages` unless the user set a page limit. Student and key budgets
+   needed. Omit `max_pages` unless the user asked for a page count; a limit the user
+   never gave is left out, and the PDF gets the pages it needs. Student and key budgets
    are separate: three student pages plus a one-page key is `max_pages: 3` and
    `answer_key_max_pages: 1`.
 6. Call `render_worksheet(spec_path="homework/quiz.json", path="homework/quiz.pdf",
    answer_key_path="homework/quiz-key.pdf", expected_questions=5,
-   expected_multiple_choice=3)`. Take the counts from the user's request, not from the
-   draft. Leave out `answer_key_path` when no key is wanted. The three names must differ.
+   expected_multiple_choice=3)`. Pass a count only when the user stated it; a count the
+   user never gave is listed under "Not checked": fix it only if the user really asked
+   for that many. Leave out
+   `answer_key_path` when no key is wanted. The three names must differ. To add a key
+   later, call `render_answer_key` with this same JSON as `spec_path`; do not write a
+   separate key JSON for it.
 7. If it fails, the error names the exact field or value and lists every answer problem.
    Fix exactly those spots with edit_file, then render again. Do not rewrite the whole
    file to change one value, and never resubmit unchanged JSON: the same error three
    times stops the task.
-8. If a page limit is too tight, the tool asks the user to allow more pages. Do not
-   remove questions, shorten the reading or shrink writing space to avoid that. After a
-   failed page-limit run, render the saved JSON again. If the user says no, stop and ask.
+8. If the user's page limit is too tight, the tool asks the user to allow more pages. Do
+   not remove questions, shorten the reading or shrink writing space to avoid that.
+   After a failed page-limit run, render the saved JSON again. If the user says no,
+   stop and ask.
 9. Report the actual files and page counts. The checks are not a visual review: you
    cannot see the pages, so never claim you looked at them.
 

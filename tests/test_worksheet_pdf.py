@@ -241,6 +241,13 @@ class NormalizeSpecTest(unittest.TestCase):
                          "removed typed numbers from prompts (the PDF numbers questions)"):
             self.assertIn(expected, joined)
 
+    def test_a_missing_title_comes_from_the_file_name_even_with_a_text_theme(self):
+        data, notes = pdf.normalize_spec({"theme": "ocean waves",
+                                          "questions": [{"prompt": "What is 2+2?"}]},
+                                         "fractions-quiz_v2")
+        self.assertEqual(data["title"], "Fractions Quiz")
+        self.assertIn("'Fractions Quiz' (from the file name) was used", "; ".join(notes))
+
     def test_text_theme_loose_icons_answer_text_and_extra_fields_are_handled(self):
         # Shaped like a real Qwen draft that failed twice before anything rendered.
         draft = {"title": "Shopping math", "passage": "", "theme": "colorful",
@@ -340,6 +347,32 @@ class NormalizeSpecTest(unittest.TestCase):
                          f"theme.mascot {mermaid}"):
             self.assertIn(expected, joined)
 
+    def test_a_separate_answer_summary_and_words_in_the_theme_are_moved_where_they_belong(self):
+        # Shaped like Qwen's grade-1 drafts, each of which failed until it was retyped.
+        draft = {"theme": {"title": "Weekly Review", "subtitle": "Grade 1", "accent": "\U0001f34e",
+                           "margin_art": "apples"},
+                 "max_pages": "2",
+                 "questions": [{"prompt": "Which is bigger?", "options": ["5", "9"]},
+                               {"prompt": "2 + 3 = __"}],
+                 "answer_key": [{"question": 1, "choice": "B"}, {"question": 2, "answer": "5"}]}
+        data, notes = pdf.normalize_spec(draft, "weekly-review-v2")
+        self.assertEqual(data, {
+            "title": "Weekly Review", "subtitle": "Grade 1", "max_pages": 2,
+            "theme": {"icons": ["\U0001f34e"]},
+            "questions": [{"prompt": "Which is bigger?", "options": ["5", "9"], "choice": "B"},
+                          {"prompt": "2 + 3 = __", "answer": "5"}]})
+        self.assertEqual(worksheet_key(pdf.validate_spec(data))[1]["answers_checked"], 2)
+        joined = "; ".join(notes)
+        for expected in ("moved theme.title to the document's title",
+                         "theme.accent held emoji, so they were used as theme.icons",
+                         "read max_pages '2' as 2",
+                         "read the separate 'answer_key' summary into Question 1, Question 2"):
+            self.assertIn(expected, joined)
+        data, notes = pdf.normalize_spec({"questions": [{"prompt": "Q?"}]}, "space_explorer_quiz_v2")
+        self.assertEqual(data["title"], "Space Explorer Quiz")
+        self.assertIn("the title was missing, so 'Space Explorer Quiz' (from the file name) was used",
+                      "; ".join(notes))
+
 
 class AnswerKeySpecTest(unittest.TestCase):
     def compile(self, key):
@@ -371,6 +404,33 @@ class AnswerKeySpecTest(unittest.TestCase):
         for key, message in cases:
             with self.subTest(key=key), self.assertRaisesRegex(pdf.DesignError, message):
                 self.compile(key)
+
+    def test_harmless_key_draft_shapes_are_read_and_named(self):
+        # Shaped like Qwen's grade-4 key drafts: a title, a placeholder fingerprint, question
+        # numbers under another name and evidence joining two sentences in one string.
+        key = {"title": "Answer key", "source_path": "quiz.json", "source_sha256": "<sha256>",
+               "meta": {"subtitle": "Week 8", "theme": {"icons": ["🚀", "🌟"]}},
+               "max_pages": "1", "answers": [
+                   {"number": 1, "answer": "Compare recorded changes and explain their differences.",
+                    "evidence": "Observe the world carefully. Record what changes, and explain "
+                                "what stays the same."},
+                   {"number": 2, "choice": "A", "explanation": "Observing supplies evidence.",
+                    "evidence": "observe the world carefully"}]}
+        document, audit = self.compile(key)
+        text = "\n".join(pdf.source_texts(pdf.validate_spec(document)))
+        self.assertIn("Observe the world carefully. … Record what changes, and explain what stays "
+                      "the same.", text)
+        self.assertEqual(document["max_pages"], 1)
+        joined = "; ".join(audit["adjusted"])
+        for expected in ("ignored field 'title'", "ignored field 'meta'",
+                         "source_sha256 was a placeholder",
+                         "read field 'number' as 'question'",
+                         "quoted sentences from different places are joined with “…”"):
+            self.assertIn(expected, joined)
+        key["answers"][1]["evidence"] = "Observe the whole world very carefully every day."
+        with self.assertRaisesRegex(pdf.DesignError, "The closest source sentence is "
+                                                     "'Observe the world carefully.'"):
+            self.compile(key)
 
     def test_invalid_question_is_flagged_without_forcing_an_option(self):
         key = key_fixture()

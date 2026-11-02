@@ -200,19 +200,27 @@ such as `rainbow_fading: true`, are read too. If a failing draft retypes a works
 that already has a PDF beside it, the error points Qwen back to that worksheet and the
 `theme` argument.
 
-By default, the document uses as many pages as it needs, up to ten; there is no
-arbitrary three-page cap. Set `max_pages` only for a limit the user requested.
-If that limit is too small, Qwen Chat shows **Use N Pages** with the required count.
+By default, the document uses as many pages as it needs; there is no page cap, only a
+fifty-page safety stop. Page limits come from the user, not the model: `max_pages`
+counts only when the user's recent messages ask for a page count ("two pages", "the
+key on one page"). Each count goes to the part its own sentence names (the worksheet,
+the key or both), and a later "no page limit" replaces counts given before it. A limit
+Qwen adds on its own is left out with a note, so the PDF
+gets the pages it needs. If the user's limit is too small, Qwen Chat shows **Use N
+Pages** with the required count.
 Approval finishes the same export without rewriting the passage, removing questions,
 reducing answer lines or changing the source JSON. Refusing leaves any existing PDF
-untouched and blocks further tool calls in that reply. Documents beyond the ten-page
-limit pause for a decision on how to split them, rather than retrying or deleting content.
+untouched, blocks further tool calls in that reply and ends it with what is not done
+yet, so you can say how to proceed. Documents beyond fifty pages pause for a decision
+on how to split them, rather than retrying or deleting content.
 An older draft that failed its page limit can be retried with the same JSON.
 
 When a request specifies question counts, Qwen is instructed to pass
 `expected_questions` and/or `expected_multiple_choice` to `render_worksheet`.
 A mismatch is rejected before rendering: three multiple-choice questions means
-three separate questions with options. The report lists both the total and the
+three separate questions with options. A count the user never stated is not enforced;
+the result lists it under "Not checked" so Qwen can tell it apart from a real miss. The
+report lists both the total and the
 multiple-choice count; the optional bonus challenge is separate.
 
 Input and output paths stay in the workspace. Rendering follows the command-approval
@@ -240,7 +248,13 @@ On a sheet with no reading, such as a math page, there is nothing to quote: a re
 written as `evidence` is shown in the key as the explanation ("Why: …") and listed in
 the audit. With a reading, evidence must quote it exactly.
 
-`max_pages` and `answer_key_max_pages` keep the two page budgets separate.
+`max_pages` and `answer_key_max_pages` keep the two page budgets separate. A key can
+also be made later with `render_answer_key` on the same worksheet JSON: it uses the
+answers stored with the questions. Drafts written in nearby shapes are read with a
+note instead of failing: a separate `answer_key` summary is moved into its questions,
+a title or emoji placed inside `theme` is moved where it belongs, and swapped student
+and key file names are put back by their names. A restyle that changes nothing saves
+no copy.
 
 ### Answer keys for an existing quiz
 
@@ -248,13 +262,19 @@ Ask normally, or suggest `/answer-key Make a PDF answer key for practice/quiz.pd
 Qwen is instructed to reread the actual quiz using `read_quiz`, even in an old chat.
 The reader uses worksheet JSON, checks a matching JSON companion against the PDF,
 or extracts sequential numbered questions and lettered options from a text PDF.
-Scans and unclear numbering need OCR or a verified structured source; failures are
-reported rather than filled with invented questions.
+Failures are reported rather than filled with invented questions. `read_file` reads a
+PDF's text and, for pages whose questions are pictures (screenshots, scans), the words
+in those pictures by OCR, marked as such and cached. To make a new quiz from those
+questions, Qwen copies them exactly into worksheet JSON with each answer in its
+question and renders both PDFs from it.
 
 `render_answer_key` binds the key to the source hash, requires every question
 exactly once, copies prompts and selected option text from the quiz, and checks
 that evidence quotations occur in the source. Missing answers, fabricated quotes,
-invalid option letters and stale sources are rejected. Questions with no defensible
+invalid option letters and stale sources are rejected. Harmless differences are read
+with a note: a title or `meta` object, a placeholder hash, `number` instead of
+`question`, and evidence joining exact sentences from different places. A quote that
+is not in the source names the closest source sentence. Questions with no defensible
 choice can be flagged rather than assigned a forced answer. These are grounding and
 coverage checks, **not proof of semantic correctness**; review the explanations,
 especially if the quiz itself contains contradictions.
@@ -267,16 +287,22 @@ the desktop accepted the launch request, not whether a window was visibly displa
 Simple legacy `xdg-open file &` calls go through this checked opener too.
 
 An unresolved PDF render/open failure cannot end with an unqualified model-generated
-success message. On reaching the 20-tool-round limit, the app pauses explicitly and
+success message. On reaching the 30-tool-round limit, the app pauses explicitly and
 keeps completed steps; reply **continue** to resume. It does not ask a tool-less model
 to print pretend commands. A second identical tool error tells Qwen its last change
 didn't fix it; a third stops the reply with the error, instead of looping. Rewriting
-a file with identical content is reported as "Unchanged".
+a file with identical content is reported as "Unchanged". An edit whose `old_text`
+is not in the file changes nothing and shows the most similar text with its line
+number; it never guesses.
 
 When a chat outgrows the context window, older tool outputs and long file contents
-are replaced with bracketed notes that end in "to save context space". Writes and
+are replaced with bracketed notes that end in "to save context space". The newest
+draft of each file is kept whole as long as anything older can be shortened instead,
+so Qwen can still copy from it. Writes and
 edits refuse text containing such a note, so a copied note can never replace real
-content in a file. History is trimmed with room to spare and then only appended to,
+content in a file; refusing such a note for an existing file says that the file still
+holds its earlier content.
+History is trimmed with room to spare and then only appended to,
 so the server keeps its cached prompt instead of re-reading it every round. A file
 read again after any change is read afresh, never from an earlier result.
 

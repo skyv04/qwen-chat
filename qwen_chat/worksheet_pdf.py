@@ -20,7 +20,9 @@ import unicodedata
 
 DATA = Path(__file__).with_name("data")
 MAX_SPEC_BYTES = 160_000
-MAX_PAGES = 10
+# A sanity bound, not a design limit: smaller limits come only from the user, and a layout
+# that needs more pages than they set asks them before using more.
+MAX_PAGES = 50
 DEFAULT_ICONS = ["\U0001f4d6", "\U0001f50d", "\U0001f4a1", "\u2b50"]
 
 
@@ -177,10 +179,41 @@ DOCUMENT_FIELDS = frozenset({
 QUESTION_FIELDS = frozenset({"prompt", "label", "lines", "options", "icon", *KEY_FIELDS})
 _READING_ALIASES = ("passage", "story")
 _ICON_ALIASES = ("icons", "emoji", "emojis", "color_emoji")
-_QUESTION_ALIASES = {"question": "prompt", "text": "prompt", "choices": "options",
-                     "correct_answer": "answer"}
+_QUESTION_ALIASES = {"question": "prompt", "text": "prompt", "choices": "options"}
+# Answer-key fields under other names. An option letter given as the answer is resolved
+# against the options when the key is checked.
+_KEY_ALIASES = {
+    "correct_answer": "answer", "correct": "answer", "correct_option": "answer",
+    "correct_choice": "answer", "correct_letter": "answer", "answer_letter": "answer",
+    "answer_choice": "answer", "solution": "answer", "expected_answer": "answer",
+    "sample_answer": "answer", "model_answer": "answer", "example_answer": "answer",
+    "rationale": "explanation", "reason": "explanation", "reasoning": "explanation",
+    "why": "explanation", "explain": "explanation",
+    "quote": "evidence", "quotes": "evidence", "text_evidence": "evidence",
+    "evidence_quote": "evidence", "evidence_quotes": "evidence",
+    "supporting_evidence": "evidence", "citation": "evidence", "citations": "evidence",
+    "source_quote": "evidence"}
+# A separate answer summary next to the questions, which belongs inside each question.
+_SUMMARY_FIELDS = ("answer_key", "answers", "answer_sheet", "answerkey", "answer_keys", "key",
+                   "solutions", "correct_answers")
+_QUESTION_REF = re.compile(r"\s*(?:q(?:uestion)?|#|no\.?|number)?\s*[#_.-]?\s*(\d{1,2})\s*[.):]?\s*",
+                           re.I)
 _IGNORED_QUESTION_FIELDS = ("type", "kind", "id", "number", "points", "difficulty")
 _IGNORED_DOCUMENT_FIELDS = ("version", "schema_version", "id")
+# Text fields of the document that a draft sometimes puts inside theme.
+_TEXT_FIELDS = ("title", "subtitle", "series", "student_line", "meta", "instructions",
+                "reading_title", "reading_note", "question_title", "closing_note")
+_COLOR_NAMES = {
+    "red": "#C62828", "crimson": "#B71C1C", "maroon": "#800000", "scarlet": "#C62828",
+    "orange": "#E65100", "coral": "#D84315", "peach": "#E65100", "yellow": "#F9A825",
+    "gold": "#B8860B", "golden": "#B8860B", "amber": "#FF8F00", "green": "#2E7D32",
+    "emerald": "#047857", "mint": "#2E8B57", "lime": "#558B2F", "olive": "#6B6B00",
+    "forest": "#1B5E20", "teal": "#00796B", "turquoise": "#00838F", "aqua": "#00838F",
+    "cyan": "#00838F", "blue": "#1565C0", "sky": "#0277BD", "navy": "#1A237E",
+    "indigo": "#3949AB", "purple": "#6A1B9A", "violet": "#7B1FA2", "lavender": "#7E57C2",
+    "lilac": "#8E5BA8", "plum": "#6A1B9A", "magenta": "#AD1457", "fuchsia": "#AD1457",
+    "pink": "#C2185B", "rose": "#C2185B", "brown": "#6D4C41", "chocolate": "#6D4C41",
+    "gray": "#546E7A", "grey": "#546E7A", "silver": "#607D8B", "black": "#212121"}
 _PAGE_WORDS = {"page", "pages", "budget", "max", "maximum", "limit", "count", "total", "num",
                "number", "of", "student", "worksheet", "quiz", "answer", "key", "parent", "teacher"}
 # Field-name words that only describe looks. The theme draws the page, so an extra field
@@ -256,6 +289,173 @@ def _mascot(value: str) -> str | None:
     return None
 
 
+def _hex_color(value) -> str | None:
+    """#RRGGBB for an accent given as #abc, #RRGGBBAA, rgb(...), bare hex digits or a common
+    color name; None when it is not a color."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})(?:[0-9a-fA-F]{2})?", text)
+    if m and (text.startswith("#") or re.search(r"\d", text)):
+        return "#" + m[1].upper()
+    m = re.fullmatch(r"#([0-9a-fA-F])([0-9a-fA-F])([0-9a-fA-F])", text)
+    if m:
+        return "#" + "".join(c * 2 for c in m.groups()).upper()
+    m = re.fullmatch(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*[\d.]+%?\s*)?\)",
+                     text, re.I)
+    if m and all(int(v) <= 255 for v in m.groups()):
+        return "#" + "".join(f"{int(v):02X}" for v in m.groups())
+    words = re.findall(r"[a-z]+", text.casefold())
+    return next((_COLOR_NAMES[w] for w in reversed(words) if w in _COLOR_NAMES), None)
+
+
+def _title_from_name(name: str) -> str:
+    """A title from a file name: unicorn-math_adventure_v2 -> Unicorn Math Adventure."""
+    words = [w for w in re.split(r"[\W_]+", name or "") if w]
+    while words and re.fullmatch(r"v?\d+|draft|final|spec|copy|tmp|temp|json|data", words[-1], re.I):
+        words.pop()
+    return " ".join(w[:1].upper() + w[1:] for w in words)[:160].strip()
+
+
+def _question_number(value, count: int) -> int | None:
+    """1-based question number from 3, "3", "q3" or "Question 3"; None otherwise."""
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str) and (m := _QUESTION_REF.fullmatch(value)):
+        number = int(m[1])
+    else:
+        return None
+    return number if 1 <= number <= count else None
+
+
+def _key_fields(item: dict, note, where: str = "", options: bool | None = None) -> dict:
+    """Moves answer-key fields given under other names (correct, rationale, quotes, ...) to
+    choice, answer, explanation and evidence. A value that contradicts the field it would
+    fill is left in place, so validation reports it."""
+    item = dict(item)
+    if options is None:
+        options = bool(item.get("options"))
+    for alias, field in _KEY_ALIASES.items():
+        if alias not in item:
+            continue
+        value, current = item[alias], item.get(field)
+        if field == "answer" and (isinstance(value, bool) or not isinstance(value, (str, int, float))
+                                  or (options and not isinstance(value, str))):
+            continue  # an option number or a flag: ambiguous, so validation reports it
+        if _empty(current):
+            item[field] = item.pop(alias)
+            note(f"read question field '{alias}' as '{field}'", where)
+        elif _empty(value) or str(value).strip().casefold() == str(current).strip().casefold():
+            del item[alias]
+            note(f"ignored question field '{alias}' (same as '{field}')", where)
+        elif (field == "answer" and options and isinstance(value, str)
+              and _LETTER_ONLY.fullmatch(value) and _empty(item.get("choice"))):
+            item["choice"] = item.pop(alias)
+            note(f"read question field '{alias}' as 'choice'", where)
+        elif field == "evidence":
+            quotes = [q for v in (current, item.pop(alias)) for q in (v if isinstance(v, list) else [v])]
+            item["evidence"] = list(dict.fromkeys(q for q in quotes if not _empty(q)))
+            note(f"added question field '{alias}' to 'evidence'", where)
+        elif field == "explanation" and isinstance(value, str) and isinstance(current, str):
+            item["explanation"] = current.rstrip() + (" " if current.rstrip()[-1:] in ".!?" else ". ") \
+                + item.pop(alias).strip()
+            note(f"added question field '{alias}' to 'explanation'", where)
+    return item
+
+
+def _summary_answers(summary, questions: list[dict]) -> dict[int, object] | None:
+    """{0-based question index: answer or key fields} from a separate answer summary, or None
+    when it can't be matched to the questions reliably."""
+    count = len(questions)
+    found: dict[int, object] = {}
+    if isinstance(summary, dict):
+        mc = [i for i, q in enumerate(questions) if q.get("options")]
+        written = [i for i, q in enumerate(questions) if not q.get("options")]
+        for field, value in summary.items():
+            number = _question_number(field, count)
+            words = set(re.findall(r"[a-z]+", str(field).casefold()))
+            if number:
+                found[number - 1] = value
+            elif field in ("title", "name", "subtitle", "note", "notes", "instructions") \
+                    and isinstance(value, str):
+                continue
+            elif isinstance(value, dict) and value and all(_question_number(k, count) for k in value):
+                found.update({_question_number(k, count) - 1: v for k, v in value.items()})
+            elif isinstance(value, list) and words & {"choice", "multiple", "mc", "mcq"} \
+                    and len(value) == len(mc):
+                found.update(zip(mc, value))
+            elif isinstance(value, list) and words & {"written", "short", "open", "response",
+                                                     "responses", "text"} \
+                    and len(value) == len(written):
+                found.update(zip(written, value))
+            elif not _empty(value):
+                return None
+        return found or None
+    if not isinstance(summary, list) or not summary:
+        return None
+    refs = [next((_question_number(v.get(k), count) for k in ("question", "number", "q", "id",
+                                                              "question_number", "num")
+                  if k in v), None) if isinstance(v, dict) else None for v in summary]
+    if all(refs) and len(set(refs)) == len(refs):
+        for ref, value in zip(refs, summary):
+            found[ref - 1] = {k: v for k, v in value.items()
+                              if k not in ("question", "number", "q", "id", "question_number", "num")}
+        return found
+    if not any(refs) and len(summary) == count:
+        return dict(enumerate(summary))
+    return None
+
+
+def _merge_summary(data: dict, note) -> None:
+    """A top-level answer summary (answer_key, answers, ...) next to the questions: its answers
+    fill questions that lack one; the questions' own answers are kept."""
+    questions = data.get("questions")
+    fields = [k for k in _SUMMARY_FIELDS if k in data]
+    if (not fields or not isinstance(questions, list) or not questions
+            or not all(isinstance(q, dict) for q in questions)
+            or data.keys() & {"source_path", "source_sha256"}):
+        return
+    for field in fields:
+        summary = data.pop(field)
+        missing = [i for i, q in enumerate(questions)
+                   if _empty(q.get("choice")) and _empty(q.get("answer"))]
+        if _empty(summary):
+            note(f"ignored an empty '{field}'")
+            continue
+        if not missing:
+            note(f"ignored the separate '{field}' summary (every question already has its "
+                 "answer; answers belong inside each question)")
+            continue
+        found = _summary_answers(summary, questions)
+        if found is None:
+            note(f"ignored the separate '{field}' summary: it could not be matched to the "
+                 "questions (put each answer inside its question as choice or answer)")
+            continue
+        filled = []
+        for i in missing:
+            value = found.get(i)
+            if _empty(value):
+                continue
+            q = questions[i]
+            if isinstance(value, dict):
+                value = _key_fields(value, lambda *_: None, options=bool(q.get("options")))
+                extra = {k: v for k, v in value.items() if k in KEY_FIELDS and _empty(q.get(k))}
+                if not extra:
+                    continue
+                q.update(extra)
+            elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                q["answer"] = value
+            else:
+                continue
+            filled.append(f"Question {i + 1}")
+        if filled:
+            note(f"read the separate '{field}' summary into {', '.join(filled[:6])}"
+                 f"{', …' if len(filled) > 6 else ''} (answers belong inside each question)")
+        else:
+            note(f"ignored the separate '{field}' summary (it had no answers for the questions "
+                 "that lack one)")
+
+
 def _normalize_theme(theme: dict, note) -> dict:
     theme = dict(theme)
     for alias, field in _THEME_ALIASES.items():
@@ -271,6 +471,10 @@ def _normalize_theme(theme: dict, note) -> dict:
         elif _top_extra(field, value):
             del theme[field]
             note(f"ignored theme field '{field}' ({_top_extra(field, value)})")
+        else:
+            del theme[field]
+            note(f"ignored theme field '{field}' (the theme only sets the look; put words in "
+                 "the title, subtitle or instructions)")
     motif = theme.get("motif")
     if isinstance(motif, str) and motif not in MOTIFS:
         words = re.findall(r"[a-z]+", motif.casefold())
@@ -307,6 +511,24 @@ def _normalize_theme(theme: dict, note) -> dict:
             theme["mascot"] = emoji
             note(f"theme.mascot '{mascot}' was drawn as {emoji}")
     accent = theme.get("accent")
+    if "accent" in theme and not (isinstance(accent, str)
+                                  and re.fullmatch(r"#[0-9a-fA-F]{6}", accent)):
+        color = _hex_color(accent)
+        emoji = (_emoji_clusters("".join(accent.split()))
+                 if isinstance(accent, str) and accent.strip() else None)
+        if color:
+            theme["accent"] = color
+            note(f"theme.accent {accent!r} was read as {color}")
+        else:
+            del theme["accent"]
+            if emoji and _empty(theme.get("icons")):
+                theme["icons"] = emoji[:6]
+                note("theme.accent held emoji, so they were used as theme.icons and the "
+                     "default accent color was used (accent is a #RRGGBB color)")
+            else:
+                note(f"theme.accent {accent!r} is not a color, so the default was used "
+                     "(accent is a #RRGGBB color)")
+    accent = theme.get("accent")
     if isinstance(accent, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", accent) \
             and _contrast(accent) < 4.5:
         theme["accent"] = _darken(accent)
@@ -329,11 +551,12 @@ def restyle_theme(old, change: dict) -> tuple[dict, list[str]]:
     return theme, notes
 
 
-def normalize_spec(value) -> tuple[dict, list[str]]:
+def normalize_spec(value, name: str = "") -> tuple[dict, list[str]]:
     """Fixes common near-misses in a drafted worksheet (renamed fields, a theme given as text,
     top-level icons, empty or look-only extra fields, an unavailable motif, a pale accent,
-    hand-typed numbering) and says what changed, so they don't each cost a rewrite and
-    another render. Anything else is left for validate_spec to report."""
+    hand-typed numbering, a separate answer summary, a missing title) and says what changed,
+    so they don't each cost a rewrite and another render. `name` is the JSON file's name,
+    used for a missing title. Anything else is left for validate_spec to report."""
     if not isinstance(value, dict):
         return value, []
     found: dict[str, list[str]] = {}
@@ -350,17 +573,37 @@ def normalize_spec(value) -> tuple[dict, list[str]]:
             note(f"read '{alias}' as 'reading'")
     if isinstance(data.get("reading"), str):
         data["reading"] = [p.strip() for p in re.split(r"\n\s*\n", data["reading"]) if p.strip()]
+    reading = data.get("reading")
+    if isinstance(reading, list):
+        kept, heading, dropped = [], None, 0
+        for p in reading:
+            if _empty(p) or (isinstance(p, dict) and set(p) <= {"text", "heading"}
+                             and _empty(p.get("text"))):
+                dropped += 1
+                if isinstance(p, dict) and isinstance(p.get("heading"), str) and p["heading"].strip():
+                    heading = p["heading"]  # a heading on its own leads the next paragraph
+                continue
+            if heading is not None:
+                if isinstance(p, str):
+                    p = {"text": p, "heading": heading}
+                elif isinstance(p, dict) and _empty(p.get("heading")):
+                    p = {**p, "heading": heading}
+                heading = None
+            kept.append(p)
+        if dropped:
+            data["reading"] = kept
+            note(f"removed {dropped} empty reading paragraph{'s' if dropped > 1 else ''}")
     theme = data.get("theme")
     if isinstance(theme, str):
-        name = " ".join(theme.split())
-        if name.casefold() in MOTIFS:
-            data["theme"] = {"motif": name.casefold()}
+        label = " ".join(theme.split())
+        if label.casefold() in MOTIFS:
+            data["theme"] = {"motif": label.casefold()}
             note(f"theme was text, so it was used as theme.motif ({THEME_FORMAT})")
-        elif name:
-            name = name[:1].upper() + name[1:]
-            if len(name) > 36:
-                name = name[:36].rsplit(" ", 1)[0].strip() or name[:36]
-            data["theme"] = {"name": name}
+        elif label:
+            label = label[:1].upper() + label[1:]
+            if len(label) > 36:
+                label = label[:36].rsplit(" ", 1)[0].strip() or label[:36]
+            data["theme"] = {"name": label}
             note(f"theme was text, so it was used as theme.name ({THEME_FORMAT})")
         else:
             del data["theme"]
@@ -407,8 +650,46 @@ def normalize_spec(value) -> tuple[dict, list[str]]:
         elif _top_extra(field, value):
             del data[field]
             note(f"ignored field '{field}' ({_top_extra(field, value)})")
+    for field in ("max_pages", "answer_key_max_pages"):
+        if field not in data:
+            continue
+        value = data[field]
+        number = (value if type(value) is int else
+                  int(value.strip()) if isinstance(value, str) and value.strip().isdigit() else
+                  int(value) if isinstance(value, float) and value.is_integer() else None)
+        if number is not None and 1 <= number <= MAX_PAGES:
+            if type(value) is not int:
+                data[field] = number
+                note(f"read {field} {value!r} as {number}")
+        else:
+            del data[field]
+            note(f"ignored {field} {value!r} (a page limit is a whole number from 1 to {MAX_PAGES})")
+    theme = data.get("theme")
+    if isinstance(theme, dict) and theme.keys() & set(_TEXT_FIELDS):
+        theme = data["theme"] = dict(theme)
+        for field in _TEXT_FIELDS:
+            if field not in theme:
+                continue
+            text = theme.pop(field)
+            if not _empty(data.get(field)):
+                note(f"ignored theme.{field} ({field} is already set)")
+            elif not _empty(text):
+                data[field] = text
+                note(f"moved theme.{field} to the document's {field}")
     if isinstance(data.get("theme"), dict):
         data["theme"] = _normalize_theme(data["theme"], note)
+    title = data.get("title")
+    if title is None or (isinstance(title, str) and not title.strip()):
+        theme_name = (data["theme"].get("name") if isinstance(data.get("theme"), dict) else None)
+        if _title_from_name(name):
+            data["title"] = _title_from_name(name)
+            how = "from the file name"
+        elif isinstance(theme_name, str) and theme_name.strip():
+            data["title"] = theme_name.strip()[:160]
+            how = "the theme name"
+        else:
+            data["title"], how = "Worksheet", "a default"
+        note(f"the title was missing, so {data['title']!r} ({how}) was used; set title to change it")
 
     def question(item, where: str):
         if not isinstance(item, dict):
@@ -418,6 +699,7 @@ def normalize_spec(value) -> tuple[dict, list[str]]:
             if alias in item and field not in item:
                 item[field] = item.pop(alias)
                 note(f"read question field '{alias}' as '{field}'", where)
+        item = _key_fields(item, note, where)
         for field in _IGNORED_QUESTION_FIELDS:
             if field in item:
                 del item[field]
@@ -476,6 +758,7 @@ def normalize_spec(value) -> tuple[dict, list[str]]:
         data["questions"] = questions
     if "challenge" in data:
         data["challenge"] = question(data["challenge"], "challenge")
+    _merge_summary(data, note)
     notes = []
     for text, places in found.items():
         places = list(dict.fromkeys(places))

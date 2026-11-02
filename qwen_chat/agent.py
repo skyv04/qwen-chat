@@ -9,11 +9,12 @@ import time
 import traceback
 from typing import Protocol
 
-from .history import NOTE_HEAD, NOTE_SEP, context_note
+from .history import NOTE_HEAD, NOTE_SEP, context_note, user_text
 from .llm import Cancelled, ChatStream, LLMError, ServerManager
-from .tools import ToolBox, ToolError
+from .tools import CONTEXT_MARKER, ToolBox, ToolError
 
-MAX_TOOL_ROUNDS = 20
+MAX_TOOL_ROUNDS = 30
+REQUEST_TURNS = 4          # the latest user messages that set page limits and counts
 REPEAT_LIMIT = 3           # the same tool error this many times ends the turn
 MAX_OUT_TOKENS = 4096      # per reply, tool call arguments included
 CALL_CHARS = 8000          # what the model is told one tool call may hold (well under the cap)
@@ -128,7 +129,9 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "install, don't try a workaround: stop and ask what they'd like instead. You can't see "
             "images: when a task depends on what images show (text, page or question numbers, "
             "order), read them first with OCR (`tesseract IMAGE -`; install tesseract-ocr "
-            "if it's missing). Never guess the order or contents from file names. Commands get "
+            "if it's missing). For a PDF, read_file already reads the words in its pictures "
+            "with OCR; tesseract cannot open a PDF. Never guess the order or contents from file "
+            "names. Commands get "
             "no keyboard input, so use non-interactive options, and keep files in the workspace. "
             "For a long script, save it with write_file, then run it with run_command; keep it "
             "short by using loops, lists and helper functions instead of repeating code.")
@@ -137,13 +140,15 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "Before creating or restyling a PDF worksheet, quiz, reading-comprehension test or "
             "activity sheet, call load_skill with name 'worksheet-pdf'. Follow that skill and "
             "use render_worksheet with a JSON content/theme file, not an improvised PDF script. "
-            "Pass expected_questions and expected_multiple_choice from the user's requested "
-            "counts when given. If the user sets a page limit, put it in max_pages; otherwise "
-            "omit max_pages. "
+            "Pass expected_questions and expected_multiple_choice only for counts the user "
+            "stated. Set max_pages only when the user asks for a page count; otherwise omit it "
+            "and the PDF gets the pages it needs. "
             "For a NEW worksheet or quiz that also needs a parent/teacher answer key, put each "
             "question's answer in the same JSON (choice letter for multiple choice, answer for "
             "written questions, evidence quotes from the reading) and create BOTH PDFs with one "
-            "render_worksheet call that passes answer_key_path. It checks every answer, keeps "
+            "render_worksheet call that passes answer_key_path. This includes a new quiz made "
+            "from the questions of an existing PDF: read_file the PDF and copy its questions "
+            "exactly. It checks every answer, keeps "
             "answers off the student PDF and makes the key in the same theme. Keep student and "
             "answer-key budgets separate: 'three student pages plus one parent page' means "
             "max_pages=3 and answer_key_max_pages=1, not four student pages. A page-limit "
@@ -261,6 +266,29 @@ def _shrink_call(call: dict) -> bool:
     return changed
 
 
+def _newest_drafts(msgs: list[dict]) -> set[int]:
+    """ids of the calls holding the newest content of each file written in `msgs`: its last
+    write and the appends after it. The model may still need that content to fix the file."""
+    newest: dict[str, list[int]] = {}
+    for m in msgs:
+        for call in m.get("tool_calls") or []:
+            if call["function"].get("name") != "write_file":
+                continue
+            try:
+                args = json.loads(call["function"]["arguments"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (not isinstance(args, dict) or not isinstance(args.get("path"), str)
+                    or not isinstance(args.get("content"), str)
+                    or CONTEXT_MARKER.search(args["content"])):  # refused: nothing was saved
+                continue
+            if args.get("append") is True:
+                newest.setdefault(args["path"], []).append(id(call))
+            else:
+                newest[args["path"]] = [id(call)]
+    return {i for ids in newest.values() for i in ids}
+
+
 def _stub(m: dict) -> None:
     m["content"] = SKILL_STUB if m.get("name") == "load_skill" else OLD_TOOL_STUB
 
@@ -274,9 +302,9 @@ def _cut(m: dict, limit: int) -> None:
 def fit_context(messages: list[dict], budget_chars: int, target_chars: int | None = None) -> list[dict]:
     """Shrinks history to fit: first repeated and old tool outputs and arguments, then earlier
     turns down to their request and final answer (the last few are kept, so a follow-up still
-    shows what it follows), then the current turn's drafts and older outputs, keeping skill
-    text and quiz sources as long as possible. Above the budget it shrinks to target_chars,
-    leaving room to append."""
+    shows what it follows), then the current turn's superseded drafts and older outputs, then
+    the newest content of each file it wrote, keeping skill text and quiz sources as long as
+    possible. Above the budget it shrinks to target_chars, leaving room to append."""
     msgs = copy.deepcopy(messages)
     total = lambda: sum(_size(m) for m in msgs)
     if total() <= budget_chars:
@@ -327,11 +355,13 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
         for m in msgs[start:end]:
             _cut(m, TURN_USER_CHARS if m["role"] == "user" else TURN_REPLY_CHARS)
     last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=0)
+    drafts = _newest_drafts(msgs[last_user:])
     for m in msgs[last_user:]:
         if total() <= goal:
             break
         for call in m.get("tool_calls") or []:
-            _shrink_call(call)
+            if id(call) not in drafts:
+                _shrink_call(call)
     # Then this turn's older outputs (stale file listings, superseded errors), oldest first.
     for m in msgs[last_user:-4]:
         if total() <= goal:
@@ -339,6 +369,13 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
         if (m["role"] == "tool" and m.get("name") not in ("read_quiz", "load_skill")
                 and len(m.get("content") or "") > len(OLD_TOOL_STUB)):
             _stub(m)
+    # The newest content of each file goes last: without it the model cannot fix that file
+    # and tends to write a placeholder over it.
+    for m in msgs[last_user:]:
+        if total() <= goal:
+            break
+        for call in m.get("tool_calls") or []:
+            _shrink_call(call)
     while total() > goal and len(earlier_turns()) > 1:
         drop_oldest()
     # Last resort: cut the biggest output, but only as far as needed. A skill is cut before a
@@ -461,6 +498,8 @@ class Agent:
         self.toolbox.status = events.status
         self.toolbox.declined = False
         self.toolbox.input_required = ""
+        # Page limits and question counts are checked against what the user actually asked.
+        self.toolbox.request_text = user_text(messages, last=REQUEST_TURNS)
         self._add_context_note(messages)
         seen: dict[str, str] = {}
         tools = self.toolbox.schemas()
@@ -481,6 +520,12 @@ class Agent:
                                for (action, error), paths in grouped.items())
             return ("**Task incomplete.** The following operations did not succeed; "
                     "do not treat their drafts as finished or opened PDFs.\n\n" + detail)
+
+        def waiting(text: str) -> str:
+            """The reply after the user said no or must choose: the model's question stays."""
+            items = sorted({f"{action.lower()} `{path}`" for action, path in failed_outputs})
+            return ((text or "").strip() + "\n\n*Not done yet: " + "; ".join(items)
+                    + ". Tell me how you'd like to proceed.*").strip()
 
         def stop(text: str) -> None:
             msg = {"role": "assistant", "content": text, "_meta": {"time": time.time()}}
@@ -544,7 +589,9 @@ class Agent:
             if cut_off and not msg.get("tool_calls"):
                 msg["content"] = (msg.get("content") or "") + "\n\n*[Stopped: reached the response length limit.]*"
             if not msg.get("tool_calls") and failed_outputs:
-                msg["content"] = incomplete()
+                msg["content"] = (waiting(msg.get("content") or "")
+                                  if self.toolbox.declined or self.toolbox.input_required
+                                  else incomplete())
             if guard_final:
                 events.content(msg.get("content") or "")
             # Broken arguments (usually a call cut off by the length limit) must not be stored:

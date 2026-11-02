@@ -180,6 +180,81 @@ class WorkspaceSandboxTest(unittest.TestCase):
         ok, out = self.run_tool("write_file", path="ok.txt", content="Use [brackets] to save space.")
         self.assertTrue(ok, out)
 
+    def test_a_missed_edit_shows_the_closest_text_and_never_guesses(self):
+        f = self.ws.root / "quiz.json"
+        good = '{\n  "questions": [\n    {"prompt": "Why did the crew feel a sense of wonder?"}\n  ]\n}\n'
+        f.write_text(good)
+        # Qwen retyped the line with the number the PDF shows in front of it.
+        ok, out = self.run_tool("edit_file", path="quiz.json",
+                                old_text='{"prompt": "8. Why did the crew feel a sense of wonder?"}',
+                                new_text='{"prompt": "Why?"}')
+        self.assertFalse(ok)
+        self.assertIn('Nothing was changed. The most similar text is at line 3:\n'
+                      '{"prompt": "Why did the crew feel a sense of wonder?"}\n', out)
+        note = "[12,000 characters omitted here to save context space]"
+        ok, out = self.run_tool("edit_file", path="quiz.json", old_text=note, new_text="x")
+        self.assertFalse(ok)
+        self.assertIn("a note from shortened chat history, not text in the file", out)
+        # Rewriting a file with the note that replaced it in history would erase it.
+        ok, out = self.run_tool("write_file", path="quiz.json", content=note)
+        self.assertFalse(ok)
+        self.assertIn("Nothing was saved, and nothing needs to be: quiz.json still holds the "
+                      "content written earlier", out)
+        self.assertEqual(f.read_text(), good)
+        # A long near miss points to the line to read instead of pasting a huge chunk.
+        lines = [f'  {{"prompt": "What did the crew see on day {i} of the moon trip?"}},'
+                 for i in range(40)]
+        (self.ws.root / "long.json").write_text("[\n" + "\n".join(lines) + "\n]\n")
+        wanted = lines[5:35]
+        wanted[10] = wanted[10].replace("crew", "team")
+        ok, out = self.run_tool("edit_file", path="long.json", old_text="\n".join(wanted),
+                                new_text="x")
+        self.assertFalse(ok)
+        self.assertIn("The most similar text starts at line 7:", out)
+        self.assertIn("call read_file with start_line 7", out)
+
+
+class RequestWordsTest(unittest.TestCase):
+    def test_page_limits_and_counts_come_from_the_users_words(self):
+        for text, want in (
+                ("make a quiz from the attached pdf", None),
+                ("make a 2-page worksheet and an answer key", {"student": 2}),
+                ("answer key on one page please", {"key": 1}),
+                ("the worksheet should be 3 pages and the key 1 page", {"student": 3, "key": 1}),
+                ("make it fit on two pages", {"any": 2}),
+                ("no more than 3 pages", {"any": 3}),
+                ("at least 3 pages", {}),
+                ("no hard page limit needed", {"unlimited": True}),
+                ("why did it fail on page count", {}),
+                # A count goes to what its own clause names.
+                ("make a worksheet with an answer key, max 2 pages", {"any": 2}),
+                ("create a reading quiz with answer key. keep it to 2 pages", {"any": 2}),
+                ("make a worksheet and answer key and keep it under 2 pages", {"any": 2}),
+                ("the answer key needs to be at most 1 page", {"key": 1}),
+                # A later "no page limit" replaces earlier counts, not the ones after it.
+                ("make a two-page worksheet\nactually, remove the page limit", {"unlimited": True}),
+                ("no hard page limit needed, but the key on one page", {"key": 1, "unlimited": True})):
+            with self.subTest(text=text):
+                got = tools.requested_pages(text)
+                self.assertEqual(got, None if want is None else {
+                    "student": None, "key": None, "any": None, "unlimited": False, **want})
+        for text, expected, words, asked in (
+                ("ten questions, all multiple choice", 10, tools._QUESTION_WORDS, True),
+                ("3 multiple choice and 2 short answer questions", 5, tools._QUESTION_WORDS, True),
+                ("3 multiple choice and 2 short answer questions", 3, tools._CHOICE_WORDS, True),
+                ("make a quiz from the attached pdf", 10, tools._QUESTION_WORDS, False),
+                ("five questions with 4 choices each", 4, tools._QUESTION_WORDS, False),
+                ("five questions with 4 choices each", 4, tools._CHOICE_WORDS, False),
+                ("we continued unit 2 story problems", 2, tools._QUESTION_WORDS, False),
+                ("a 5 question quiz for grade 4", 5, tools._QUESTION_WORDS, True),
+                ("a 5 question quiz for grade 4", 4, tools._QUESTION_WORDS, False),
+                ("make 5 fill-in-the-blank questions", 5, tools._QUESTION_WORDS, True),
+                ("3 multiple choice and 2 short answer", 5, tools._QUESTION_WORDS, True),
+                ("fix question 5 please", 5, tools._QUESTION_WORDS, False),
+                ("make it 2 pages with 10 questions", 2, tools._QUESTION_WORDS, False)):
+            with self.subTest(text=text, expected=expected):
+                self.assertEqual(tools.count_requested(text, expected, words), asked)
+
 
 class WebGuardTest(unittest.TestCase):
     def test_blocks_local_and_non_http(self):
@@ -737,6 +812,113 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn(note, text)
         self.assertEqual((self.ws.root / "harvest.json").read_text(), raw)
 
+    def test_page_limits_and_counts_follow_what_the_user_asked(self):
+        data = self._homework_spec()
+        source = self.ws.root / "moon.json"
+        source.write_text(json.dumps({**data, "max_pages": 1, "answer_key_max_pages": 1}))
+        before = source.read_bytes()
+        staged = []
+
+        def render(argv, *_args):
+            staged.append(json.loads(Path(argv[-2]).read_text()))
+            return self._render_ok(argv)
+
+        job = dict(spec_path="moon.json", path="moon.pdf", answer_key_path="moon-key.pdf",
+                   expected_questions=10, expected_multiple_choice=5)
+        # Limits and counts the model made up are not the user's: no page prompt, no failure.
+        self.box.request_text = "make a moon quiz with an answer key"
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", **job)
+        self.assertTrue(ok, text)
+        self.assertEqual([s.get("max_pages") for s in staged], [None, None])
+        for note in ("left out max_pages 1: the user did not ask for a page limit",
+                     "left out answer_key_max_pages 1"):
+            self.assertIn(note, text)
+        self.assertIn("\nNot checked, because the user's recent messages do not ask for that many: "
+                      "expected_questions 10 (the worksheet has 2); expected_multiple_choice 5 "
+                      "(the worksheet has 1). If the user did ask for it", text)
+        self.assertEqual(source.read_bytes(), before)
+        # The user's own page counts replace the draft's.
+        staged.clear()
+        self.box.request_text = "make it two pages, with a one page answer key"
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", **{**job, "path": "moon2.pdf",
+                                                             "answer_key_path": "moon2-key.pdf"})
+        self.assertTrue(ok, text)
+        self.assertEqual([s.get("max_pages") for s in staged], [2, 1])
+        self.assertIn("max_pages is 2, the page count the user asked for", text)
+        # A count the user stated is still enforced.
+        self.box.request_text = "make 3 questions"
+        with mock.patch.object(tools, "run_streaming") as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon3.pdf",
+                                     expected_questions=3)
+        self.assertFalse(ok)
+        self.assertIn("needs 3 questions, but the saved worksheet has 2", text)
+        run.assert_not_called()
+        # A count the user gave for the whole request keeps the draft's key limit that matches
+        # it (asking beats dropping), but not one that differs.
+        for key_pages, want in ((2, [2, 2]), (1, [2, None])):
+            staged.clear()
+            source.write_text(json.dumps({**data, "max_pages": 2, "answer_key_max_pages": key_pages}))
+            self.box.request_text = "make a worksheet with an answer key, max 2 pages"
+            with mock.patch.object(tools, "run_streaming", side_effect=render):
+                ok, text = self.run_tool("render_worksheet", **{**job, "path": f"moon{key_pages}x.pdf",
+                                                                 "answer_key_path": f"moon{key_pages}x-key.pdf"})
+            self.assertTrue(ok, text)
+            self.assertEqual([s.get("max_pages") for s in staged], want)
+
+    def test_answers_go_to_the_file_named_as_the_key(self):
+        self._homework_spec()
+
+        def render(argv, *_args):
+            answers = "Answer:" in Path(argv[-2]).read_text()
+            result = self._render_ok(argv)
+            Path(argv[-1]).write_bytes(b"%PDF-1.7\n" + (b"key" if answers else b"student"))
+            return result
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json",
+                                     path="moon-answer-key.pdf", answer_key_path="moon.pdf")
+            self.assertTrue(ok, text)
+            self.assertIn("the answers went to moon-answer-key.pdf and the student copy to "
+                          "moon.pdf, as their names say", text)
+            self.assertEqual((self.ws.root / "moon-answer-key.pdf").read_bytes(), b"%PDF-1.7\nkey")
+            self.assertEqual((self.ws.root / "moon.pdf").read_bytes(), b"%PDF-1.7\nstudent")
+            # A worksheet JSON holds its own answers, so render_answer_key makes its key too.
+            ok, text = self.run_tool("render_answer_key", spec_path="moon.json", path="moon.pdf")
+            self.assertFalse(ok)
+            self.assertIn("is the worksheet's own PDF name", text)
+            ok, text = self.run_tool("render_answer_key", spec_path="moon.json",
+                                     path="moon-teacher.pdf")
+            self.assertTrue(ok, text)
+            self.assertIn("Made from the answers stored with the questions in moon.json.", text)
+            self.assertEqual((self.ws.root / "moon-teacher.pdf").read_bytes(), b"%PDF-1.7\nkey")
+
+    def test_pdf_pictures_are_read_with_ocr_once_and_marked(self):
+        (self.ws.root / "boost.pdf").write_bytes(b"%PDF-1.4 email with pasted screenshots")
+        ran = []
+
+        def ocr(argv, *_args):
+            ran.append(argv[0])
+            if argv[0] == "pdftoppm":
+                Path(argv[-1] + ".png").write_bytes(b"png")
+            else:
+                Path(argv[2] + ".txt").write_text("Featured this week\nMultiply:\n2 x 20 = __\n|~\n")
+            return 0, "", ""
+
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp.name}), \
+                mock.patch.object(tools, "_pdftotext", return_value="Featured this week\n\f"), \
+                mock.patch.object(tools, "_picture_pages", return_value={1}), \
+                mock.patch.object(tools.shutil, "which", return_value="/usr/bin/found"), \
+                mock.patch.object(tools, "run_streaming", side_effect=ocr):
+            for _ in range(2):
+                ok, text = self.run_tool("read_file", path="boost.pdf")
+                self.assertTrue(ok, text)
+                self.assertIn("[Page 1]\nFeatured this week\n[Page 1 pictures, read by OCR; may "
+                              "contain errors]\nMultiply:\n2 x 20 = __", text)
+                self.assertNotIn("|~", text)
+        self.assertEqual(ran, ["pdftoppm", "tesseract"])  # the second read came from the cache
+
     def test_a_look_change_keeps_the_content_and_saves_the_restyled_json(self):
         data = self._homework_spec()
         data["theme"] = {"name": "Moon trip", "motif": "stars", "icons": ["\U0001f98a", "\U0001f680"]}
@@ -802,6 +984,19 @@ class ProgramToolsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("evidence is not in the source", text)
         self.assertNotIn("retypes", text)
+
+    def test_a_look_change_that_changes_nothing_saves_no_copy(self):
+        data = self._homework_spec()
+        data["theme"] = {"background": "rainbow"}
+        (self.ws.root / "moon.json").write_text(json.dumps(data))
+        with mock.patch.object(tools, "run_streaming", side_effect=self._render_ok):
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon-r.pdf",
+                                     theme={"background": "rainbow"})
+        self.assertTrue(ok, text)
+        self.assertIn("the theme argument is already the worksheet's own look, so nothing was "
+                      "restyled", text)
+        self.assertNotIn("Restyled:", text)
+        self.assertFalse((self.ws.root / "moon-r.json").exists())
 
     def test_other_chats_files_are_hidden_and_refused_until_named(self):
         from qwen_chat.history import ChatScope

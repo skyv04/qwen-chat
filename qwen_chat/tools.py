@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import difflib
 import hashlib
 import html
 import inspect
@@ -114,8 +115,78 @@ def _find_once(text: str, old: str, name: str) -> tuple[int, int]:
     if count:
         raise ToolError(f"old_text matches {count} places in {name}. Include more of the nearby "
                         "text so it matches exactly one place.")
+    marker = CONTEXT_MARKER.search(old)
+    if marker:
+        raise ToolError(f"old_text was not found in {name}: it contains {marker[0]!r}, a note "
+                        "from shortened chat history, not text in the file. Use read_file and "
+                        "copy the exact current text.")
+    closest = _closest_text(text, old)
+    if closest:
+        line, chunk = closest
+        if len(chunk) <= 800:
+            raise ToolError(f"old_text was not found in {name}. Nothing was changed. The most "
+                            f"similar text is at line {line}:\n{chunk}\nIf that is the place to "
+                            "change, copy it exactly (character for character) as old_text.")
+        raise ToolError(f"old_text was not found in {name}. Nothing was changed. The most similar "
+                        f"text starts at line {line}:\n{chunk[:600]}…\nIf that is the place to "
+                        f"change, call read_file with start_line {line} and copy the current text "
+                        "exactly, or use a shorter old_text holding only the lines to change.")
     raise ToolError(f"old_text was not found in {name}. Use read_file and copy the current text "
                     "exactly; the file may have changed.")
+
+
+CLOSEST_SECONDS = 1.5
+
+
+def _closest_text(text: str, old: str) -> tuple[int, str] | None:
+    """The (line, text) in a file most like a mistyped old_text, so a retry can copy it
+    exactly. It is only shown, never applied. The search is bounded: a long old_text is
+    matched line by line, a short one character by character on a few candidates."""
+    want = old.strip()
+    if not want or len(text) > 200_000:
+        return None
+    lines = text.splitlines()
+    want_lines = want.splitlines()
+    size = len(want_lines)
+    starts = range(max(1, len(lines) - size + 1))
+
+    def chunk(i: int) -> str:
+        return "\n".join(lines[i:i + size]).strip()
+
+    if size > 8 or len(want) > 600:
+        keys = [" ".join(line.split()) for line in lines]
+        wanted = {k for k in (" ".join(line.split()) for line in want_lines) if len(k) >= 6}
+        if not wanted:
+            return None
+        hits = list(itertools.accumulate((k in wanted for k in keys), initial=0))
+        rough = sorted(starts, key=lambda i: hits[min(i + size, len(keys))] - hits[i],
+                       reverse=True)[:20]
+        # Lines such as "lines": 4, repeat everywhere: count the distinct ones a place shares.
+        best = max(rough, key=lambda i: len(set(keys[i:i + size]) & wanted))
+        if 2 * len(set(keys[best:best + size]) & wanted) < len(wanted):
+            return None
+        return best + 1, chunk(best)
+    deadline = time.monotonic() + CLOSEST_SECONDS
+    matcher = difflib.SequenceMatcher(None, autojunk=False)
+    matcher.set_seq2(want)
+    rough = []
+    for i in starts:
+        if not i % 64 and time.monotonic() > deadline:
+            break
+        piece = chunk(i)
+        if piece:
+            matcher.set_seq1(piece)
+            if matcher.real_quick_ratio() >= 0.6:
+                rough.append((matcher.quick_ratio(), i, piece))
+    best, found = 0.6, None
+    for quick, i, piece in sorted(rough, reverse=True)[:12]:
+        if quick < best or time.monotonic() > deadline:
+            break
+        matcher.set_seq1(piece)
+        ratio = matcher.ratio()
+        if ratio >= best:
+            best, found = ratio, (i + 1, piece)
+    return found
 
 
 def human_size(n: int) -> str:
@@ -354,6 +425,13 @@ class Workspace:
             raise ToolError(f"Content is too large ({human_size(len(data))}).")
         existed = f.exists()
         name = self.display(f)
+        stub = CONTEXT_MARKER.fullmatch(content.strip())
+        if stub and existed and not append and f.is_file():
+            raise ToolError(
+                f"Nothing was saved, and nothing needs to be: {name} still holds the content "
+                f"written earlier ({human_size(f.stat().st_size)}). {stub[0]!r} only means the chat "
+                "history was shortened. Continue with the next step (for example, render it), or "
+                "use edit_file to change part of it.")
         _refuse_placeholder(content, name, existed)
         if (existed and not append and f.is_file() and f.stat().st_size == len(data)
                 and f.read_bytes() == data):
@@ -526,7 +604,8 @@ def _as_int(v, default: int) -> int:
         return default
 
 
-def pdf_to_text(path: Path, *, raw: bool = False) -> str:
+def _pdftotext(path: Path, raw: bool = False) -> str:
+    """pdftotext's output as is: each page ends with a form feed."""
     if not shutil.which("pdftotext"):
         raise ToolError("PDF support needs pdftotext (poppler-utils), which isn't installed.")
     try:
@@ -538,11 +617,71 @@ def pdf_to_text(path: Path, *, raw: bool = False) -> str:
     if res.returncode:
         raise ToolError("PDF text extraction failed: "
                         + res.stderr.decode("utf-8", errors="replace")[-1000:])
-    text = res.stdout.decode("utf-8", errors="replace")
+    return res.stdout.decode("utf-8", errors="replace")
+
+
+def _tidy_text(text: str) -> str:
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", text)).strip()
+
+
+def pdf_to_text(path: Path, *, raw: bool = False) -> str:
+    text = _pdftotext(path, raw)
     if not text.strip():
         raise ToolError("The PDF has no extractable text (it may be scanned images).")
-    text = re.sub(r"[ \t]{2,}", " ", text if raw else text.replace("\f", "\n"))
-    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", text)).strip()
+    return _tidy_text(text if raw else text.replace("\f", "\n"))
+
+
+# Pictures that can hold words (a scanned page, a screenshot of questions): pdfimages pixels.
+OCR_MIN_AREA, OCR_MIN_SIDE = 40_000, 60
+# A page with this much text already has its words in the text layer.
+OCR_TEXT_PAGE = 2000
+OCR_MAX_PAGES = 20
+
+
+def _ocr_cache() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "qwen-chat" / "ocr"
+
+
+def _picture_pages(path: Path) -> set[int] | None:
+    """Pages with a picture big enough to hold words, or None if pdfimages can't tell."""
+    if not shutil.which("pdfimages"):
+        return None
+    try:
+        res = subprocess.run(["pdfimages", "-list", str(path)], capture_output=True, timeout=60,
+                             stdin=subprocess.DEVNULL, env=child_env())
+    except subprocess.TimeoutExpired:
+        return None
+    if res.returncode:
+        return None
+    pages = set()
+    for line in res.stdout.decode("utf-8", errors="replace").splitlines()[2:]:
+        cols = line.split()
+        try:
+            page, kind, width, height = int(cols[0]), cols[2], int(cols[3]), int(cols[4])
+        except (IndexError, ValueError):
+            continue
+        if kind == "image" and width * height >= OCR_MIN_AREA and min(width, height) >= OCR_MIN_SIDE:
+            pages.add(page)
+    return pages
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\W+", "", text.casefold())
+
+
+def _ocr_lines(ocr: str, layer: str) -> str:
+    """OCR lines that add something to a page's text layer; noise and repeats are left out."""
+    known, known_lines = _plain(layer), {_plain(line) for line in layer.splitlines()}
+    keep = []
+    for line in ocr.splitlines():
+        line = " ".join(line.split())
+        plain, visible = _plain(line), line.replace(" ", "")
+        if (len(plain) < 3 or plain in known_lines or len(plain) >= 12 and plain in known
+                or sum(c.isalnum() for c in visible) < 0.5 * len(visible)):
+            continue
+        keep.append(line)
+    return "\n".join(keep)
 
 
 # --------------------------------------------------------------------------- web
@@ -1654,7 +1793,9 @@ FILE_TOOLS = [
     _fn("list_files", "List files and folders in the workspace.",
         {"path": {**_S, "description": "Folder relative to the workspace (default '.')"},
          "recursive": {"type": "boolean", "description": "Include subfolders"}}, []),
-    _fn("read_file", "Read a text, code, Markdown, CSV or PDF file from the workspace.",
+    _fn("read_file", "Read a text, code, Markdown, CSV or PDF file from the workspace. For a "
+        "PDF, words in pictures (a scan, or questions pasted in as screenshots) are also read "
+        "with OCR and marked page by page.",
         {"path": {**_S, "description": "File path relative to the workspace"},
          "start_line": {"type": "integer", "description": "Line to start from (default 1)"}}, ["path"]),
     _fn("read_quiz", "Read the actual quiz before making an answer key. Returns exact questions, "
@@ -1718,8 +1859,9 @@ SKILL_TOOLS = [
 PROGRAM_TOOLS = [
     _fn("render_worksheet", "Create a themed, portrait PDF from a workspace JSON specification. "
         "Load worksheet-pdf first for its format. Checks layout, page limit, color emoji and "
-        "text preservation before saving. Pass the user's requested question counts, when given, "
-        "to check the format. A page-limit conflict asks the user to allow the necessary pages; "
+        "text preservation before saving. Pass expected counts only when the user gave them, "
+        "to check the format. Set max_pages only when the user asks for a page count; a "
+        "page-limit conflict asks the user to allow the necessary pages; "
         "do not rewrite or remove content to work around it. For a NEW worksheet plus a parent "
         "or teacher answer key, put each question's answer in the same JSON and pass "
         "answer_key_path: one call checks every answer and creates both PDFs, with no answers "
@@ -1753,9 +1895,12 @@ PROGRAM_TOOLS = [
         "Load answer-key and call read_quiz first. Requires one answer per source question, "
         "valid option letters and exact source evidence. Copies question/option text from "
         "the source; flags invalid questions rather than forcing wrong choices. Checks the "
-        "source hash, coverage, layout, page limit and exported text before saving.",
+        "source hash, coverage, layout, page limit and exported text before saving. A worksheet "
+        "JSON whose questions hold their answers can be passed as spec_path too: its key is "
+        "made from those answers.",
         {"spec_path": {**_S, "description": "Answer-key JSON with source_path, source_sha256, answers "
-                                             "and optional max_pages; see answer-key skill"},
+                                             "and optional max_pages (see answer-key skill), or "
+                                             "a worksheet JSON with answers in its questions"},
          "path": {**_S, "description": "Destination .pdf file in the workspace"}},
         ["spec_path", "path"]),
     _fn("open_file", "Request that the desktop open an existing workspace file. Rejects missing "
@@ -1822,6 +1967,170 @@ def _write_atomic(path: Path, content: bytes) -> None:
         raise
 
 
+# ------------------------------------------------------------------ the user's own numbers
+
+_NUMBER_WORDS = {w: n for n, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+    "fifteen sixteen seventeen eighteen nineteen twenty".split())}
+_NUMBER_WORDS.update({"thirty": 30, "dozen": 12, "single": 1, "no": 0, "none": 0})
+_KEY_WORDS = frozenset({"key", "keys", "answer", "answers", "answerkey", "solution", "solutions",
+                        "teacher", "teachers", "parent", "parents"})
+_DOC_WORDS = frozenset({"worksheet", "worksheets", "quiz", "quizzes", "test", "homework", "sheet",
+                        "activity", "student", "students", "practice", "packet", "assignment",
+                        "booklet", "reading", "story", "passage"})
+_QUESTION_WORDS = frozenset({"question", "questions", "problem", "problems", "item", "items",
+                             "exercise", "exercises", "prompt", "prompts", "task", "tasks",
+                             "multiple", "mc", "mcq", "mcqs", "choice", "fill", "blank", "blanks",
+                             "short", "written", "open", "essay", "essays", "response",
+                             "responses", "true", "false", "matching"})
+_CHOICE_WORDS = frozenset({"multiple", "mc", "mcq", "mcqs"})
+# Words that make the number after them a name, as in "unit 2" or "grade 4", not a count.
+_LABEL_WORDS = frozenset({"unit", "lesson", "chapter", "week", "grade", "module", "level", "part",
+                          "section", "day", "step", "page", "number", "version", "class", "room",
+                          "question", "problem", "item", "exercise", "task"})
+# Words that make the number before them a count of something else, as in "4 choices each".
+_UNIT_WORDS = frozenset({"page", "pages", "choices", "options", "answers", "minutes", "lines",
+                         "points", "words", "sentences", "paragraphs", "stories", "passages",
+                         "pictures", "images", "examples", "st", "nd", "rd", "th"})
+# Words that make a page count about the whole request, as in "keep it under 2 pages".
+_WHOLE_WORDS = frozenset({"it", "everything", "them", "whole", "total", "overall", "altogether"})
+_NO_PAGE_LIMIT = re.compile(
+    r"\b(?:no|without|unlimited|remove|drop|ignore)\b(?:\W+\w+){0,2}?\W+page\W*(?:limit|cap|count|max)"
+    r"|\bas many pages\b|\bany number of pages\b|\bunlimited pages\b")
+_BREAK = "|"  # a clause break (, . ; ! ? or a new line) among the tokens
+
+
+def _tokens(text: str | None, breaks: bool = False) -> list[str]:
+    if not breaks:
+        return re.findall(r"\d+|[a-z]+", (text or "").casefold())
+    return [t if t[0].isalnum() else _BREAK
+            for t in re.findall(r"\d+|[a-z]+|[,;!?\n]|\.(?!\d)", (text or "").casefold())]
+
+
+def _clause_end(tokens: list[str], start: int, end: int) -> int:
+    """`end`, or earlier where a clause break comes first."""
+    return next((i for i in range(start, min(end, len(tokens))) if tokens[i] == _BREAK), end)
+
+
+def _numbers(tokens: list[str]) -> list[tuple[int, int, int]]:
+    """(value, first token, token after) of each number written in digits or words."""
+    out, i = [], 0
+    while i < len(tokens):
+        t, following = tokens[i], tokens[i + 1] if i + 1 < len(tokens) else ""
+        if t.isdigit() and len(t) <= 3:
+            out.append((int(t), i, i + 1))
+        elif t in ("twenty", "thirty") and 0 < _NUMBER_WORDS.get(following, 10) < 10:
+            out.append((_NUMBER_WORDS[t] + _NUMBER_WORDS[following], i, i + 2))
+            i += 1
+        elif t in _NUMBER_WORDS:
+            out.append((_NUMBER_WORDS[t], i, i + 1))
+        i += 1
+    return out
+
+
+def requested_pages(text: str | None) -> dict | None:
+    """The page counts a request gives, as {"student", "key", "any"} (None where it gives
+    none) and "unlimited" (it asks for no limit); None when it never mentions pages."""
+    from .worksheet_pdf import MAX_PAGES
+
+    lowered = (text or "").casefold()
+    if not {"page", "pages"} & set(_tokens(lowered)):
+        return None
+    no_limit = list(_NO_PAGE_LIMIT.finditer(lowered))
+    if no_limit:
+        # "No page limit" replaces the counts of earlier sentences and messages; counts in its
+        # own sentence or after it ("no page limit, but the key on one page") still apply.
+        sentence = max(lowered.rfind(c, 0, no_limit[-1].start()) for c in ".!?\n") + 1
+        lowered = _NO_PAGE_LIMIT.sub(" ; ", lowered[sentence:])
+    tokens = _tokens(lowered, breaks=True)
+    asked = {"student": None, "key": None, "any": None, "unlimited": bool(no_limit)}
+    numbers = [n for n in _numbers(tokens) if n[0]]
+    for i, (value, start, end) in enumerate(numbers):
+        if end >= len(tokens) or tokens[end] not in ("page", "pages") or not 1 <= value <= MAX_PAGES:
+            continue
+        prev = tokens[max(0, start - 3):start]
+        if (prev[-2:] == ["at", "least"] or prev[-1:] in (["minimum"], ["min"], ["over"])
+                or prev[-2:] == ["more", "than"] and prev[-3:-2] not in (["no"], ["not"])):
+            continue  # a minimum, not a limit
+        # What the count is for: up to 6 words before it, within its clause (not past a comma,
+        # an earlier count or "it"), and 2 after it (3 after "for", "in", "on" or "of").
+        before = tokens[max(start - 6, numbers[i - 1][2] if i else 0):start]
+        cut = max((j for j, t in enumerate(before) if t == _BREAK or t in _WHOLE_WORDS), default=-1)
+        before = set(before[cut + 1:])
+        size = 3 if tokens[end + 1:end + 2] in (["for"], ["in"], ["on"], ["of"]) else 2
+        after = set(tokens[end + 1:_clause_end(tokens, end + 1, end + 1 + size)])
+        if after & {"each", "apiece"} or "both" in before:
+            slots = ("student", "key")
+        elif after & _KEY_WORDS:
+            slots = ("key",)
+        elif after & _DOC_WORDS:
+            slots = ("student",)
+        elif before & _KEY_WORDS and not before & _DOC_WORDS:
+            slots = ("key",)
+        elif before & _DOC_WORDS and not before & _KEY_WORDS:
+            slots = ("student",)
+        else:
+            slots = ("any",)
+        for slot in slots:
+            asked[slot] = value
+    return asked
+
+
+def count_requested(text: str | None, expected: int, words: frozenset = _QUESTION_WORDS) -> bool:
+    """Whether a request itself asks for this many questions: a number followed, within its
+    clause, by words such as "questions" or "fill in the blank" (or after "questions:"), or
+    numbers that add up to it ("3 multiple choice and 2 short answer")."""
+    tokens = _tokens(text, breaks=True)
+    numbers = _numbers(tokens)
+    found = []
+    for n, (value, start, end) in enumerate(numbers):
+        if start and tokens[start - 1] in _LABEL_WORDS or tokens[end:end + 1] and tokens[end] in _UNIT_WORDS:
+            continue
+        stop = min(end + 6, numbers[n + 1][1] if n + 1 < len(numbers) else len(tokens))
+        named_before = start and tokens[start - 1] in words and tokens[start - 1].endswith("s")
+        if set(tokens[end:_clause_end(tokens, end, stop)]) & words or named_before:
+            found.append(value)
+    return expected in found or len(found) > 1 and sum(found) == expected
+
+
+def _keyish(path: str) -> bool:
+    return bool(set(_tokens(Path(str(path)).stem)) & _KEY_WORDS)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _page_list(pages: list[int]) -> str:
+    return ", ".join(map(str, pages))
+
+
+def _handled(notes: list[str], json_kept: bool = True) -> str:
+    """The line telling the model what was fixed for it, so it does not 'fix' it again."""
+    if not notes:
+        return ""
+    return ("\nHandled automatically (no action needed"
+            + ("; the JSON file was not changed" if json_kept else "") + "): "
+            + "; ".join(dict.fromkeys(notes)) + ".")
+
+
+def _bonus_hint(spec: dict, expected: int, actual: int) -> str:
+    """The usual off-by-one: a bonus question counted, or a requested one made the bonus."""
+    last = spec["questions"][-1]["prompt"] if spec["questions"] else ""
+    if actual == expected + 1 and not spec["challenge"] and re.search(
+            r"\b(?:bonus|challenge|extra)\b", last, re.I):
+        return (" The last question looks like a bonus: move it into the challenge field, which "
+                "is not counted as a question.")
+    if actual == expected - 1 and spec["challenge"]:
+        return (" The bonus challenge is not counted; if it is one of the requested questions, "
+                "move it into questions.")
+    return ""
+
+
 class ToolBox:
     def __init__(self, workspace: Workspace, web: bool = True, files: bool = True,
                  commands: bool = False,
@@ -1845,6 +2154,9 @@ class ToolBox:
         # Once the user says no, nothing else is asked in that turn: the model has to reply.
         self.declined = False
         self.input_required = ""
+        # Set by the agent for each turn: the user's recent messages, casefolded. Page limits
+        # and question counts the user never gave are not enforced. None (direct calls): all are.
+        self.request_text: str | None = None
         # Set by the app for each turn: other chats' files, kept out of this one.
         self.scope: ChatScope | None = None
         # Workspace files the last tool call created, changed or removed, when it can't be
@@ -1873,7 +2185,7 @@ class ToolBox:
             "fetch_url": fetch_url,
             "download_file": lambda url, path="": download_file(ws, url, path),
             "list_files": self.list_files,
-            "read_file": ws.read_file,
+            "read_file": self.read_file,
             "read_quiz": self.read_quiz,
             "write_file": ws.write_file,
             "edit_file": ws.edit_file,
@@ -1897,6 +2209,93 @@ class ToolBox:
         if scope is None or not scope.foreign:
             return self.ws.list_files(path, recursive)
         return self.ws.list_files(path, recursive, hide=scope.owner)
+
+    def read_file(self, path: str, start_line: int = 1) -> str:
+        f = self.ws.resolve(path)
+        if f.suffix.lower() != ".pdf" or not f.is_file():
+            return self.ws.read_file(path, start_line)
+        return _text_page(self._pdf_text(f), self.ws.display(f), start_line)
+
+    def _pdf_text(self, f: Path) -> str:
+        """A PDF's text, plus the words OCR reads in its pictures where the text layer lacks
+        them (a scan, or questions pasted in as screenshots), marked page by page."""
+        full = _pdftotext(f)
+        pages = full.split("\f")
+        if len(pages) > 1 and not pages[-1].strip():
+            pages.pop()
+        texts = [_tidy_text(p) for p in pages]
+        has_text = any(texts)
+        plain = _tidy_text(full.replace("\f", "\n"))
+        pictures = _picture_pages(f) if has_text else None
+        wanted = [n for n in range(1, len(texts) + 1) if not has_text
+                  or pictures and n in pictures and len(texts[n - 1]) < OCR_TEXT_PAGE]
+        if not wanted:
+            if not has_text:
+                raise ToolError("The PDF has no extractable text (it may be scanned images).")
+            return plain
+        missing = [p for p in ("pdftoppm", "tesseract") if not shutil.which(p)]
+        if missing:
+            note = (f"[Page(s) {_page_list(wanted)} have pictures that may hold words such as "
+                    f"questions, but reading them needs OCR ({', '.join(missing)}), which is not "
+                    "installed. Do not guess what they say: install tesseract-ocr, or ask the "
+                    "user to type them.]")
+            if not has_text:
+                raise ToolError("The PDF has no extractable text (it may be scanned images). " + note)
+            return plain + "\n\n" + note
+        digest, read, failed = _file_sha256(f), {}, []
+        chosen = wanted[:OCR_MAX_PAGES]
+        with tempfile.TemporaryDirectory(prefix="qwen-ocr-") as tmp:
+            for i, n in enumerate(chosen, 1):
+                if self._cancelled():
+                    raise ToolError("Stopped by the user.")
+                self.status(f"Reading the pictures on page {n} ({i} of {len(chosen)})…")
+                text = self._ocr_page(f, digest, n, Path(tmp))
+                if text is None:
+                    failed.append(n)
+                else:
+                    read[n] = text
+        out, added = [], False
+        for n, text in enumerate(texts, 1):
+            extra = _ocr_lines(read.get(n, ""), text)
+            added = added or bool(extra)
+            out.append("\n".join([f"[Page {n}]", *([text] if text else []), *(
+                [f"[Page {n} pictures, read by OCR; may contain errors]", extra] if extra else [])]))
+        notes = []
+        if failed:
+            notes.append(f"[OCR could not read the pictures on page(s) {_page_list(failed)}.]")
+        if len(wanted) > len(chosen):
+            notes.append(f"[OCR read the pictures on the first {len(chosen)} pages that have them; "
+                         f"page(s) {_page_list(wanted[len(chosen):])} were not read.]")
+        if not added:
+            if not has_text:
+                raise ToolError("The PDF has no extractable text, and OCR found no words in it.")
+            return "\n\n".join([plain, *notes])
+        return "\n\n".join(out + notes)
+
+    def _ocr_page(self, pdf: Path, digest: str, page: int, tmp: Path) -> str | None:
+        """The words tesseract reads on one page (cached by the PDF's hash), or None."""
+        cache = _ocr_cache() / f"{digest}-r200-p{page}.txt"
+        with contextlib.suppress(OSError, UnicodeError):
+            return cache.read_text(encoding="utf-8")
+        env = {**child_env(), "OMP_THREAD_LIMIT": "4"}
+        image, base = tmp / f"page{page}", tmp / f"text{page}"
+        for argv, limit in (
+                (["pdftoppm", "-f", str(page), "-l", str(page), "-r", "200", "-gray", "-png",
+                  "-singlefile", str(pdf), str(image)], 60),
+                (["tesseract", f"{image}.png", str(base), "--psm", "3"], 120)):
+            rc, _out, reason = run_streaming(argv, tmp, env, limit, self.cancel)
+            if reason == "cancelled" or self._cancelled():
+                raise ToolError("Stopped by the user.")
+            if rc != 0 or reason:
+                return None
+        try:
+            text = Path(f"{base}.txt").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        with contextlib.suppress(OSError):
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            _write_atomic(cache, text.encode("utf-8"))
+        return text
 
     def _not_foreign(self, real: Path, given: str, whole: bool = False) -> None:
         """Refuse a file another chat made (or, with whole, a folder holding one)."""
@@ -2136,21 +2535,93 @@ class ToolBox:
             raise ToolError("Stopped by the user.")
         source = self.ws.resolve(spec_path)
         data, _ = self._json_data(source)
-        if not isinstance(data, dict) or not isinstance(data.get("source_path"), str):
+        if not isinstance(data.get("source_path"), str):
+            if data.keys() & {"questions", "challenge", "reading", "passage", "story"}:
+                return self._worksheet_answer_key(source, data, path)
             raise ToolError("Load answer-key, then call read_quiz. The key JSON needs source_path, "
                             "source_sha256 and an answers list, not rewritten worksheet questions.")
         quiz, name, digest, snapshots = self._quiz_source(data["source_path"])
+        # The file it names is the source, however its path was written.
+        data["source_path"] = name
         target = self.ws.resolve(path)
         if target in snapshots or source in snapshots:
             raise ToolError("Save the answer key separately; never replace the source quiz.")
+        adjusted = self._requested_limits(data, {"max_pages": ("key", "any")})
         try:
             document, audit = key_document(data, quiz, name, digest)
             spec = validate_spec(document)
         except DesignError as exc:
-            raise ToolError(f"Invalid answer key: {exc}") from None
+            hint = ""
+            if name.lower().endswith(".json") and "evidence" in str(exc):
+                hint = (f"\nA simpler way: {name} is worksheet JSON, so store each answer with "
+                        f"its question in {name} (choice: the correct option letter; answer: the "
+                        "expected answer; explanation and evidence optional), then call "
+                        f"render_answer_key with spec_path \"{name}\". No separate key JSON is "
+                        "needed then.")
+            raise ToolError(f"Invalid answer key: {exc}{hint}") from None
         result = self._render_pdf(source, target, path, document, spec, "answer key",
                                   lambda: self._check_source_snapshots(snapshots))
-        return result + "\nSource checks: " + json.dumps(audit, ensure_ascii=False)
+        adjusted += audit.pop("adjusted", [])
+        return (result + _handled(adjusted) + "\nSource checks: "
+                + json.dumps(audit, ensure_ascii=False))
+
+    def _worksheet_answer_key(self, source: Path, data: dict, path: str) -> str:
+        """The answer key of a worksheet JSON whose questions hold their own answers."""
+        from .answer_key import worksheet_key
+        from .worksheet_pdf import DesignError, normalize_spec, validate_spec
+
+        shown = self.ws.display(source)
+        data, adjusted = normalize_spec(data, source.stem)
+        adjusted += self._requested_limits(data, {"answer_key_max_pages": ("key", "any")})
+        try:
+            spec = validate_spec(data)
+        except (DesignError, ValueError, UnicodeError) as exc:
+            raise ToolError(f"Invalid worksheet specification in {shown}: {exc} Fix that spot "
+                            "with edit_file, then call render_answer_key again.") from None
+        try:
+            document, audit = worksheet_key(spec)
+            key_spec = validate_spec(document)
+        except DesignError as exc:
+            raise ToolError(
+                f"The answer key is not ready: {exc}\n{shown} is worksheet JSON, so its key comes "
+                "from the answers stored in its own questions: fix them there with edit_file, "
+                "then call render_answer_key again. Do not write a separate key JSON for it.") from None
+        target = self.ws.resolve(path)
+        if target == source.with_suffix(".pdf") and not _keyish(path):
+            raise ToolError(f"{self.ws.display(target)} is the worksheet's own PDF name. Give the "
+                            "answer key its own name, such as one ending in -answer-key.pdf.")
+        result = self._render_pdf(source, target, path, document, key_spec, "answer key")
+        adjusted += audit.pop("adjusted", [])
+        return (result + f"\nMade from the answers stored with the questions in {shown}."
+                + _handled(adjusted) + "\nAnswer checks: " + json.dumps(audit, ensure_ascii=False))
+
+    def _requested_limits(self, data: dict, slots: dict[str, tuple[str, ...]]) -> list[str]:
+        """Page limits come from the user, not the draft: a limit the user never gave is left
+        out (the PDF gets the pages it needs) and a page count the user gave replaces the
+        draft's. `slots` maps each page-limit field to the requested counts it takes, best
+        first. Pages mentioned without a count keep the draft's reading; so does a direct
+        call without the request (request_text None)."""
+        if self.request_text is None:
+            return []
+        asked = requested_pages(self.request_text)
+        given = asked and any(asked[s] for s in ("student", "key", "any"))
+        if asked and not given and not asked["unlimited"]:
+            return []
+        counts = {asked[s] for s in ("student", "key", "any")} - {None} if given else set()
+        notes = []
+        for field, prefer in slots.items():
+            want = next((asked[s] for s in prefer if asked and asked[s]), None)
+            have = data.get(field)
+            if want is None and type(have) is int and have in counts and not asked["unlimited"]:
+                continue  # the user gave this count, maybe for this part too: ask, don't drop
+            if want is None and field in data:
+                del data[field]
+                notes.append(f"left out {field} {have!r}: the user did not ask for a page limit, "
+                             "so the PDF gets the pages it needs")
+            elif want is not None and have != want:
+                data[field] = want
+                notes.append(f"{field} is {want}, the page count the user asked for")
+        return notes
 
     def render_worksheet(self, spec_path: str, path: str, expected_questions: int | None = None,
                          expected_multiple_choice: int | None = None,
@@ -2162,14 +2633,28 @@ class ToolBox:
         self._check_declined()
         if self._cancelled():
             raise ToolError("Stopped by the user.")
-        source, target = self.ws.resolve(spec_path), self.ws.resolve(path)
+        source = self.ws.resolve(spec_path)
         change = _theme_change(theme)
         data, _ = self._json_data(source)
-        data, adjusted = normalize_spec(data)
+        data, adjusted = normalize_spec(data, source.stem)
+        if answer_key_path and _keyish(path) and not _keyish(answer_key_path):
+            # A file named like a key must hold the answers, or a child could get them.
+            path, answer_key_path = answer_key_path, path
+            adjusted.append(f"the answers went to {answer_key_path} and the student copy to "
+                            f"{path}, as their names say")
+        target = self.ws.resolve(path)
         if change:
             new_theme, notes = restyle_theme(data.get("theme"), change)
-            data, again = normalize_spec({**data, "theme": new_theme})
-            adjusted = list(dict.fromkeys([*adjusted, *notes, *again]))
+            restyled, again = normalize_spec({**data, "theme": new_theme}, source.stem)
+            if restyled == data:
+                change = None
+                adjusted.append("the theme argument is already the worksheet's own look, so "
+                                "nothing was restyled")
+            else:
+                data = restyled
+                adjusted = list(dict.fromkeys([*adjusted, *notes, *again]))
+        adjusted += self._requested_limits(data, {"max_pages": ("student", "any"), **(
+            {"answer_key_max_pages": ("key",)} if answer_key_path else {})})
         try:
             spec = validate_spec(data)
         except (DesignError, ValueError, UnicodeError) as exc:
@@ -2177,24 +2662,32 @@ class ToolBox:
                     "render_answer_key." if isinstance(data, dict)
                     and data.keys() & {"answers", "source_path", "source_sha256"} else
                     " Fix the theme argument and render again." if change
-                    and "theme" in str(exc) else
+                    and "theme" in str(exc).split("Allowed", 1)[0] else
                     " Fix that spot with edit_file, then render again.")
             if not change:
                 hint += self._restyle_hint(source, data)
             raise ToolError(f"Invalid worksheet specification: {exc}{hint}") from None
-        for label, expected, actual in (
-                ("questions", expected_questions, len(spec["questions"])),
-                ("multiple-choice questions", expected_multiple_choice,
-                 sum(bool(q["options"]) for q in spec["questions"]))):
+        unchecked = []
+        for label, field, expected, actual, words in (
+                ("questions", "expected_questions", expected_questions, len(spec["questions"]),
+                 _QUESTION_WORDS),
+                ("multiple-choice questions", "expected_multiple_choice", expected_multiple_choice,
+                 sum(bool(q["options"]) for q in spec["questions"]), _CHOICE_WORDS)):
             if expected is None:
                 continue
             if type(expected) is not int or not 0 <= expected <= 30:
                 raise ToolError(f"The expected number of {label} must be an integer from 0 to 30.")
-            if actual != expected:
-                raise ToolError(f"Question format mismatch: the request needs {expected} {label}, "
-                                f"but the saved worksheet has {actual}. Correct the question mix "
-                                "to match the request before rendering; do not change the expected "
-                                "count to match a mistaken draft.")
+            if actual == expected:
+                continue
+            if self.request_text is not None and not count_requested(self.request_text, expected, words):
+                unchecked.append(f"{field} {expected} (the worksheet has {actual})")
+                continue
+            raise ToolError(f"Question format mismatch: the request needs {expected} {label}, "
+                            f"but the saved worksheet has {actual}. Correct the question mix "
+                            "to match the request before rendering; do not change the expected "
+                            "count to match a mistaken draft."
+                            + (_bonus_hint(spec, expected, actual)
+                               if field == "expected_questions" else ""))
         jobs = [(target, path, without_answers(data), spec, "worksheet")]
         key_audit = None
         if answer_key_path:
@@ -2208,6 +2701,7 @@ class ToolBox:
             except DesignError as exc:
                 raise ToolError(f"The answer key is not ready: {exc}"
                                 + ("" if change else self._restyle_hint(source, data))) from None
+            adjusted += key_audit.pop("adjusted", [])
             jobs.append((key_target, answer_key_path, document, key_spec, "answer key"))
         extra = []
         if change:
@@ -2220,10 +2714,11 @@ class ToolBox:
             result += (f"\nRestyled: the passage, questions and answers are unchanged from "
                        f"{self.ws.display(source)}; only the look changed.")
         result += "\nLook: " + json.dumps(spec["theme"], ensure_ascii=False)
-        if adjusted:
-            result += ("\nHandled automatically (no action needed"
-                       + ("" if change else "; the JSON file was not changed") + "): "
-                       + "; ".join(adjusted) + ".")
+        result += _handled(adjusted, json_kept=not change)
+        if unchecked:
+            result += ("\nNot checked, because the user's recent messages do not ask for that "
+                       "many: " + "; ".join(unchecked) + ". If the user did ask for it, fix the "
+                       "questions and render again; if not, the PDFs are done.")
         if key_audit:
             return (result + "\nAnswer checks: " + json.dumps(key_audit, ensure_ascii=False)
                     + "\nThe student PDF has no answers; the answer key has every answer.")
@@ -2324,7 +2819,7 @@ class ToolBox:
         self._ask(f"Create this {kind} PDF?" if len(jobs) == 1 else "Create the worksheet and answer key?",
                   f"Create {' and '.join(names)} from {self.ws.display(source)} using the bundled "
                   "local renderer. It uses a separate headless browser, not your open browser, "
-                  "for up to 2 minutes per PDF.",
+                  "for up to 3 minutes per PDF.",
                   f"render_{kind.replace(' ', '_')}(" + json.dumps(call) + ")",
                   "Create PDF" if len(jobs) == 1 else "Create PDFs",
                   "The user said no to creating this PDF.")
@@ -2410,7 +2905,7 @@ class ToolBox:
             rc, out, reason = run_streaming(
                 [python, str(Path(__file__).with_name("worksheet_pdf.py")),
                  str(staged_spec), str(staged_pdf)],
-                self.ws.root, env, 120, self.cancel)
+                self.ws.root, env, 180, self.cancel)
             if reason == "cancelled" or self._cancelled():
                 raise ToolError("Stopped by the user. The existing PDF was not changed.")
             if reason == "timeout":
@@ -2443,9 +2938,9 @@ class ToolBox:
                 + (" + a bonus challenge" if spec["challenge"] else ""))
             self._ask(
                 f"Use {pages} pages for this {kind}?",
-                f"The saved specification limits {name} to {spec['max_pages']} pages, but "
-                f"the complete {kind} needs {pages}. Keep all content "
-                "at readable sizes. Only this export's page allowance changes; "
+                f"{name} has a limit of {spec['max_pages']} page"
+                f"{'s' if spec['max_pages'] != 1 else ''}, but the complete {kind} needs {pages}. "
+                "Keep all content at readable sizes. Only this export's page allowance changes; "
                 "the source JSON stays untouched.",
                 count_summary,
                 f"Use {pages} Pages",
@@ -2603,7 +3098,10 @@ class ToolBox:
                             f"pass a larger timeout_seconds (up to {MAX_RUN_TIMEOUT}).\n{body}{tail}")
         if rc != 0:
             hint = ""
-            if rc == 127 or re.search(r"command not found|No such file or directory", out[-600:]):
+            if "Pdf reading is not supported" in out:
+                hint = ("\ntesseract cannot open a PDF. read_file reads a PDF's pictures with OCR "
+                        "by itself: use read_file on the PDF instead.")
+            elif rc == 127 or re.search(r"command not found|No such file or directory", out[-600:]):
                 hint = ("\nIf a program is missing, check_programs shows what's installed and "
                         "install_packages can install it.")
             raise ToolError(f"The command failed with exit code {rc}.\n{body}{tail}{hint}")

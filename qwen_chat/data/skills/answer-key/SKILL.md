@@ -20,7 +20,10 @@ restyling and it is not the student worksheet JSON format.
    the reader supports extractable text with sequential `Question 1:` or `1.`
    headings and `A.` option labels. Check that extraction contains the whole quiz;
    do not use a partial inventory or trust decorative headers as question text.
-   If extraction fails, use `read_file`/OCR and resolve the structure first.
+   If extraction fails, `read_file` the PDF: it also reads pictures of questions by
+   OCR (tesseract cannot open a PDF itself). Copy those questions exactly into
+   worksheet JSON with each answer stored in its question, then call
+   `render_answer_key` with that JSON as `spec_path`.
    A scan or unnumbered PDF is not an excuse to invent questions.
 2. Answer every numbered question exactly once, including a bonus if returned.
    Work each one out before writing it: do the arithmetic, then find the sentence
@@ -88,8 +91,8 @@ hash, letters and quotes from read_quiz, never this example's answers.
   explain the defect in `issue`, and quote the relevant evidence. Never force
   a wrong letter just to fill the key. Where an intended choice is only weakly
   supported, give that choice and state the caveat in `issue`.
-- `max_pages`: set only when the user requested a page limit, from 1 to 10.
-  Otherwise omit it. Approval is required if the complete readable key needs more.
+- `max_pages`: set only when the user asked for a page count; a limit the user never
+  gave is left out. Approval is required if the complete readable key needs more.
 - Do not invent `points`, scores, rubrics, answer choices or factual corrections.
   If corrections are wanted, ask before changing the original quiz.
 
@@ -98,7 +101,9 @@ hash, letters and quotes from read_quiz, never this example's answers.
 For a NEW quiz or homework plus a parent key, skip this read_quiz flow. Load
 worksheet-pdf, put each answer in the worksheet JSON, and create both PDFs with one
 `render_worksheet(spec_path=..., path=..., answer_key_path=...)` call. It checks every
-answer first and keeps answers off the student copy.
+answer first and keeps answers off the student copy. For worksheet JSON whose questions
+already hold their answers, `render_answer_key(spec_path=<that JSON>, path=...)` makes
+the key alone; no key JSON is needed.
 "At most three student pages plus a one-page parent key" means `max_pages: 3` and
 `answer_key_max_pages: 1` in that JSON, not four student pages.
 Check both actual page reports before using `pdfunite` if one combined file was
