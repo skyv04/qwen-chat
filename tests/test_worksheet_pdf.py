@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from qwen_chat import worksheet_pdf as pdf
+from qwen_chat import figures, mathtext, worksheet_pdf as pdf
 from qwen_chat.answer_key import (arithmetic_target, check_math, key_document, quiz_from_pdf,
                                   quiz_from_spec, resolve_choice, worksheet_key)
 
@@ -177,6 +177,23 @@ class WorksheetKeyTest(unittest.TestCase):
         self.assertEqual((audit["worked_math_checked"], audit["unverified_questions"]), (2, [2, 3]))
         self.assertIn("Answer: A. $0\nWhy: $10 - $6 - $4 = $0", document["reading"][0]["text"])
 
+    def test_correct_chained_working_passes_and_a_wrong_chain_is_named(self):
+        # From Qwen's grade-4 volume quiz: correct working was rejected three renders in a row
+        # ("12 × 8 × 5 = 96 × 5 = 480" read as 12 × 8 × 5 = 96, "½ × 8 × 6" as 8 × 6), and
+        # the run stopped on the repeated error.
+        prompt = "A box is 12 cm long, 8 cm wide and 5 cm tall. What is its volume?"
+        right = ["12 × 8 × 5 = 96 × 5 = 480 cm³", "Area = ½ × 8 × 6 = 24 cm², Volume = 24 × 10 = 240 cm³",
+                 "20 × 12 × 8 = 240 × 8 = 1,920 cm³", "(5 + 3) × 2 × 4 = 64 cubic units", "−3 + 5 = 2"]
+        worksheet_key(pdf.validate_spec({"title": "Volume", "questions": [
+            {"prompt": prompt, "answer": working, "explanation": working} for working in right]}))
+        for working, message in (
+                ("12 × 8 × 5 = 96 × 4 = 384 cm³",
+                 "the working says 12 × 8 × 5 = 96 × 4, but 12 × 8 × 5 = 480 and 96 × 4 = 384"),
+                ("20 × 12 × 8 = 1,820 cm³", "the working says 20 × 12 × 8 = 1,820, but 20 × 12 × 8 = 1,920")):
+            with self.subTest(working=working), self.assertRaisesRegex(pdf.DesignError, re.escape(message)):
+                worksheet_key(pdf.validate_spec({"title": "Volume", "questions": [
+                    {"prompt": prompt, "answer": working}]}))
+
     def test_reasons_given_as_evidence_on_a_math_sheet_become_explanations(self):
         data = {"title": "Harvest math", "questions": [
             {"prompt": "3 + 4 = __", "answer": "7", "evidence": "3 apples and 4 more make 7."},
@@ -300,7 +317,7 @@ class NormalizeSpecTest(unittest.TestCase):
                 self.assertEqual(pdf.normalize_spec(draft), (draft, []))
         self.assertEqual(pdf.normalize_spec("text"), ("text", []))
         with self.assertRaisesRegex(pdf.DesignError, r"Unknown Question 1 field\(s\): hint\. "
-                                    r"Allowed: answer, choice, evidence, explanation, icon, label"):
+                                    r"Allowed: answer, choice, evidence, explanation, figure, icon, label"):
             pdf.validate_spec({"title": "Math", "questions": [{"prompt": "Q?", "hint": "x"}]})
 
     def test_a_look_change_swaps_the_mascot_and_adds_a_rainbow(self):
@@ -372,6 +389,38 @@ class NormalizeSpecTest(unittest.TestCase):
         self.assertEqual(data["title"], "Space Explorer Quiz")
         self.assertIn("the title was missing, so 'Space Explorer Quiz' (from the file name) was used",
                       "; ".join(notes))
+
+
+    def test_figures_are_drawn_from_prompts_or_aliases_and_problems_become_warnings(self):
+        area = "A rectangle has a length of 6 units and a width of 4 units. What is its area?"
+        spec = {"title": "Shapes", "questions": [
+            {"prompt": area, "options": ["10 square units", "24 square units"]},
+            {"prompt": area, "options": ["10 square units", "24 square units"], "figure": []},
+            {"prompt": "Find the area.", "lines": 1, "diagram": {"shape": "circle", "radius": 3}},
+            {"prompt": "Count the slices.", "lines": 1, "picture": "\U0001f355"},
+            {"prompt": "Look at the shape below. What is its perimeter?", "lines": 1},
+            {"prompt": "Shade the model.", "lines": 1, "figure": {"shape": "fraction"}},
+            {"prompt": "A triangle has sides of 1 cm, 2 cm and 10 cm. What is its perimeter?", "lines": 1},
+        ]}
+        warnings = []
+        data, notes = pdf.normalize_spec(copy.deepcopy(spec), "shapes.json", warnings)
+        q = data["questions"]
+        self.assertEqual(q[0]["figure"], [{"shape": "rectangle", "length": 6, "width": 4, "unit": "units"}])
+        self.assertEqual(q[1]["figure"], [])
+        self.assertEqual(q[2]["figure"], [{"shape": "circle", "radius": 3}])
+        self.assertEqual(q[3]["icon"], "\U0001f355")
+        self.assertNotIn("figure", q[4])
+        self.assertEqual(q[5]["figure"], [])
+        self.assertIn('drew {"shape": "rectangle", "length": 6, "width": 4, "unit": "units"} from the '
+                      'prompt; set "figure": [] to leave it out (Question 1)', notes)
+        self.assertEqual(warnings[0], "Question 5 talks about a picture but has no figure")
+        self.assertRegex(warnings[1], r"^Question 6 figure: a fraction model needs parts")
+        self.assertRegex(warnings[2], r"^Question 7: sides 1, 2 and 10 cannot make a triangle")
+        self.assertEqual(len(warnings), 3)
+        pdf.validate_spec(data)
+        _data, notes = pdf.normalize_spec(copy.deepcopy(spec), "shapes.json")
+        self.assertIn("left out a figure that could not be drawn (Question 6 figure: a fraction "
+                      'model needs parts, such as {"fraction": "3/8"})', notes)
 
 
 class AnswerKeySpecTest(unittest.TestCase):
@@ -504,7 +553,9 @@ class WorksheetSpecTest(unittest.TestCase):
                 ({"theme": {"icons": ["\U0001f680", "rocket"]}}, r"theme\.icons\[1\] must be one emoji"),
                 ({"questions": [{"prompt": "Count.", "icon": "\U0001f680\U0001f319"}]},
                  "Question 1 icon has 2 separate emoji"),
-                ({"challenge": {"prompt": "Count.", "points": 5}}, "challenge")):
+                ({"challenge": {"prompt": "Count.", "points": 5}}, "challenge"),
+                ({"questions": [{"prompt": "Find the area.", "lines": 1, "figure": {"shape": "blob"}}]},
+                 'Question 1 figure: needs "shape"')):
             with self.subTest(change=change), self.assertRaisesRegex(pdf.DesignError, message):
                 pdf.validate_spec({**fixture(), **change})
 
@@ -517,6 +568,75 @@ class WorksheetSpecTest(unittest.TestCase):
         self.assertIn("&lt;script&gt;document.body.remove()&lt;/script&gt;", document)
         self.assertNotIn(attack, document)
         self.assertIn("connect-src 'none'", document)
+
+
+class MathFigureTest(unittest.TestCase):
+    def test_lenient_figures_become_canonical_and_mistakes_are_explained(self):
+        canonical = [{"shape": "rectangle", "length": 6, "width": 4, "unit": "cm"}]
+        drawn, _notes, problems = figures.parse({"type": "Rectangle", "l": "6 cm", "w": 4})
+        self.assertEqual((drawn, problems), (canonical, []))
+        self.assertEqual(figures.parse(drawn), (canonical, [], []))
+        self.assertTrue(figures.svg(drawn[0])[0].startswith("<svg"))
+        for value, message in (({"shape": "fraction"}, "a fraction model needs parts"),
+                               ("a happy face", "could not tell what to draw"),
+                               ({"shape": "blob"}, 'needs "shape"')):
+            with self.subTest(value=value):
+                self.assertIn(message, figures.parse(value)[2][0])
+        with self.assertRaisesRegex(figures.Impossible, "cannot make a triangle"):
+            figures.svg({"shape": "triangle", "sides": [1, 2, 10]})
+
+    def test_a_prompt_naming_a_shape_and_its_sizes_is_drawn_and_only_picture_talk_needs_one(self):
+        for prompt, expected in (
+                ("A rectangle has a length of 6 units and a width of 4 units. What is its area?",
+                 {"shape": "rectangle", "length": 6, "width": 4, "unit": "units"}),
+                ("A triangle has a perimeter of 20 cm. Two sides are 5 cm and 7 cm. How long is "
+                 "the third side?", {"shape": "triangle", "sides": [5, 7, "?"], "unit": "cm"}),
+                ("An isosceles triangle has two equal sides of 5 cm and a base of 8 cm.",
+                 {"shape": "triangle", "sides": [8, 5, 5], "kind": "isosceles", "unit": "cm"})):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(figures.infer(prompt), [expected])
+        for prompt in ("What is 6 x 4?", "Draw a rectangle 6 cm long and 4 cm wide."):
+            self.assertEqual(figures.infer(prompt), [])
+        for prompt in ("Look at the shape below. What is its perimeter?",
+                       "What fraction of the circle is shaded?", "Plot (2, 3) on the coordinate grid."):
+            self.assertTrue(figures.needs_picture(prompt), prompt)
+        for prompt in ("Who is the most important figure in the story?",
+                       "What kindness was shown by the girl?",
+                       "Draw a rectangle with an area of 12 square units."):
+            self.assertFalse(figures.needs_picture(prompt), prompt)
+
+    def test_a_triangular_prism_is_drawn_as_one_even_when_its_figure_says_prism(self):
+        # From Qwen's grade-4 quiz: a box was the only prism it knew, so it drew one for this.
+        prompt = ("A triangular prism has a triangular base with base 8 cm and height 6 cm, and "
+                  "the prism is 10 cm long. What is its volume?")
+        expected = {"shape": "triangular_prism", "base": 8, "height": 6, "length": 10, "unit": "cm"}
+        self.assertEqual(figures.infer(prompt), [expected])
+        self.assertEqual(figures.infer("A triangular prism has a base area of 24 cm² and a height "
+                                       "of 10 cm. What is its volume?"), [])
+        spec = {"title": "Volume", "questions": [
+            {"prompt": prompt, "lines": 2, "figure": {"shape": "prism", "length": 10, "unit": "cm"}}]}
+        data, notes = pdf.normalize_spec(spec, "volume.json")
+        self.assertEqual(data["questions"][0]["figure"], [expected])
+        self.assertIn("drew a triangular prism, as the prompt describes, instead of a box (Question 1)",
+                      notes)
+        self.assertEqual(figures.parse({"shape": "prism", "base": "triangle", "width": 8, "height": 6,
+                                        "length": 10})[0],
+                         [{"shape": "triangular_prism", "base": 8, "height": 6, "length": 10}])
+        self.assertIn('class="dash"', figures.svg(expected)[0])
+        box = [{"shape": "prism", "length": 10, "unit": "cm"}]
+        self.assertEqual(figures.follow_prompt(box, "A rectangular prism is 10 cm long."), (box, []))
+        # A stack of unit cubes is solid: no hidden edges show through it.
+        self.assertNotIn('class="dash"', figures.svg({"shape": "cube", "side": 3, "cubes": True})[0])
+
+    def test_fractions_stack_and_operators_are_tidy_but_dates_ranges_and_markup_are_text(self):
+        html = mathtext.to_html("Ella ate 1/4 of the pizza on 3/4/2025.", False)
+        self.assertEqual(html.count('class="frac"'), 1)
+        self.assertIn('class="frac-text"', html)
+        self.assertIn("3/4/2025", html)
+        self.assertEqual(mathtext.printed("Questions 3 - 5: what is 10 - 4 x 2?"),
+                         "Questions 3 - 5: what is 10 \u2212 4 \u00d7 2?")
+        self.assertEqual(mathtext.printed(r"Simplify \frac{6}{8} \times 2"), "Simplify 6/8 \u00d7 2")
+        self.assertTrue(mathtext.to_html("<b>1/2</b>", False).startswith("&lt;b&gt;"))
 
 
 class WorksheetRenderTest(unittest.TestCase):
@@ -620,6 +740,32 @@ class WorksheetRenderTest(unittest.TestCase):
         for expected in ("Answer: A. To the Moon", "Answer: 5", "Answer: six", "Paragraph [1]"):
             self.assertIn(expected, text)
         self.assertNotIn("Name: ______", text)
+
+    def test_figures_and_stacked_fractions_print_in_both_copies_and_read_back_in_order(self):
+        from qwen_chat.tools import ToolBox, Workspace
+        moon = ("The Moon is made of 4 different regions. If Region A is 1/2 of the Moon and Region "
+                "B is 1/4 of the Moon, what fraction of the Moon is made of Regions A and B combined?")
+        spec = {"title": "Fraction shapes", "questions": [
+            {"prompt": moon, "options": ["3/4", "3/8"], "choice": "A"},
+            {"prompt": "A rectangle has a length of 6 units and a width of 4 units. What is its area?",
+             "options": ["10 square units", "24 square units"], "choice": "B"},
+            {"prompt": "What is 1/4 + 2/4?", "options": ["3/4", "3/8"], "choice": "A",
+             "figure": {"shape": "fraction", "fraction": "3/4"}},
+            {"prompt": "What is 10 - 4?", "options": ["6", "14"], "choice": "A"}]}
+        data, _notes = pdf.normalize_spec(spec)
+        ws = Workspace(self.root / "ws", trash_dir=self.root / "trash")
+        report = pdf.render(pdf.validate_spec(pdf.without_answers(data)), ws.root / "quiz.pdf")
+        self.assertEqual(report["figures"], 2)
+        self.assertTrue(report["text_preserved"])
+        # Stacked fractions read back in place, not moved to lines of their own.
+        text = pdf._normalize(ToolBox(ws, web=False, files=True).read_file("quiz.pdf"))
+        for expected in (moon, "What is 1/4 + 2/4?", "A. 3/4", "What is 10 \u2212 4?"):
+            self.assertIn(pdf._normalize(expected), text)
+        raw = subprocess.run(["pdftotext", "-raw", str(ws.root / "quiz.pdf"), "-"],
+                             check=True, capture_output=True, text=True).stdout
+        self.assertEqual(len(quiz_from_spec(data, raw)["questions"]), 4)
+        document, _audit = worksheet_key(pdf.validate_spec(data))
+        self.assertEqual(pdf.render(pdf.validate_spec(document), self.root / "key.pdf")["figures"], 2)
 
     def test_answer_key_pdf_preserves_questions_choices_and_evidence_without_blank_lines(self):
         document, source_audit = key_document(key_fixture(), quiz_from_spec(fixture()),

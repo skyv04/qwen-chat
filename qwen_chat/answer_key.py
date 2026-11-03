@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import re
 import unicodedata
+from typing import NamedTuple
 
 from .worksheet_pdf import (MAX_PAGES, DesignError, _empty, _integer, _key_fields, _normalize,
                             _question_number, _text, normalize_spec, source_texts, validate_spec)
@@ -177,14 +178,21 @@ _UNITS = ("zero one two three four five six seven eight nine ten eleven twelve t
 _TENS = "twenty thirty forty fifty sixty seventy eighty ninety".split()
 _OPS = {"−": "-", "–": "-", "×": "*", "x": "*", "X": "*", "÷": "/"}
 _MATH_TOKEN = re.compile(
-    r"(?P<n>(?<![\w.,:])\d{1,6}(?!\w|[.,:]\d))|(?P<b>_{2,}|[□▢◻⬜]|\[\s*\]|\(\s*\))|(?P<q>\?)"
-    r"|(?P<o>[-+−–×÷*/]|(?<=\s)[xX](?=\s))|(?P<e>=)|(?P<w>[^\W\d_]+(?:'[^\W\d_]+)?)|(?P<p>\S)")
-# One character per token: n number, b blank, q "?", o operator, e "=", W/I/S question words.
+    r"(?P<n>(?<![\w.,:\u2044])(?:\d{1,3}(?:,\d{3})+|\d{1,6})(?!\w|[.,:]\d|\u2044))"
+    r"|(?P<b>_{2,}|[□▢◻⬜]|\[\s*\]|\(\s*\))|(?P<q>\?)|(?P<o>[-+−–×÷*/]|(?<=\s)[xX](?=\s))"
+    r"|(?P<e>=)|(?P<f>[\u00bc-\u00be\u2150-\u215e\u2189])|(?P<w>[^\W\d_]+(?:'[^\W\d_]+)?)"
+    r"|(?P<p>\S)")
+# One character per token: n number (1,920 too), b blank, q "?", o operator, e "=",
+# f a fraction character such as ½ (a number, never a unit word), W/I/S question words.
 _MATH_SHAPE = re.compile(
     r"(?<![noqbe])(?P<a>n(?:on)+)e(?:[bq](?![noe])|$)"           # 3 + 4 = __
     r"|(?<![noqbe])[bq]e(?P<r>n(?:on)+)(?![noeq])"               # __ = 3 + 4
     r"|(?<![noqbe])(?P<m>[bq]on|no[bq])e(?P<t>n)(?![noeq])"      # 4 + __ = 9
     r"|(?:WI|S)p?(?P<c>n(?:on)+)(?=[qp]|$)")                     # What is 3 + 4?
+
+
+def _number(text: str) -> int:
+    return int(text.replace(",", ""))
 
 
 def _evaluate(values: list[int], ops: list[str]) -> int | None:
@@ -230,7 +238,7 @@ def arithmetic_target(prompt: str) -> tuple[str, int] | None:
                     "S" if word in ("what's", "solve", "find", "calculate", "compute") else "w")
         shape.append(kind)
         texts.append(text)
-        values.append(int(text) if kind == "n" else _OPS.get(text, text))
+        values.append(_number(text) if kind == "n" else _OPS.get(text, text))
     shape = "".join(shape)
     found = []
     for m in _MATH_SHAPE.finditer(shape):
@@ -251,6 +259,7 @@ def arithmetic_target(prompt: str) -> tuple[str, int] | None:
 def _numbers(text: str) -> set[int]:
     text = text.casefold()
     found = {int(n) for n in re.findall(r"\d+", text)}
+    found |= {_number(n) for n in re.findall(r"(?<![\d,])\d{1,3}(?:,\d{3})+(?!\d)", text)}
     words = re.findall(r"[^\W\d_]+", text)
     for i, word in enumerate(words):
         if word in _UNITS:
@@ -282,31 +291,81 @@ _QUANTITY = re.compile(r"\bhow (?:many|much|old|far|long|tall)\b|\btotal\b|\bin 
                        r"|\baltogether\b|\bleft\b", re.I)
 
 
-def _steps(text: str) -> list[tuple[str, int | None, int]]:
-    """Worked steps such as "3 apples × $2 = $6" as (expression, its whole-number value or
-    None when it can't be judged, the stated result). Words and money signs between the
-    numbers are skipped; punctuation ends a step, so decimals and times are left alone."""
+class _Step(NamedTuple):
+    """One "=" of worked math. "12 × 8 × 5 = 96 × 5" has expression "12 × 8 × 5" (value
+    480), stated 96 (the first number after "=") and result "96 × 5" (value 480)."""
+    expression: str
+    value: int | None           # None when it can't be judged (fractions, negatives)
+    operands: tuple[int, ...]
+    stated: int
+    result: str                 # "96 × 5", or just "96"
+    result_value: int | None    # None when the right side can't be judged
+
+    @property
+    def wrong(self) -> bool:
+        # Both ways of writing several steps are right: a chain whose parts are all equal
+        # ("12 × 8 × 5 = 96 × 5 = 480") and a running total ("12 × 8 = 96 × 5 = 480").
+        return (self.value is not None and self.value != self.stated
+                and self.result_value is not None and self.result_value != self.value)
+
+
+def _steps(text: str) -> list[_Step]:
+    """Worked steps such as "3 apples × $2 = $6": each "=" with a whole-number expression
+    before it and a number after it. Words and money signs right after a number are its
+    unit and are skipped; punctuation ends a step, so decimals and times are left alone.
+    A step whose leftmost operand is unknown ("½ × 8 × 6", "base × 8", "(5 + 3) × 2",
+    "−3 + 5") is left out rather than judged on the numbers that remain."""
     tokens = [(m.lastgroup, m[0]) for m in _MATH_TOKEN.finditer(text.replace("\u2019", "'"))
               if m[0] not in _MONEY]
     steps = []
     for i, (kind, _) in enumerate(tokens):
         if kind != "e" or i + 1 == len(tokens) or tokens[i + 1][0] != "n":
             continue
-        parts, want = [], "n"
+        parts, want, edge = [], "n", None
         for token, raw in reversed(tokens[:i]):
             if token == "w" and want == "n":  # "3 apples × 2", "2 bags = 6"
                 continue
             if token != want:
+                edge = token
                 break
             parts.append(raw)
             want = "o" if want == "n" else "n"
-        if want == "n" and parts:  # an operator with no number before it
-            parts.pop()
-        if len(parts) < 3:
+        # An operator with no number before it, or a number glued to another ("2 1/2"),
+        # means part of the expression is unknown.
+        if want == "n" or edge in ("n", "f") or len(parts) < 3:
             continue
         parts.reverse()
-        value = _evaluate([int(n) for n in parts[0::2]], [_OPS.get(o, o) for o in parts[1::2]])
-        steps.append((" ".join(parts), value, int(tokens[i + 1][1])))
+        result, want, edge, j = [], "n", None, i + 1
+        while j < len(tokens):
+            token, raw = tokens[j]
+            if token == "w" and want == "o":  # a unit before the next operator: "96 cm × 5"
+                k = j
+                while k < len(tokens) and tokens[k][0] == "w":
+                    k += 1
+                if k < len(tokens) and tokens[k][0] == "o":
+                    j = k
+                    continue
+            if token != want:
+                edge = token
+                break
+            result.append(raw)
+            want = "o" if want == "n" else "n"
+            j += 1
+        stated = _number(result[0])
+        if want == "n":
+            result.pop()
+            result_value = None             # "= 2 × (3 + 4)"
+        elif edge in ("n", "f"):
+            result_value = None             # "= 3 1/2"
+        elif len(result) == 1:
+            result_value = stated
+        else:
+            result_value = _evaluate([_number(n) for n in result[0::2]],
+                                     [_OPS.get(o, o) for o in result[1::2]])
+        operands = tuple(_number(n) for n in parts[0::2])
+        value = _evaluate(list(operands), [_OPS.get(o, o) for o in parts[1::2]])
+        steps.append(_Step(" ".join(parts), value, operands, stated, " ".join(result),
+                           result_value))
     return steps
 
 
@@ -315,27 +374,32 @@ def check_working(where: str, prompt: str, working: str, answer: str) -> bool:
     "how much" question checks that the steps reach the answer. True when that held using
     only the question's numbers; raises when a step is wrong or the steps end elsewhere."""
     steps = _steps(working) + _steps(answer)
-    for expression, value, stated in steps:
-        if value is not None and value != stated:
-            raise DesignError(f"{where}: the working says {expression} = {stated}, but "
-                              f"{expression} = {value}. Fix that step and anything that depends on it.")
-    judged = [(expression, value) for expression, value, _ in steps if value is not None]
+    for step in steps:
+        if step.wrong:
+            comma = "," in step.expression + step.result  # 1,920 not 1920, like the working
+            raise DesignError(
+                f"{where}: the working says {step.expression} = {step.result}, but "
+                f"{step.expression} = {step.value:{',' if comma else ''}}"
+                + (f" and {step.result} = {step.result_value:{',' if comma else ''}}"
+                   if " " in step.result else "")
+                + ". Fix that step and anything that depends on it.")
+    judged = [step for step in steps if step.value is not None]
     if not judged or not _QUANTITY.search(prompt):
         return False
     given, known = _numbers(answer), _numbers(prompt)
-    operands = {int(n) for expression, _ in judged for n in re.findall(r"\d+", expression)}
+    operands = {n for step in judged for n in step.operands}
     # A number the steps found that isn't in the question (7 + 3 = 10 finds 3) counts too.
-    reached = {value for _, value in judged} | (operands - known)
+    reached = {step.value for step in judged} | (operands - known)
     if given and given.isdisjoint(reached):
-        raise DesignError(f"{where}: the working ends at {judged[-1][1]}, but the answer is "
+        raise DesignError(f"{where}: the working ends at {judged[-1].value}, but the answer is "
                           f"{answer!r}. Solve it again from the question's numbers, writing each "
                           "step down to the answer, then make the answer match.")
-    if not given & {value for _, value in judged}:
+    if not given & {step.value for step in judged}:
         return False
-    for expression, value in judged:
-        if not {int(n) for n in re.findall(r"\d+", expression)} <= known:
+    for step in judged:
+        if not set(step.operands) <= known:
             return False
-        known.add(value)
+        known.add(step.value)
     return True
 
 
@@ -356,7 +420,9 @@ def quiz_from_spec(value, pdf_text: str | None = None, name: str = "") -> dict:
         raise DesignError("The source has no questions to answer.")
     if pdf_text is not None:
         actual = _normalize(pdf_text)
-        if any(_normalize(text) not in actual for text in source_texts(spec)):
+        # A PDF from this renderer prints tidy math (10 − 4 for 10 - 4); older ones, the text as written.
+        if not any(all(_normalize(text) in actual for text in source_texts(spec, printed))
+                   for printed in (True, False)):
             raise DesignError("The companion JSON does not match the actual PDF. "
                               "Read the PDF and resolve that mismatch before generating a key.")
         numbers = re.findall(r"(?m)^Question\s+(\d+):\s*$", pdf_text)
@@ -369,7 +435,8 @@ def quiz_from_spec(value, pdf_text: str | None = None, name: str = "") -> dict:
         "theme": spec["theme"],
         "passages": passages or [q["prompt"] for q in questions],
         "questions": [
-            {"number": i, "label": q["label"], "prompt": q["prompt"], "options": q["options"]}
+            {"number": i, "label": q["label"], "prompt": q["prompt"], "options": q["options"],
+             **({"figure": q["figure"]} if q["figure"] else {})}
             for i, q in enumerate(questions, 1)
         ],
     }
@@ -738,7 +805,8 @@ def key_document(value, quiz: dict, source_path: str, digest: str) -> tuple[dict
             body += "\nSource issue: " + issue
             issues.append(number)
         body += "\n\n" + "\n".join(citations)
-        paragraphs.append({"heading": question["label"], "text": body})
+        paragraphs.append({"heading": question["label"], "text": body,
+                           **({"figure": question["figure"]} if question.get("figure") else {})})
     if errors:
         raise _problems(errors)
     document = {
@@ -843,7 +911,8 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
             body += "\n\n" + "\n".join(
                 (f"{_cited(found, 'Paragraph')}: " if passages else "Evidence: ") + f'"{shown}"'
                 for found, shown in citations)
-        paragraphs.append({"heading": q["label"], "text": body})
+        paragraphs.append({"heading": q["label"], "text": body,
+                           **({"figure": q["figure"]} if q["figure"] else {})})
     if errors:
         raise _problems(errors)
     document = {

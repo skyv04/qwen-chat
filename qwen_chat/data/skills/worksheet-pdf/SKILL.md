@@ -114,6 +114,47 @@ quotes really appear, simple sums like `3 + 2 = __` or `What is 10 - 4?` are rig
 written steps add up and end at the chosen answer.
 It cannot judge facts or reasoning, so check those yourself.
 
+## Math: figures and fractions
+
+Type fractions as `3/4` and mixed numbers as `1 1/2`: the PDF prints them stacked, the
+numerator over the denominator (`?/4` and `__/4` work as blanks). `6 x 4` or `6 * 4`
+prints as 6 × 4, `10 - 4` as 10 − 4, `5^2` as 5², `<=` as ≤; LaTeX such as `\frac{3}{4}`,
+`\sqrt{16}`, `\times` and `\pi` works too. Dates such as 3/4/2025 stay as typed.
+
+Give every geometry, measurement or fraction-model question a `figure`: one object, or a
+list of up to 4, drawn beside its options. A reading paragraph written as an object may
+have one too. Lengths are numbers, `"6 cm"`, `"3 1/2"`, a letter such as `"x"`, or
+`"?"` for the length the student must find.
+
+- `{"shape": "rectangle", "length": 8, "width": 5, "unit": "cm"}`; `square` takes
+  `side`. Add `"grid": true` for unit squares or `parts`/`shaded` for equal parts.
+- `{"shape": "triangle", "base": 6, "height": 4}`, or `"sides": [3, 4, 5]`, with
+  optional `"kind": "right"` and `"angles": [60, 60, "?"]`.
+- `{"shape": "circle", "radius": 5}` or `"diameter": 10`.
+- `parallelogram` (`base`, `height`, `side`), `trapezoid` (`top`, `bottom`, `height`),
+  `rhombus` (`side`, `diagonals`), `pentagon` to `decagon` (`side`), or `polygon` with
+  `points` such as `[[0,0],[6,0],[6,4]]` and `edges`, one label per side.
+- `{"shape": "angle", "degrees": 120}`; `{"shape": "lines", "kind": "parallel"}`.
+- `{"shape": "fraction", "fraction": "3/8", "model": "bar"}` (or `circle`, `set`).
+- `{"shape": "number_line", "start": 0, "end": 1, "divisions": 4, "points": ["3/4"]}`.
+- `{"shape": "array", "rows": 3, "columns": 4}`;
+  `{"shape": "area_model", "rows": [10, 7], "columns": [30, 3]}`.
+- `{"shape": "prism", "length": 5, "width": 3, "height": 2}` (a box) or `cube` with
+  `side`; `"cubes": true` shows unit cubes.
+- `{"shape": "triangular_prism", "base": 8, "height": 6, "length": 10}`: the end
+  triangle's base and height, and the prism's length; `"kind": "right"` for a
+  right-triangle end.
+- `{"shape": "coordinate_grid", "size": 10, "points": ["A(2, 3)", [5, 1]]}`.
+- `{"shape": "clock", "time": "3:45"}`; `{"shape": "base_ten", "number": 243}`;
+  `{"shape": "bar_graph", "bars": {"Mon": 4, "Tue": 6}, "title": "Books read"}`.
+- Optional: `vertices` (corner names such as `"ABCD"`) on polygons, and `caption`.
+
+Label only what the question gives, never the answer; mark the length to find `"?"`.
+A prompt that names a shape and its sizes ("A rectangle is 6 cm long and 4 cm wide") is
+drawn even without `figure`; set `"figure": []` to leave a picture out. The report
+warns about prompts that mention a picture they lack and figures that could not be
+drawn: fix those with edit_file, then render again.
+
 ## Emoji and output
 
 Each icon is one emoji picture, not words or two emoji. Joined emoji (👨‍🚀), skin tones,

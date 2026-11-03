@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import html
 import json
 import os
@@ -17,6 +18,12 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+
+try:
+    from . import figures, mathtext
+except ImportError:  # run as a script by tools.render_worksheet
+    import figures
+    import mathtext
 
 DATA = Path(__file__).with_name("data")
 MAX_SPEC_BYTES = 160_000
@@ -176,7 +183,10 @@ DOCUMENT_FIELDS = frozenset({
     "title", "subtitle", "series", "student_line", "meta", "instructions", "reading_title",
     "reading", "reading_note", "question_title", "questions", "challenge", "closing_note",
     "theme", "max_pages", "answer_key_max_pages"})
-QUESTION_FIELDS = frozenset({"prompt", "label", "lines", "options", "icon", *KEY_FIELDS})
+QUESTION_FIELDS = frozenset({"prompt", "label", "lines", "options", "icon", "figure", *KEY_FIELDS})
+READING_FIELDS = frozenset({"text", "heading", "figure"})
+FIGURE_FORMAT = ('a figure is an object such as {"shape": "rectangle", "length": 6, "width": 4, '
+                 '"unit": "cm"}; load worksheet-pdf for every shape')
 _READING_ALIASES = ("passage", "story")
 _ICON_ALIASES = ("icons", "emoji", "emojis", "color_emoji")
 _QUESTION_ALIASES = {"question": "prompt", "text": "prompt", "choices": "options"}
@@ -228,6 +238,28 @@ _OFF = ("", "none", "no", "off", "false", "plain")
 _LETTERED = re.compile(r"\s*\(?([A-Ha-h])[.):]\s+(\S.*)", re.S)
 _LETTER_ONLY = re.compile(r"\s*\(?[A-Ha-h]\)?[.):]?\s*")
 _NUMBERED = re.compile(r"\s*(\d{1,2})[.):]\s+(\S.*)", re.S)
+
+
+@functools.lru_cache(maxsize=256)
+def _svg(key: str) -> tuple[str, int, int]:
+    return figures.svg(json.loads(key))
+
+
+def _drawn(figure: dict) -> tuple[str, int, int]:
+    """SVG markup, width and height for a canonical figure; raises figures.FigureError."""
+    return _svg(json.dumps(figure, sort_keys=True, ensure_ascii=False))
+
+
+def _figures(value, where: str) -> list[dict]:
+    found, _notes, problems = figures.parse(value, f"{where} figure")
+    if problems:
+        raise DesignError(f"{problems[0]}; {FIGURE_FORMAT}.")
+    for figure in found:
+        try:
+            _drawn(figure)
+        except figures.FigureError as error:
+            raise DesignError(f"{where} figure: {error}") from None
+    return found
 
 
 def _empty(value) -> bool:
@@ -551,12 +583,18 @@ def restyle_theme(old, change: dict) -> tuple[dict, list[str]]:
     return theme, notes
 
 
-def normalize_spec(value, name: str = "") -> tuple[dict, list[str]]:
+def normalize_spec(value, name: str = "", warnings: list[str] | None = None
+                   ) -> tuple[dict, list[str]]:
     """Fixes common near-misses in a drafted worksheet (renamed fields, a theme given as text,
     top-level icons, empty or look-only extra fields, an unavailable motif, a pale accent,
     hand-typed numbering, a separate answer summary, a missing title) and says what changed,
     so they don't each cost a rewrite and another render. `name` is the JSON file's name,
-    used for a missing title. Anything else is left for validate_spec to report."""
+    used for a missing title. Anything else is left for validate_spec to report.
+
+    Figures are made canonical, and a shape a prompt describes is drawn when no figure was
+    given. A figure that can't be drawn is left out rather than failing the worksheet: that,
+    and a prompt that talks about a missing picture, is added to `warnings` when a list is
+    given (otherwise it is a note)."""
     if not isinstance(value, dict):
         return value, []
     found: dict[str, list[str]] = {}
@@ -565,6 +603,78 @@ def normalize_spec(value, name: str = "") -> tuple[dict, list[str]]:
         found.setdefault(text, [])
         if where:
             found[text].append(where)
+
+    art = {"left": figures.PER_DOCUMENT, "in_reading": False}
+
+    def picture(item: dict, where: str, prompt=None) -> None:
+        """Puts the item's picture under "figure" as canonical figures. An explicit [] or
+        "none" means no picture; without a figure, a shape the prompt describes is drawn."""
+        for alias in figures.FIELD_ALIASES:
+            if alias not in item or _empty(item[alias]):
+                continue
+            value = item.pop(alias)
+            emoji = _emoji_clusters(value.strip()) if isinstance(value, str) else None
+            if emoji and len(emoji) == 1:
+                if "icon" in item:
+                    note(f"ignored '{alias}' (an emoji, and icon is already set)", where)
+                else:
+                    item["icon"] = emoji[0]
+                    note(f"read '{alias}' as 'icon' (an emoji is the question's icon)", where)
+            elif not _empty(item.get("figure")):
+                note(f"ignored '{alias}' ('figure' is already set)", where)
+            else:
+                item["figure"] = value
+                note(f"read '{alias}' as 'figure'", where)
+        if "figure" in item and (item["figure"] is True or item["figure"] in (None, "", {})):
+            del item["figure"]  # a placeholder, not a choice: the prompt may still say what to draw
+        given, problems = "figure" in item, []
+        text = prompt if isinstance(prompt, str) else ""
+        text = m[2] if (m := _NUMBERED.fullmatch(text)) else text
+        if given:
+            drawn, notes, problems = figures.parse(item["figure"], f"{where} figure")
+            for line in notes:
+                note(line)
+            drawn, fixed = figures.follow_prompt(drawn, text)
+            for line in fixed:
+                note(line, where)
+        else:
+            drawn = figures.infer(text) if text else []
+            if not drawn:
+                if (warnings is not None and figures.needs_picture(text)
+                        and not art["in_reading"]):
+                    warnings.append(f"{where} talks about a picture but has no figure")
+                return
+        kept, wrong = [], []
+        for figure in drawn:
+            try:
+                _drawn(figure)
+            except figures.FigureError as error:
+                problems.append(f"{where} figure: {error}")
+                if isinstance(error, figures.Impossible):
+                    wrong.append(f"{where}: {error}")
+                continue
+            if art["left"] <= 0:
+                problems.append(f"{where} figure: a document holds at most "
+                                f"{figures.PER_DOCUMENT} figures")
+                continue
+            art["left"] -= 1
+            kept.append(figure)
+        if not given:
+            # The prompt's shape is a bonus the model didn't ask for, but numbers that cannot
+            # make the shape it describes are a mistake in the question.
+            problems = wrong
+            if kept:
+                shown = kept[0] if len(kept) == 1 else kept
+                note("drew " + json.dumps(shown, ensure_ascii=False) + " from the prompt; set "
+                     '"figure": [] to leave it out', where)
+                item["figure"] = kept
+        else:
+            item["figure"] = kept
+        for problem in problems:
+            if warnings is None:
+                note(f"left out a figure that could not be drawn ({problem})")
+            else:
+                warnings.append(problem)
 
     data = dict(value)
     for alias in _READING_ALIASES:
@@ -593,6 +703,15 @@ def normalize_spec(value, name: str = "") -> tuple[dict, list[str]]:
         if dropped:
             data["reading"] = kept
             note(f"removed {dropped} empty reading paragraph{'s' if dropped > 1 else ''}")
+        paragraphs = []
+        for i, p in enumerate(data["reading"], 1):
+            if isinstance(p, dict) and p.keys() & {"figure", *figures.FIELD_ALIASES}:
+                p = dict(p)
+                picture(p, f"reading paragraph {i}")
+                art["in_reading"] = art["in_reading"] or bool(p.get("figure"))
+            paragraphs.append(p)
+        if paragraphs != data["reading"]:
+            data["reading"] = paragraphs
     theme = data.get("theme")
     if isinstance(theme, str):
         label = " ".join(theme.split())
@@ -727,6 +846,7 @@ def normalize_spec(value, name: str = "") -> tuple[dict, list[str]]:
                 note("read question field 'answer_text' as 'explanation'", where)
             else:
                 item["answer_text"] = extra
+        picture(item, where, item.get("prompt"))
         for field in [k for k in item if k not in QUESTION_FIELDS]:
             why = _extra_field(field, item[field])
             if why:
@@ -817,10 +937,11 @@ def validate_spec(value) -> dict:
     for i, item in enumerate(reading, 1):
         if isinstance(item, str):
             item = {"text": item}
-        item = _object(item, {"text", "heading"}, f"reading paragraph {i}")
+        item = _object(item, READING_FIELDS, f"reading paragraph {i}")
         spec["reading"].append({
             "text": _text(item.get("text", ""), f"reading paragraph {i}", required=True),
             "heading": _text(item.get("heading", ""), f"reading heading {i}", 160),
+            "figure": _figures(item.get("figure", []), f"reading paragraph {i}"),
         })
     questions = value.get("questions", [])
     if not isinstance(questions, list) or len(questions) > 30:
@@ -841,6 +962,7 @@ def validate_spec(value) -> dict:
             "options": [_text(o, f"{where} option", 1000, True) for o in options],
             "icon": _icon(item.get("icon", icons[(number - 1) % len(icons)]),
                           f"{where} icon"),
+            "figure": _figures(item.get("figure", []), where),
             # Parent-key data: checked by answer_key.worksheet_key, never rendered here.
             "key": {k: item[k] for k in KEY_FIELDS if k in item},
         }
@@ -849,22 +971,33 @@ def validate_spec(value) -> dict:
     spec["challenge"] = question(value["challenge"], len(questions) + 1, True) if "challenge" in value else None
     if not reading and not questions and not spec["challenge"]:
         raise DesignError("Provide a reading passage or questions; a title page alone is not a worksheet.")
+    if figure_count(spec) > figures.PER_DOCUMENT:
+        raise DesignError(f"A worksheet holds at most {figures.PER_DOCUMENT} figures; this one "
+                          f"has {figure_count(spec)}. Split it into separate documents.")
     if sum(len(t) for t in source_texts(spec)) > 60_000:
         raise DesignError("Too much text for one worksheet. Split it into separate documents.")
     return spec
 
 
-def source_texts(spec: dict) -> list[str]:
-    texts = [spec[k] for k in ("title", "subtitle", "series", "student_line", "meta",
-                               "instructions", "reading_note", "closing_note")]
+def figure_count(spec: dict) -> int:
+    return sum(len(item["figure"]) for item in [*spec["reading"], *spec["questions"],
+                                                *([spec["challenge"]] if spec["challenge"] else [])])
+
+
+def source_texts(spec: dict, printed: bool = False) -> list[str]:
+    """The document's text blocks. With printed, body text is as the PDF prints it (tidy
+    math symbols; LaTeX as plain text), for checking the PDF's text layer."""
+    body = mathtext.printed if printed else str
+    texts = [spec[k] for k in ("title", "subtitle", "series", "student_line", "meta")]
+    texts += [body(spec[k]) for k in ("instructions", "reading_note", "closing_note")]
     if spec["reading"]:
         texts.append(spec["reading_title"])
     if spec["questions"] or spec["challenge"]:
         texts.append(spec["question_title"])
     for paragraph in spec["reading"]:
-        texts.extend((paragraph["heading"], paragraph["text"]))
+        texts.extend((paragraph["heading"], body(paragraph["text"])))
     for question in [*spec["questions"], *([spec["challenge"]] if spec["challenge"] else [])]:
-        texts.extend((question["label"], question["prompt"], *question["options"]))
+        texts.extend((question["label"], body(question["prompt"]), *map(body, question["options"])))
     return [t for t in texts if t.strip()]
 
 
@@ -917,9 +1050,28 @@ def _decor(motif: str) -> str:
     return '<svg class="decor" viewBox="0 0 816 1056" aria-hidden="true">' + "".join(shapes) + "</svg>"
 
 
+# Figures sit beside multiple-choice options when both are small enough to share a row.
+_BESIDE_WIDTH = 330
+_BESIDE_OPTION = 42
+_FIGURE_GAP = 26
+
+
+def _figure_row(found: list[dict]) -> str:
+    return ('<div class="figures">' + "".join(_drawn(f)[0] for f in found) + "</div>"
+            if found else "")
+
+
+def _beside(question: dict) -> bool:
+    found = question["figure"]
+    width = sum(_drawn(f)[1] for f in found) + _FIGURE_GAP * (len(found) - 1)
+    return (bool(found) and bool(question["options"]) and width <= _BESIDE_WIDTH
+            and max(len(mathtext.printed(o)) for o in question["options"]) <= _BESIDE_OPTION)
+
+
 def make_html(spec: dict) -> str:
     icons = spec["theme"]["icons"]
     blocks: list[str] = []
+    text = mathtext.to_html
 
     def chunk(body: str) -> None:
         blocks.append(f'<section class="chunk" data-block="{len(blocks) + 1}">{body}</section>')
@@ -927,8 +1079,8 @@ def make_html(spec: dict) -> str:
     def band(text: str, icon: str) -> str:
         return f'<h2 class="band">{_emoji(icon)}<span>{_e(text)}</span></h2>'
 
-    def note(text: str, icon: str) -> str:
-        return f'<aside class="callout">{_emoji(icon)}<p>{_e(text)}</p></aside>'
+    def note(words: str, icon: str) -> str:
+        return f'<aside class="callout">{_emoji(icon)}<p>{text(words)}</p></aside>'
 
     intro = ""
     if spec["student_line"]:
@@ -943,8 +1095,12 @@ def make_html(spec: dict) -> str:
         heading = band(spec["reading_title"], icons[0]) if i == 1 else ""
         if p["heading"]:
             heading += f'<h3 class="reading-heading">{_e(p["heading"])}</h3>'
+        # A figure follows the paragraph's first part: in an answer key, that is the question.
+        first, _, rest = p["text"].partition("\n\n") if p["figure"] else (p["text"], "", "")
         body = (heading + f'<p class="reading-text"><span class="paragraph-number">[{i}]</span> '
-                + _e(p["text"]) + "</p>")
+                + text(first) + "</p>" + _figure_row(p["figure"]))
+        if rest.strip():
+            body += f'<p class="reading-text after-figure">{text(rest)}</p>'
         if i == len(spec["reading"]) and spec["reading_note"]:
             body += note(spec["reading_note"], icons[-1])
         chunk(body)
@@ -954,14 +1110,16 @@ def make_html(spec: dict) -> str:
     for i, q in enumerate(questions, 1):
         bonus = i > len(spec["questions"])
         badge = "+" if bonus else f"{i:02}"
-        options = "".join(f'<li><b>{chr(65 + j)}.</b> {_e(o)}</li>' for j, o in enumerate(q["options"]))
+        options = "".join(f'<li><b>{chr(65 + j)}.</b> {text(o)}</li>' for j, o in enumerate(q["options"]))
+        options = f'<ol class="options">{options}</ol>' if options else ""
+        art = _figure_row(q["figure"])
         lines = "".join('<div class="answer-line"></div>' for _ in range(q["lines"]))
         question = (
             f'<article class="question" data-question="{i}" data-answer-lines="{q["lines"]}">'
             f'<div class="question-head"><span class="number-badge">{badge}</span>'
             f'<div class="question-copy"><p class="question-label">{_e(q["label"])}</p>'
-            f'<p class="q-prompt">{_e(q["prompt"])}</p></div>{_emoji(q["icon"])}</div>'
-            + (f'<ol class="options">{options}</ol>' if options else "")
+            f'<p class="q-prompt">{text(q["prompt"], True)}</p></div>{_emoji(q["icon"])}</div>'
+            + (f'<div class="q-body">{art}{options}</div>' if _beside(q) else art + options)
             + (f'<div class="answer-space" aria-label="Answer space">{lines}</div>' if lines else "")
             + "</article>")
         if i == 1:
@@ -1075,7 +1233,7 @@ def render(spec: dict, destination: Path) -> dict:
         if text.returncode:
             raise DesignError("Could not check the PDF's text: " + text.stderr[-600:])
         actual = _normalize(text.stdout)
-        for i, source in enumerate(source_texts(spec), 1):
+        for i, source in enumerate(source_texts(spec, printed=True), 1):
             if _normalize(source) not in actual:
                 raise DesignError(f"Text block {i} did not survive PDF export intact. "
                                   "No PDF was saved; do not delete or paraphrase it to hide the problem.")
@@ -1083,6 +1241,7 @@ def render(spec: dict, destination: Path) -> dict:
         audit["questions"] = len(spec["questions"])
         audit["multiple_choice"] = sum(bool(q["options"]) for q in spec["questions"])
         audit["challenge"] = bool(spec["challenge"])
+        audit["figures"] = figure_count(spec)
         os.replace(pdf, destination)
         return audit
 

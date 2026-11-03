@@ -620,6 +620,20 @@ def _pdftotext(path: Path, raw: bool = False) -> str:
     return res.stdout.decode("utf-8", errors="replace")
 
 
+def _content_ordered(path: Path) -> bool:
+    """True for a PDF printed by headless Chromium, such as this app's worksheets. Its content
+    stream is in reading order, while layout analysis moves small hidden text (the text of a
+    stacked fraction) and margin pictures onto lines of their own."""
+    if not shutil.which("pdfinfo"):
+        return False
+    try:
+        res = subprocess.run(["pdfinfo", str(path)], capture_output=True, timeout=20,
+                             stdin=subprocess.DEVNULL, env=child_env())
+    except subprocess.TimeoutExpired:
+        return False
+    return not res.returncode and re.search(rb"(?m)^Creator:.*\bHeadlessChrome/", res.stdout) is not None
+
+
 def _tidy_text(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", text)).strip()
@@ -1882,6 +1896,9 @@ PROGRAM_TOOLS = [
         "answer_key_path: one call checks every answer and creates both PDFs, with no answers "
         "on the student copy. To change only the LOOK of an existing worksheet (new mascot, "
         "colors, background), pass its existing spec_path plus theme; never retype its content. "
+        "Geometry and fraction questions take a figure such as {\"shape\": \"rectangle\", "
+        "\"length\": 6, \"width\": 4, \"unit\": \"cm\"}, drawn beside the options; fractions "
+        "typed as 3/4 print stacked. "
         "For a key to an EXISTING quiz, use read_quiz and render_answer_key.",
         {"spec_path": {**_S, "description": "Workspace JSON file containing the worksheet data"},
          "path": {**_S, "description": "Destination .pdf file in the workspace"},
@@ -2234,7 +2251,7 @@ class ToolBox:
     def _pdf_text(self, f: Path) -> str:
         """A PDF's text, plus the words OCR reads in its pictures where the text layer lacks
         them (a scan, or questions pasted in as screenshots), marked page by page."""
-        full = _pdftotext(f)
+        full = _pdftotext(f, raw=_content_ordered(f))
         pages = full.split("\f")
         if len(pages) > 1 and not pages[-1].strip():
             pages.pop()
@@ -2640,8 +2657,8 @@ class ToolBox:
                          expected_multiple_choice: int | None = None,
                          answer_key_path: str | None = None, theme=None) -> str:
         from .answer_key import worksheet_key
-        from .worksheet_pdf import (DesignError, normalize_spec, restyle_theme, validate_spec,
-                                    without_answers)
+        from .worksheet_pdf import (FIGURE_FORMAT, DesignError, normalize_spec, restyle_theme,
+                                    validate_spec, without_answers)
 
         self._check_declined()
         if self._cancelled():
@@ -2649,7 +2666,8 @@ class ToolBox:
         source = self.ws.resolve(spec_path)
         change = _theme_change(theme)
         data, _ = self._json_data(source)
-        data, adjusted = normalize_spec(data, source.stem)
+        pictures: list[str] = []
+        data, adjusted = normalize_spec(data, source.stem, pictures)
         if answer_key_path and _keyish(path) and not _keyish(answer_key_path):
             # A file named like a key must hold the answers, or a child could get them.
             path, answer_key_path = answer_key_path, path
@@ -2728,6 +2746,10 @@ class ToolBox:
                        f"{self.ws.display(source)}; only the look changed.")
         result += "\nLook: " + json.dumps(spec["theme"], ensure_ascii=False)
         result += _handled(adjusted, json_kept=not change)
+        if pictures:
+            result += ("\nPictures missing from the PDF: " + "; ".join(dict.fromkeys(pictures))
+                       + f". Fix each in the JSON with edit_file ({FIGURE_FORMAT}), or reword a "
+                       "question so it needs no picture, then render again.")
         if unchecked:
             result += ("\nNot checked, because the user's recent messages do not ask for that "
                        "many: " + "; ".join(unchecked) + ". If the user did ask for it, fix the "

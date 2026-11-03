@@ -812,6 +812,29 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn(note, text)
         self.assertEqual((self.ws.root / "harvest.json").read_text(), raw)
 
+    def test_worksheet_shapes_are_drawn_from_prompts_and_missing_pictures_are_reported(self):
+        spec = {"title": "Shapes", "questions": [
+            {"prompt": "A rectangle is 6 cm long and 4 cm wide. What is its area?",
+             "options": ["10 square cm", "24 square cm"]},
+            {"prompt": "Look at the shape below. What is its perimeter?", "lines": 1}]}
+        raw = json.dumps(spec)
+        (self.ws.root / "shapes.json").write_text(raw)
+        staged = []
+
+        def render(argv, *_args):
+            staged.append(json.loads(Path(argv[-2]).read_text()))
+            return self._render_ok(argv)
+
+        with mock.patch.object(tools, "run_streaming", side_effect=render):
+            ok, text = self.run_tool("render_worksheet", spec_path="shapes.json", path="shapes.pdf")
+        self.assertTrue(ok, text)
+        self.assertEqual(staged[0]["questions"][0]["figure"],
+                         [{"shape": "rectangle", "length": 6, "width": 4, "unit": "cm"}])
+        self.assertNotIn("figure", staged[0]["questions"][1])
+        self.assertIn("Pictures missing from the PDF: Question 2 talks about a picture but has no "
+                      "figure. Fix each in the JSON with edit_file", text)
+        self.assertEqual((self.ws.root / "shapes.json").read_text(), raw)
+
     def test_page_limits_and_counts_follow_what_the_user_asked(self):
         data = self._homework_spec()
         source = self.ws.root / "moon.json"

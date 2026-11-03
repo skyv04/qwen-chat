@@ -174,7 +174,9 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "passage, questions or answers for a look change, and describe the new look only as "
             "the report's Look line confirms. Match the topic with related emoji and margin "
             "artwork; keep text and writing "
-            "areas clear. Read the renderer's report and fix failures before claiming the file is "
+            "areas clear. For math, give each geometry, measurement or fraction-model question "
+            "a figure object as the skill shows, labeled with the given sizes and \"?\" for "
+            "the one to find, never the answer; type fractions as 3/4, which print stacked. Read the renderer's report and fix failures before claiming the file is "
             "ready. Automated checks are not visual inspection; don't claim you saw the pages.")
         parts.append(
             "\n## Answer keys and opening files\n"

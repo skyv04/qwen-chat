@@ -60,7 +60,8 @@ started it.
   reusable renderer: related color emoji, themed margins, consistent headings,
   portrait pages, numbered paragraphs and ruled answer areas, instead of a new
   hand-written PDF script for every request. A new worksheet and its parent answer key
-  are checked and created together in one step.
+  are checked and created together in one step. Math questions get drawn figures
+  (shapes, fraction models, number lines, grids) and neatly stacked fractions.
 - Answer keys have their own **answer-key** skill and source-checked renderer:
   exact question/option identities, complete answer coverage, quoted evidence and
   explicit flags for defective questions, not a student worksheet with empty lines.
@@ -188,6 +189,21 @@ An unavailable motif becomes `dots`, a too-pale accent is darkened, and line bre
 typed inside JSON text are accepted. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
 with its line, column and text, so one `edit_file` call can fix it.
+
+Math reads like a textbook. A fraction typed as `3/4` or `1 1/2` prints stacked, with
+the numerator over the denominator; `6 x 4`, `10 - 4`, `5^2` and simple LaTeX such as
+`\frac{3}{4}` print as 6 × 4, 10 − 4, 5² and a stacked fraction. The JSON keeps the
+text as typed, and `read_file` reads `3/4` back from the PDF. A question or reading
+paragraph can carry a `figure`, such as
+`{"shape": "rectangle", "length": 6, "width": 4, "unit": "cm"}`, drawn as a labeled
+picture beside the options (and repeated in the answer key):
+rectangles, triangles, circles and other polygons, angles and lines, fraction bars,
+circles and sets, number lines, arrays, area models, rectangular and triangular
+prisms, coordinate grids, clocks, base-ten blocks and bar graphs. A prompt that names
+a shape and its sizes, such as "A rectangle is 6 cm long and 4 cm wide", is drawn
+even without one, unless the question sets `"figure": []`. The report warns about a
+prompt that refers to a picture it doesn't have, or a figure that couldn't be drawn,
+so it can be fixed.
 
 A theme can also set `background` (`plain`, or `rainbow` for a pastel rainbow fading
 behind the text) and a `mascot` emoji shown first in the header. To change only the
