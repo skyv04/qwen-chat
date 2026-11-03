@@ -86,7 +86,8 @@ All text is plain: no HTML, Markdown or scripts. Unknown fields are rejected.
 ```
 
 - `theme`: `name`, `accent`, `icons`, `motif`, and optionally `background` and `mascot`.
-- `reading`: paragraphs as strings, or `{"heading": "...", "text": "..."}`. Leave it out
+- `reading`: a top-level list of paragraphs as strings, or `{"heading": "...", "text":
+  "..."}`; the story's title goes in `reading_title`, not inside reading. Leave it out
   for a math or activity sheet; never add sentences to it just to quote them.
 - `prompt` is the question only and `options` are the choices only: the PDF adds
   "Question 1:" and the A/B/C letters itself.
@@ -97,6 +98,8 @@ All text is plain: no HTML, Markdown or scripts. Unknown fields are rejected.
   counted in the expected question numbers.
 - Other optional fields: `subtitle`, `series`, `student_line`, `meta`, `reading_title`,
   `reading_note`, `question_title`, `closing_note`, `max_pages`, `answer_key_max_pages`.
+  Every field sits at the top level; `meta` is one short line of text such as
+  "Grade 1 · Reading · 15 minutes", never an object holding other fields.
 
 Answer fields, only for a parent key (never printed on the student PDF):
 - `choice`: the correct option's letter (A is the first option); required for
@@ -104,7 +107,9 @@ Answer fields, only for a parent key (never printed on the student PDF):
 - `answer`: the expected answer; required for written questions. For open or creative
   prompts write "Answers will vary, for example: ...".
 - `evidence`: an exact quote, or a list of up to six, copied word for word from the
-  reading. Without a reading, put the reason in `explanation` instead.
+  reading; quote whole sentences. Without a reading, put the reason in `explanation`
+  instead. For creative or math questions no sentence supports, leave evidence out
+  (never "N/A").
 - `explanation`: an optional short reason, shown to the parent as "Why:". For a word
   problem, write the steps with the question's numbers, ending at the answer:
   `"$10 - $6 - $4 = $0"`.

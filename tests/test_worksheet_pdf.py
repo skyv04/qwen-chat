@@ -194,6 +194,29 @@ class WorksheetKeyTest(unittest.TestCase):
                 worksheet_key(pdf.validate_spec({"title": "Volume", "questions": [
                     {"prompt": prompt, "answer": working}]}))
 
+    def test_a_quote_with_words_left_out_shows_whole_sentences_but_never_drops_a_not(self):
+        # From Qwen's grade-1 key: "Benny collected... Rosie wove..." was rejected although both
+        # sentences are in the story, and Qwen cut the story trying to make it match.
+        data = {"title": "Rainbow bridge", "reading": [
+                    "Luna saw that the bridge was not safe.",
+                    "Next, Benny the beaver collected shiny leaves. Then, Rosie the rabbit wove "
+                    "magical threads."],
+                "questions": [{"prompt": "How did the friends help?", "answer": "They brought leaves.",
+                               "evidence": "Benny collected... Rosie wove..."}]}
+        document, audit = worksheet_key(pdf.validate_spec(data))
+        self.assertIn('Paragraph [2]: "Next, Benny the beaver collected shiny leaves. Then, Rosie the '
+                      'rabbit wove magical threads."', document["reading"][0]["text"])
+        self.assertEqual(audit["evidence_quotes_checked"], 1)
+        for quote, message in (
+                ("Luna saw that the bridge was safe.",
+                 "evidence is not in the source: 'Luna saw that the bridge was safe.'. The closest "
+                 "source sentence is 'Luna saw that the bridge was not safe.'"),
+                ("Benny collected... Rosie sang...",
+                 "part of the evidence is not in the source: 'Rosie sang'.")):
+            data["questions"][0]["evidence"] = quote
+            with self.subTest(quote=quote), self.assertRaisesRegex(pdf.DesignError, re.escape(message)):
+                worksheet_key(pdf.validate_spec(data))
+
     def test_reasons_given_as_evidence_on_a_math_sheet_become_explanations(self):
         data = {"title": "Harvest math", "questions": [
             {"prompt": "3 + 4 = __", "answer": "7", "evidence": "3 apples and 4 more make 7."},
@@ -257,6 +280,44 @@ class NormalizeSpecTest(unittest.TestCase):
                          "lines must be 1-12 here, so 12 was used (challenge)",
                          "removed typed numbers from prompts (the PDF numbers questions)"):
             self.assertIn(expected, joined)
+
+    def test_meta_and_reading_objects_keep_the_whole_story_and_its_look(self):
+        # Shaped like Qwen's grade-1 drafts: the title, theme and page limit inside meta, the
+        # story inside a reading object with an empty entry between paragraphs, and "N/A"
+        # evidence. Rejecting them made Qwen flatten meta, losing the look, and cut the story
+        # until its quotes broke and the run stopped.
+        draft = {
+            "meta": {"title": "Luna's Rainbow Bridge", "grade": 1, "max_pages": 4,
+                     "theme": {"mascot": "\U0001f984", "motif": "stars"}},
+            "reading": {"title": "The Rainbow Bridge", "paragraph_count": 2,
+                        "passage": ["Luna saw that the bridge was not safe.", "She called her friends.",
+                                    "", "Next, Benny the beaver collected shiny leaves."]},
+            "questions": [{"prompt": "Draw the new bridge.", "evidence": "N/A - creative response"}]}
+        original = copy.deepcopy(draft)
+        data, notes = pdf.normalize_spec(draft)
+        self.assertEqual(draft, original)
+        self.assertEqual(data, {
+            "title": "Luna's Rainbow Bridge", "max_pages": 4, "meta": "Grade: 1",
+            "theme": {"mascot": "\U0001f984", "motif": "stars"}, "reading_title": "The Rainbow Bridge",
+            "reading": ["Luna saw that the bridge was not safe.\nShe called her friends.",
+                        "Next, Benny the beaver collected shiny leaves."],
+            "questions": [{"prompt": "Draw the new bridge."}]})
+        pdf.validate_spec(data)
+        joined = "; ".join(notes)
+        for expected in ("moved title, max_pages, theme out of meta to the top level",
+                         "made the meta line from meta.grade",
+                         "read the reading object's 'passage' as the reading's paragraphs, 'title' "
+                         "as reading_title", "ignored reading.paragraph_count",
+                         "joined 3 reading lines into 2 paragraphs", "ignored evidence such as 'N/A'"):
+            self.assertIn(expected, joined)
+        # An object without paragraphs to find is named, not reported as a story that is too long.
+        with self.assertRaisesRegex(pdf.DesignError, r"reading must be a list of paragraph strings, "
+                                    r"not an object with chapter_one, title\. Put the paragraphs"):
+            pdf.validate_spec(pdf.normalize_spec({"title": "X", "questions": [{"prompt": "Q?"}],
+                                                  "reading": {"title": "X", "chapter_one": "Long ago."}})[0])
+        with self.assertRaisesRegex(pdf.DesignError, "reading has 61 paragraphs; the most is 60. Keep "
+                                                     "the whole story"):
+            pdf.validate_spec({"title": "X", "reading": ["A."] * 61, "questions": [{"prompt": "Q?"}]})
 
     def test_a_missing_title_comes_from_the_file_name_even_with_a_text_theme(self):
         data, notes = pdf.normalize_spec({"theme": "ocean waves",

@@ -174,10 +174,21 @@ class WorkspaceSandboxTest(unittest.TestCase):
                 ok, out = self.run_tool("write_file", path="new.json", content=note)
                 self.assertFalse(ok)
                 self.assertIn("Write the complete content of new.json", out)
+        # Qwen's own short copy of such a note, as the whole text or a whole JSON value.
+        for content in ("[6,074 characters]", '{"title": "x", "reading": "[6,074 characters]"}'):
+            with self.subTest(content=content):
+                ok, out = self.run_tool("write_file", path="sheet.json", content=content)
+                self.assertFalse(ok)
+                self.assertIn("Nothing was saved", out)
+                ok, out = self.run_tool("write_file", path="new.json", content=content)
+                self.assertFalse(ok)
+                self.assertIn("'[6,074 characters]', a note from shortened chat history", out)
         self.assertEqual(f.read_text(), '{"title": "Farm day"}')
         self.assertFalse((self.ws.root / "new.json").exists())
         self.assertFalse(self.ws.trash_dir.exists())
         ok, out = self.run_tool("write_file", path="ok.txt", content="Use [brackets] to save space.")
+        self.assertTrue(ok, out)
+        ok, out = self.run_tool("write_file", path="box.txt", content="Each box holds [2 characters].")
         self.assertTrue(ok, out)
 
     def test_a_missed_edit_shows_the_closest_text_and_never_guesses(self):

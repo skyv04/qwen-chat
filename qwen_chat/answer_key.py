@@ -82,6 +82,39 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])[\"'”’)\]]*\s+")
 _PIECES = re.compile(r"(?<=[.!?])[\"'”’)\]]*\s+|\s*(?:\.{3}|…)\s*")
 NEAR_QUOTE = 0.9    # a quote this close to one source sentence is a misquote of it
 REASON_BELOW = 0.5  # evidence this far from every sentence is a reason, not a quote
+GAP_WORDS = 3       # most words a shortened quote may leave out between two of its words
+# Words a shortened quote may not leave out: without them a sentence means the opposite.
+_NEGATIONS = frozenset({"not", "no", "never", "nobody", "nothing", "none", "nor", "neither",
+                        "cannot", "t", "without", "nowhere"})
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold())
+
+
+def _negations(text: str) -> int:
+    """How many negations ("not", "never", the t of "didn't", ...) text has."""
+    return sum(w in _NEGATIONS for w in _words(text))
+
+
+def _shortened(words: list[str], tokens: list[str]) -> bool:
+    """Whether a quote's words occur in a sentence's words in order, leaving out at most
+    GAP_WORDS between two of them, no more than the quote's own length in all, and never a
+    negation. Nothing may be added."""
+    states = {p: 0 for p, t in enumerate(tokens) if t == words[0]}
+    for word in words[1:]:
+        reached: dict[int, int] = {}
+        for p, skipped in states.items():
+            for q in range(p + 1, min(p + 2 + GAP_WORDS, len(tokens))):
+                left_out = skipped + q - p - 1
+                if (tokens[q] == word and left_out <= len(words)
+                        and left_out < reached.get(q, len(words) + 1)
+                        and not _NEGATIONS.intersection(tokens[p + 1:q])):
+                    reached[q] = left_out
+        states = reached
+        if not states:
+            return False
+    return bool(states)
 
 
 def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], str, list[str]]:
@@ -89,12 +122,25 @@ def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], 
     Case, spacing, punctuation and quote styles are ignored. Also accepted, and shown in the
     source's own words: the quoted part of 'The story says "..."', exact sentences from
     different places (joined with " … "), a short phrase found in exactly one sentence
-    (shown as that sentence) and a nearly exact sentence. Raises _NotQuoted otherwise."""
+    (shown as that sentence), a nearly exact sentence, and a sentence with a few words left
+    out ("Benny collected..." for "Benny the beaver collected shiny leaves."), shown whole.
+    Raises _NotQuoted otherwise."""
     quote = _text(quote, f"{where} evidence", 1000, required=True).strip()
     plain = _plain(quote)
     plains = [_plain(text) for text in sources]
     sentences = [(i, s.strip()) for i, text in enumerate(sources, 1)
                  for s in _SENTENCE_END.split(text) if _plain(s)]
+    tokens = [_words(s) for _i, s in sentences]
+
+    def shortened(text: str) -> tuple[int, str] | None:
+        """(paragraph, whole sentence) for a quote that leaves a few words out of exactly one
+        source sentence."""
+        words = _words(text)
+        if len(words) < 2:
+            return None
+        hits = [(i, s) for (i, s), t in zip(sentences, tokens)
+                if len(_plain(s)) <= 400 and _shortened(words, t)]
+        return hits[0] if hits and len({_plain(s) for _i, s in hits}) == 1 else None
 
     def nearest(text: str) -> tuple[float, int, str]:
         best, p = (0.0, 0, ""), _plain(text)
@@ -109,15 +155,16 @@ def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], 
         """(paragraph, text as shown) for one exact or, with near, nearly exact piece."""
         p = _plain(text)
         if len(p) < 12:  # a short piece must be a whole sentence, not part of a word
-            return next(((i, text) for i, s in sentences if _plain(s) == p), None) if p else None
+            whole = next(((i, text) for i, s in sentences if _plain(s) == p), None) if p else None
+            return whole or (shortened(text) if near and p else None)
         found = next((i for i, s in enumerate(plains, 1) if p in s), None)
         if found:
             return found, text
         if near and len(p) >= 20:
             ratio, i, sentence = nearest(text)
-            if ratio >= NEAR_QUOTE:
+            if ratio >= NEAR_QUOTE and _negations(text) == _negations(sentence):
                 return i, sentence
-        return None
+        return shortened(text) if near else None
 
     if plain and plain in plains:
         return [plains.index(plain) + 1], quote, []
@@ -127,6 +174,9 @@ def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], 
         hits = [(i, s) for i, s in sentences if pattern and pattern.search(s.casefold())]
         if len(hits) == 1 and len(_plain(hits[0][1])) <= 400:
             return ([hits[0][0]], hits[0][1],
+                    [f"{where}: the short quote {quote!r} is shown as its whole source sentence"])
+        if found := shortened(quote):
+            return ([found[0]], found[1],
                     [f"{where}: the short quote {quote!r} is shown as its whole source sentence"])
         raise _NotQuoted(f"{where}: evidence {quote!r} is too short to check"
                          + (" (it is in several sentences)" if hits else "")
@@ -139,7 +189,8 @@ def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], 
         whole = find(quote, near)
         if whole:
             return [whole[0]], whole[1], ([] if whole[1] == quote else [
-                f"{where}: evidence {quote!r} was nearly exact, so the source's own words are shown"])
+                f"{where}: evidence {quote!r} was not word for word, so the source's own words "
+                "are shown"])
         for parts, note in ((segments, "only the quoted source words were kept as evidence"),
                             (pieces if len(pieces) > 1 else [], None)):
             found = [find(part, near) for part in parts]
@@ -155,9 +206,21 @@ def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], 
             if len(runs) > 1 and not note:
                 notes.append(f"{where}: quoted sentences from different places are joined with “…”")
             if near and [s for _i, s in found] != parts:
-                notes.append(f"{where}: a nearly exact quote is shown in the source's own words")
+                notes.append(f"{where}: a quote that was not word for word is shown in the "
+                             "source's own words")
             return sorted({i for i, _s in runs}), " … ".join(s for _i, s in runs), notes
     closeness, _i, sentence = nearest(quote)
+    missing = [part for part in pieces if not find(part, True)] if len(pieces) > 1 else []
+    if missing and len(missing) < len(pieces):
+        # Most of it is quoted: name the parts to fix rather than one unrelated sentence.
+        parts = []
+        for part in missing[:3]:
+            close, _i, nearby = nearest(part)
+            parts.append(repr(part) + (f" (closest source sentence: {nearby!r})"
+                                       if close >= REASON_BELOW else ""))
+        raise _NotQuoted(f"{where}: part of the evidence is not in the source: "
+                         f"{'; '.join(parts)}. Copy each sentence exactly, or list the sentences "
+                         f"as separate quotes. {hint}", closeness)
     closest = (f" The closest source sentence is {sentence!r}: if it supports the answer, copy it "
                "exactly; otherwise move this to explanation." if closeness >= REASON_BELOW else "")
     raise _NotQuoted(f"{where}: evidence is not in the source: {quote!r}.{closest} {hint}", closeness)

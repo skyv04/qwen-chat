@@ -63,16 +63,31 @@ class ToolError(Exception):
 # A model can copy one into a file, which silently replaces real content, so writes refuse it.
 CONTEXT_MARKER = re.compile(
     r"\[[^\[\]\n]{0,80}(?:to save context space|to fit the context window)[^\[\]\n]{0,120}\]")
+# A model's own short copy of that note, such as "[6,074 characters]". It only counts as the
+# whole text or a whole JSON string value, where it can't be real content.
+_SIZE_NOTE = r"\[\s*\d[\d,]*\s*(?:characters?|chars?)\b[^\[\]\n\"]{0,80}\]"
+_SIZE_VALUE = re.compile(rf"\"({_SIZE_NOTE})\"")
+
+
+def placeholder_note(text: str) -> str | None:
+    """The shortened-history note in text that would replace real content, or None."""
+    m = CONTEXT_MARKER.search(text)
+    if m:
+        return m[0]
+    if re.fullmatch(_SIZE_NOTE, text.strip()):
+        return text.strip()
+    m = _SIZE_VALUE.search(text)
+    return m[1] if m else None
 
 
 def _refuse_placeholder(text: str, name: str, existed: bool) -> None:
     if NOTE_HEAD in text:
         raise ToolError(f"Nothing was saved: the new text contains the app's “{NOTE_HEAD}” "
                         "note, which is for you, not file content. Leave it out.")
-    m = CONTEXT_MARKER.search(text)
-    if m:
+    note = placeholder_note(text)
+    if note:
         raise ToolError(
-            f"Nothing was saved: the new text contains {m[0]!r}, a note from shortened chat "
+            f"Nothing was saved: the new text contains {note!r}, a note from shortened chat "
             "history, not real content. "
             + (f"{name} keeps its previous content. Use read_file to see it, then change part of "
                "it with edit_file or write the complete content." if existed else
@@ -92,7 +107,7 @@ def json_error(exc: json.JSONDecodeError) -> str:
 
 def _json_fix_hint(exc: json.JSONDecodeError) -> str:
     doc = exc.doc if isinstance(exc.doc, str) else ""
-    if CONTEXT_MARKER.search(doc):
+    if placeholder_note(doc):
         return ("The file contains a bracketed note copied from shortened chat history, so real "
                 "content is missing. Write the complete JSON again with write_file.")
     if exc.pos >= len(doc.rstrip()):
@@ -115,9 +130,9 @@ def _find_once(text: str, old: str, name: str) -> tuple[int, int]:
     if count:
         raise ToolError(f"old_text matches {count} places in {name}. Include more of the nearby "
                         "text so it matches exactly one place.")
-    marker = CONTEXT_MARKER.search(old)
+    marker = placeholder_note(old)
     if marker:
-        raise ToolError(f"old_text was not found in {name}: it contains {marker[0]!r}, a note "
+        raise ToolError(f"old_text was not found in {name}: it contains {marker!r}, a note "
                         "from shortened chat history, not text in the file. Use read_file and "
                         "copy the exact current text.")
     closest = _closest_text(text, old)
@@ -425,7 +440,7 @@ class Workspace:
             raise ToolError(f"Content is too large ({human_size(len(data))}).")
         existed = f.exists()
         name = self.display(f)
-        stub = CONTEXT_MARKER.fullmatch(content.strip())
+        stub = CONTEXT_MARKER.fullmatch(content.strip()) or re.fullmatch(_SIZE_NOTE, content.strip())
         if stub and existed and not append and f.is_file():
             raise ToolError(
                 f"Nothing was saved, and nothing needs to be: {name} still holds the content "
@@ -543,9 +558,9 @@ class Workspace:
         note = self._json_note(f, new)
         if is_json and not was_valid and not note:
             note = f" {name} is now valid JSON."
-        left = CONTEXT_MARKER.search(new)
+        left = placeholder_note(new)
         if left:
-            note += (f" {name} still contains {left[0]!r}, a note from shortened chat history; "
+            note += (f" {name} still contains {left!r}, a note from shortened chat history; "
                      "replace it with the real content.")
         return (f"Edited {name} at line {text.count(chr(10), 0, start) + 1} "
                 f"({end - start:,} characters replaced with {len(new_text):,}).{backup}{note}")

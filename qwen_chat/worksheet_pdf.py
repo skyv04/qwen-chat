@@ -210,6 +210,19 @@ _QUESTION_REF = re.compile(r"\s*(?:q(?:uestion)?|#|no\.?|number)?\s*[#_.-]?\s*(\
                            re.I)
 _IGNORED_QUESTION_FIELDS = ("type", "kind", "id", "number", "points", "difficulty")
 _IGNORED_DOCUMENT_FIELDS = ("version", "schema_version", "id")
+# meta is one line of plain text; these keys of a meta object hold that line.
+_META_LINE_KEYS = ("text", "line", "meta")
+# A reading drafted as an object: where its paragraphs, title and note are.
+_READING_BODY_KEYS = ("paragraphs", "passage", "text", "story", "content", "body", "reading",
+                      "paragraph", "passages", "sections", "lines", "sentences")
+_READING_TITLE_KEYS = ("title", "heading", "name", "reading_title")
+_READING_NOTE_KEYS = ("note", "reading_note", "instructions", "directions", "subtitle")
+_NUMBERED_PART = re.compile(r"(?:paragraph|para|p|section|part)[\s_-]*(\d{1,2})", re.I)
+# Evidence saying there is none, such as "N/A - creative response": not a quote to check.
+_NO_EVIDENCE = re.compile(
+    r"\s*[(\[]?\s*(?:n\s*/\s*a|n\.\s*a\.?|na|none|null|nil|not applicable|not needed|[-–—]+"
+    r"|no (?:text )?(?:evidence|quotes?)(?: (?:needed|required|available))?)\s*[)\]]?"
+    r"(?:\s*[-–—:(;,]\s*[^\n]{0,200})?\s*[.!]?\s*", re.I)
 # Text fields of the document that a draft sometimes puts inside theme.
 _TEXT_FIELDS = ("title", "subtitle", "series", "student_line", "meta", "instructions",
                 "reading_title", "reading_note", "question_title", "closing_note")
@@ -299,6 +312,146 @@ def _page_limit_field(field: str, value) -> str | None:
     if type(value) is not int or not words & {"page", "pages"} or not words <= _PAGE_WORDS:
         return None
     return "answer_key_max_pages" if words & {"answer", "key", "parent", "teacher"} else "max_pages"
+
+
+def _hoist_meta(data: dict, note) -> None:
+    """meta is one line of plain text, such as "Grade 1 · Reading · 15 minutes". A meta
+    object usually holds the document's own fields (title, theme, instructions, ...): they
+    move to the top level, where they belong, and short labels such as a grade or subject
+    become the meta line. Rejecting it made models flatten meta and lose the title and theme."""
+    meta = data.get("meta")
+    if (isinstance(meta, list) and meta and all(isinstance(m, (str, int, float))
+                                                and not isinstance(m, bool) for m in meta)):
+        data["meta"] = " · ".join(t for m in meta if (t := " ".join(str(m).split())))
+        note("joined the meta list into one line of text")
+        return
+    if not isinstance(meta, dict):
+        return
+    del data["meta"]
+    moved, texts, labels, used, ignored = [], [], [], [], []
+    for key, value in meta.items():
+        if _empty(value):
+            continue
+        if key in _META_LINE_KEYS and isinstance(value, str):
+            texts.append(" ".join(value.split()))
+            used.append(key)
+        elif key != "meta" and (key in DOCUMENT_FIELDS or key in _READING_ALIASES
+                                or key in _ICON_ALIASES or key in _THEME_AT_TOP
+                                or _page_limit_field(key, value)):
+            if _empty(data.get(key)):
+                data[key] = value
+                moved.append(key)
+            else:
+                ignored.append(f"meta.{key} ({key} is already set)")
+        elif (key not in _IGNORED_DOCUMENT_FIELDS and not _top_extra(key, value)
+              and isinstance(value, (str, int, float)) and len(str(value)) <= 80):
+            text = " ".join(str(value).split())
+            labels.append(text if re.search(r"[^\W\d_]", text) else
+                          f"{key.replace('_', ' ').strip().capitalize()}: {text}")
+            used.append(key)
+        else:
+            why = _top_extra(key, value)
+            ignored.append(f"meta.{key}" + (f" ({why})" if why else ""))
+    if texts or labels:
+        data["meta"] = " · ".join(texts + labels)
+    if moved:
+        note(f"moved {', '.join(moved)} out of meta to the top level (meta is one line of plain "
+             "text; every other field sits beside it, not inside it)")
+    if used:
+        note("made the meta line from meta." + ", meta.".join(used))
+    if ignored:
+        note("ignored " + ", ".join(ignored))
+
+
+def _unwrap_reading(data: dict, note) -> None:
+    """reading is a list of paragraphs. A reading drafted as an object, such as
+    {"title": ..., "passage": [...], "paragraph_count": 9}, is unwrapped: its paragraphs
+    become the reading, its title reading_title and its note reading_note. Rejecting it
+    made models think the story was too long and cut it."""
+    reading = data.get("reading")
+    if (isinstance(reading, list) and len(reading) == 1 and isinstance(reading[0], dict)
+            and reading[0].keys() & (set(_READING_BODY_KEYS) - {"text"})):
+        reading = reading[0]
+    if not isinstance(reading, dict):
+        return
+    body_key = next((k for k in _READING_BODY_KEYS if isinstance(reading.get(k), (str, list))
+                     and not _empty(reading[k])), None)
+    numbered = sorted((int(m[1]), k) for k in reading if isinstance(k, str)
+                      and (m := _NUMBERED_PART.fullmatch(k))
+                      and isinstance(reading[k], (str, dict)) and not _empty(reading[k]))
+    if body_key:
+        body, used = reading[body_key], {body_key}
+        read = [f"'{body_key}' as the reading's paragraphs"]
+    elif numbered:
+        body, used = [reading[k] for _n, k in numbered], {k for _n, k in numbered}
+        read = ["its numbered paragraphs, in order, as the reading"]
+    else:
+        return  # validation names the object's fields
+    body = ([p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+            if isinstance(body, str) else list(body))
+    ignored = []
+    for keys, target in ((_READING_TITLE_KEYS, "reading_title"), (_READING_NOTE_KEYS, "reading_note")):
+        for key in keys:
+            if key in used or not isinstance(reading.get(key), str) or _empty(reading[key]):
+                continue
+            used.add(key)
+            if _empty(data.get(target)):
+                data[target] = reading[key].strip()
+                read.append(f"'{key}' as {target}")
+            else:
+                ignored.append(f"reading.{key} ({target} is already set)")
+    for key in ("figure", *figures.FIELD_ALIASES):
+        if key in used or key not in reading or _empty(reading[key]):
+            continue
+        used.add(key)
+        first = body[0] if body else None
+        if isinstance(first, str) or (isinstance(first, dict) and _empty(first.get("figure"))):
+            body[0] = {**({"text": first} if isinstance(first, str) else first),
+                       "figure": reading[key]}
+            read.append(f"'{key}' as the first paragraph's figure")
+        else:
+            ignored.append(f"reading.{key} (a figure is already set)")
+    for key, value in reading.items():
+        if key in used or _empty(value):
+            continue
+        if key in DOCUMENT_FIELDS and key not in ("reading", "meta") and _empty(data.get(key)):
+            data[key] = value
+            read.append(f"'{key}' as the document's {key}")
+        else:
+            ignored.append(f"reading.{key}")
+    data["reading"] = body
+    note("read the reading object's " + ", ".join(read) + " (reading is a list of paragraph "
+         "strings; its title goes in reading_title)")
+    if ignored:
+        note("ignored " + ", ".join(ignored))
+
+
+def _join_lines(reading: list, note) -> list:
+    """Lines between empty entries make one paragraph, as lines between blank lines do in a
+    text: ["A.", "B.", "", "C."] -> ["A.\\nB.", "C."]. Unchanged without such a break."""
+    blank = [p is None or (isinstance(p, str) and not p.strip()) for p in reading]
+    line = [isinstance(p, str) and not b for p, b in zip(reading, blank)]
+    if not any(b and any(line[:i]) and any(line[i + 1:]) for i, b in enumerate(blank)):
+        return reading
+    joined, run = [], []
+    for p, b, is_line in zip(reading, blank, line):
+        if is_line:
+            run.append(p.strip())
+            continue
+        if run:
+            joined.append("\n".join(run))
+            run = []
+        if not b:
+            joined.append(p)
+    if run:
+        joined.append("\n".join(run))
+    lines, paragraphs = sum(line), sum(isinstance(p, str) for p in joined)
+    if paragraphs < lines:
+        note(f"joined {lines} reading lines into {paragraphs} paragraphs (an empty entry is a "
+             "paragraph break)")
+    else:
+        note(f"removed {sum(blank)} empty reading paragraph{'s' if sum(blank) > 1 else ''}")
+    return joined
 
 
 def _is_character(icon: str) -> bool:
@@ -392,6 +545,16 @@ def _key_fields(item: dict, note, where: str = "", options: bool | None = None) 
             item["explanation"] = current.rstrip() + (" " if current.rstrip()[-1:] in ".!?" else ". ") \
                 + item.pop(alias).strip()
             note(f"added question field '{alias}' to 'explanation'", where)
+    evidence = item.get("evidence")
+    quotes = evidence if isinstance(evidence, list) else [evidence]
+    kept = [q for q in quotes if not (isinstance(q, str) and _NO_EVIDENCE.fullmatch(q))]
+    if len(kept) < len(quotes):
+        if kept and isinstance(evidence, list):
+            item["evidence"] = kept
+        else:
+            del item["evidence"]
+        note("ignored evidence such as 'N/A' (not a quote; leave evidence out when no sentence "
+             "supports the answer)", where)
     return item
 
 
@@ -677,12 +840,16 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
                 warnings.append(problem)
 
     data = dict(value)
+    _hoist_meta(data, note)
     for alias in _READING_ALIASES:
         if alias in data and "reading" not in data:
             data["reading"] = data.pop(alias)
             note(f"read '{alias}' as 'reading'")
+    _unwrap_reading(data, note)
     if isinstance(data.get("reading"), str):
         data["reading"] = [p.strip() for p in re.split(r"\n\s*\n", data["reading"]) if p.strip()]
+    if isinstance(data.get("reading"), list):
+        data["reading"] = _join_lines(data["reading"], note)
     reading = data.get("reading")
     if isinstance(reading, list):
         kept, heading, dropped = [], None, 0
@@ -931,8 +1098,15 @@ def validate_spec(value) -> dict:
         spec["theme"]["mascot"] = mascot
     icons = spec["theme"]["icons"]
     reading = value.get("reading", [])
-    if not isinstance(reading, list) or len(reading) > 60:
-        raise DesignError("reading must be a list of at most 60 paragraphs.")
+    if isinstance(reading, dict):
+        raise DesignError("reading must be a list of paragraph strings, not an object with "
+                          f"{', '.join(sorted(map(str, reading))[:6])}. Put the paragraphs "
+                          "themselves in reading and the story's title in reading_title.")
+    if not isinstance(reading, list):
+        raise DesignError("reading must be a list of paragraph strings.")
+    if len(reading) > 60:
+        raise DesignError(f"reading has {len(reading)} paragraphs; the most is 60. Keep the "
+                          "whole story: join short paragraphs or lines into longer paragraphs.")
     spec["reading"] = []
     for i, item in enumerate(reading, 1):
         if isinstance(item, str):

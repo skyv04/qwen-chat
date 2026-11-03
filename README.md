@@ -184,7 +184,11 @@ A theme given as plain text becomes the theme's name, top-level `icons` move int
 theme, and extra fields that are empty or only about looks (such as `margin_art` or
 `font_size`) are dropped; extra fields that might hold content are still reported. An
 `answer_text` beside a letter `answer` is read as the option text, so the two are
-checked against each other.
+checked against each other. A `meta` object holding the title, theme and other fields
+is unpacked to the top level (meta itself is one line of text), and a reading written
+as an object, such as `{"title": ..., "passage": [...]}`, becomes the paragraph list
+with its title as `reading_title`. In a reading list, empty entries are paragraph
+breaks: the lines between them make one paragraph. Evidence such as "N/A" is ignored.
 An unavailable motif becomes `dots`, a too-pale accent is darkened, and line breaks
 typed inside JSON text are accepted. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
@@ -263,7 +267,9 @@ exact `evidence` quotes. One `render_worksheet` call with `answer_key_path` then
 
 On a sheet with no reading, such as a math page, there is nothing to quote: a reason
 written as `evidence` is shown in the key as the explanation ("Why: …") and listed in
-the audit. With a reading, evidence must quote it exactly.
+the audit. With a reading, evidence must quote it exactly. A quote that only leaves a
+few words out of one sentence (never a "not" or "never") is shown as that whole
+sentence, and when only part of a quote is wrong, the error names that part.
 
 `max_pages` and `answer_key_max_pages` keep the two page budgets separate. A key can
 also be made later with `render_answer_key` on the same worksheet JSON: it uses the

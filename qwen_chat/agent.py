@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .history import NOTE_HEAD, NOTE_SEP, context_note, user_text
 from .llm import Cancelled, ChatStream, LLMError, ServerManager
-from .tools import CONTEXT_MARKER, ToolBox, ToolError
+from .tools import ToolBox, ToolError, placeholder_note
 
 MAX_TOOL_ROUNDS = 30
 REQUEST_TURNS = 4          # the latest user messages that set page limits and counts
@@ -21,7 +21,7 @@ CALL_CHARS = 8000          # what the model is told one tool call may hold (well
 CHARS_PER_TOKEN = 3.0      # conservative; real English text is ~3.5-4
 LONG_ARG = 1500            # tool call strings longer than this get shortened when space is tight
 # History trimming. Every note says "to save context space" in brackets: write tools refuse
-# text containing one (tools.CONTEXT_MARKER), because a copied note would replace real content.
+# text containing one (tools.placeholder_note), because a copied note would replace real content.
 OLD_TOOL_STUB = "[Earlier tool output removed to save context space. Run the tool again if you need it.]"
 SKILL_STUB = "[Skill text removed to save context space. Call load_skill again before following it.]"
 REPEAT_STUB = "[Same as a later result of this tool; removed here to save context space.]"
@@ -293,7 +293,7 @@ def _newest_drafts(msgs: list[dict]) -> set[int]:
                 continue
             if (not isinstance(args, dict) or not isinstance(args.get("path"), str)
                     or not isinstance(args.get("content"), str)
-                    or CONTEXT_MARKER.search(args["content"])):  # refused: nothing was saved
+                    or placeholder_note(args["content"])):  # refused: nothing was saved
                 continue
             if args.get("append") is True:
                 newest.setdefault(args["path"], []).append(id(call))
