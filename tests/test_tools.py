@@ -144,6 +144,19 @@ class WorkspaceSandboxTest(unittest.TestCase):
         ok, out = self.run_tool("edit_file", path="sheet.json", old_text="Harvest", new_text="Harvest")
         self.assertIn("Unchanged", out)
 
+    def test_edit_file_replace_all_changes_the_same_field_in_every_question(self):
+        f = self.ws.root / "quiz.json"
+        f.write_text('{"questions": [\n  {"choice": "A, B, C"},\n  {"choice": "A, B, C"}\n]}\n')
+        ok, out = self.run_tool("edit_file", path="quiz.json", old_text='"choice": "A, B, C"',
+                                new_text='"choice": "A,B"')
+        self.assertFalse(ok)
+        self.assertIn("or set replace_all to true to change all 2", out)
+        ok, out = self.run_tool("edit_file", path="quiz.json", old_text='"choice": "A, B, C"',
+                                new_text='"choice": "A,B"', replace_all=True)
+        self.assertTrue(ok, out)
+        self.assertIn("Edited quiz.json in 2 places (lines 2, 3).", out)
+        self.assertEqual(f.read_text(), '{"questions": [\n  {"choice": "A,B"},\n  {"choice": "A,B"}\n]}\n')
+
     def test_json_drafts_say_where_they_break_until_fixed(self):
         ok, out = self.run_tool("write_file", path="broken.json", content='{"a": 1\n "b": 2}')
         self.assertTrue(ok, out)

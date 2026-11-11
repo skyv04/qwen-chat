@@ -66,6 +66,70 @@ def resolve_choice(where: str, options: list[str], choice, answer: str) -> tuple
     return None if picked is None else (chr(65 + picked), options[picked])
 
 
+# A prompt that asks for more than one option: "Circle ALL the equations that match",
+# "Which two animals ...", "Select all that apply".
+_SELECT_MANY = re.compile(
+    r"\b(?:circle|choose|select|pick|mark|colou?r|tick|check|underline|shade|find)\s+"
+    r"(?:all|both|every|each|two|three|four|the\s+(?:two|three|four))\b"
+    r"|\ball\s+(?:that|which)\b|\bthat\s+apply\b|\bmore\s+than\s+one\b"
+    r"|\bwhich\s+(?:two|three|four)\b", re.I)
+_SEVERAL_LETTERS = re.compile(r"\s*\(?[A-Ha-h]\)?\.?(?:\s*(?:[,;/&+]|\band\b|\s)\s*\(?[A-Ha-h]\)?\.?)+"
+                              r"\s*")
+
+
+def _letters(value) -> list[str] | None:
+    """The letters of a value naming several options ("A,B", "A and B", ["A", "B"])."""
+    if isinstance(value, list) and len(value) > 1 and all(
+            isinstance(v, str) and re.fullmatch(r"\s*\(?[A-Ha-h]\)?[.):]?\s*", v) for v in value):
+        value = ",".join(value)
+    if not isinstance(value, str) or not _SEVERAL_LETTERS.fullmatch(value):
+        return None
+    return [s.upper() for s in re.findall(r"(?<![A-Za-z])[A-Ha-h](?![A-Za-z])", value)]
+
+
+def resolve_choices(where: str, options: list[str], choice, answer: str,
+                    prompt: str) -> list[tuple[str, str]] | None:
+    """Like resolve_choice, as a list. A question whose prompt asks for several options
+    ("Circle ALL the equations that match") may name several letters in choice (or, with no
+    choice, in answer): "A,B", "A and B" or ["A", "B"]."""
+    if isinstance(choice, list) and len(choice) == 1:
+        choice = choice[0]
+    several = _letters(choice) if choice not in (None, "") else _letters(answer)
+    if not several:
+        picked = resolve_choice(where, options, choice, answer)
+        return None if picked is None else [picked]
+    given = choice if choice not in (None, "") else answer
+    if not _SELECT_MANY.search(prompt):
+        raise DesignError(f"{where}: {given!r} names {len(several)} options, but the question "
+                          "asks for one answer. Give the single correct letter, or, when "
+                          "several options are correct, make the prompt ask for them all, for "
+                          "example \"Circle ALL the equations that match\".")
+    wrong = [letter for letter in several if ord(letter) - 65 >= len(options)]
+    if wrong:
+        raise DesignError(f"{where}: choice must use its actual option letters "
+                          f"({', '.join(chr(65 + i) for i in range(len(options)))}), not "
+                          f"{', '.join(dict.fromkeys(wrong))}.")
+    picked = sorted({ord(letter) - 65 for letter in several})
+    if choice not in (None, "") and answer.strip():
+        named = {ord(letter) - 65 for letter in _letters(answer) or []}
+        named |= {i for i, option in enumerate(options) if _same(option, answer)}
+        m = _LETTER.fullmatch(answer)
+        if m and not named:
+            index = ord(m[1]) - 65
+            if index >= len(options) or not m[2] or _same(m[2], options[index]):
+                named.add(index)
+        if named and not named <= set(picked):
+            raise DesignError(f"{where}: choice {given!r} and answer {answer!r} name different "
+                              "options. Solve the question again, then list every correct "
+                              "letter in choice and leave answer out.")
+    return [(chr(65 + i), options[i]) for i in picked]
+
+
+def _shown(picked: list[tuple[str, str]]) -> str:
+    """'B. A book', or 'A. 3 + 5 = 8; B. 5 + 3 = 8' for several options."""
+    return "; ".join(f"{letter}. {text}" for letter, text in picked)
+
+
 class _NotQuoted(DesignError):
     """Evidence that is not a quotation of the source. closeness (0-1) is how near the
     nearest source sentence is: low means it is a reason, not a misquote."""
@@ -834,13 +898,14 @@ def key_document(value, quiz: dict, source_path: str, digest: str) -> tuple[dict
             explanation = _with_reasons(explanation, reasoning, where)
             if not citations:
                 citations.append(f'Source excerpt {number}: "{question["prompt"]}"')
-        checked = response
+        checked = [response]
         try:
             if question["options"]:
                 picked = (None if issue.strip() and choice in (None, "")
-                          else resolve_choice(where, question["options"], choice, response))
+                          else resolve_choices(where, question["options"], choice, response,
+                                               question["prompt"]))
                 if picked:
-                    response, checked = f"{picked[0]}. {picked[1]}", picked[1]
+                    response, checked = _shown(picked), [text for _letter, text in picked]
                 elif not issue.strip():
                     raise DesignError(f"{where}: choose an actual option or explain why "
                                       "no option is defensible in issue. Never force a wrong choice.")
@@ -853,7 +918,7 @@ def key_document(value, quiz: dict, source_path: str, digest: str) -> tuple[dict
             elif not response.strip():
                 raise DesignError(f"{where} needs a written answer, not a blank answer area.")
             if not issue.strip() and not problems:
-                arithmetic += check_math(where, question["prompt"], checked)
+                arithmetic += all([check_math(where, question["prompt"], text) for text in checked])
                 worked += check_working(where, question["prompt"], explanation, response)
         except DesignError as exc:
             problems.append(str(exc))
@@ -921,17 +986,17 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
             answer = _answer_text(key.get("answer", ""), f"{where} answer")
             explanation = _text(key.get("explanation", ""), f"{where} explanation", 1600)
             if q["options"]:
-                picked = resolve_choice(where, q["options"], key.get("choice"), answer)
+                picked = resolve_choices(where, q["options"], key.get("choice"), answer, q["prompt"])
                 if picked is None:
                     raise DesignError(f"{where} needs choice: the letter of its correct option.")
-                response, value = f"{picked[0]}. {picked[1]}", picked[1]
+                response, values = _shown(picked), [text for _letter, text in picked]
             elif key.get("choice") not in (None, ""):
                 raise DesignError(f"{where} has no options; put its expected answer in answer, not choice.")
             elif not answer.strip():
                 raise DesignError(f"{where} needs answer: the expected answer, or for open "
                                   "questions 'Answers will vary' with an example.")
             else:
-                response = value = answer
+                response, values = answer, [answer]
             quotes = key.get("evidence", [])
             quotes = [quotes] if isinstance(quotes, str) else quotes
             if not isinstance(quotes, list) or len(quotes) > 6:
@@ -954,7 +1019,7 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
                 raise DesignError(" ".join(bad))
             if reasoning:  # a reason the explanation already gives is not repeated
                 explanation = _with_reasons(explanation, reasoning, where)
-            math = check_math(where, q["prompt"], value)
+            math = all([check_math(where, q["prompt"], value) for value in values])
             worked = check_working(where, q["prompt"], explanation, response)
         except DesignError as exc:
             errors.append(str(exc))

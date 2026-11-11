@@ -196,10 +196,12 @@ is unpacked to the top level (meta itself is one line of text), and a reading wr
 as an object, such as `{"title": ..., "passage": [...]}`, becomes the paragraph list
 with its title as `reading_title`. In a reading list, empty entries are paragraph
 breaks: the lines between them make one paragraph. Evidence such as "N/A" is ignored.
-An unavailable motif becomes `dots`, a too-pale accent is darkened, and line breaks
+An unavailable motif becomes `dots`, a too-pale accent is darkened, an answer-key style
+`answers` list inside a question becomes its `choice` and `evidence`, and line breaks
 typed inside JSON text are accepted. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
-with its line, column and text, so one `edit_file` call can fix it.
+with its line, column and text, so one `edit_file` call can fix it. `edit_file` with
+`replace_all` changes every match at once, such as the same field in each question.
 
 Math reads like a textbook. A fraction typed as `3/4` or `1 1/2` prints stacked, with
 the numerator over the denominator; `6 x 4`, `10 - 4`, `5^2` and simple LaTeX such as
@@ -260,7 +262,10 @@ Successful PDFs get an **Open** chip like other generated files.
 
 For a new worksheet plus a key, Qwen writes each answer into the same JSON: `choice`
 for multiple choice, `answer` for written questions, and optional `explanation` and
-exact `evidence` quotes. One `render_worksheet` call with `answer_key_path` then:
+exact `evidence` quotes. A question whose prompt asks for several options ("Circle ALL
+the equations that match", "Which two...", "Select all that apply") lists every correct
+letter, such as `"choice": "A,B"`; the key shows them all. Other questions take exactly
+one letter. One `render_worksheet` call with `answer_key_path` then:
 
 - checks every answer first: each question answered, real option letters, quotes that
   really occur in the reading, and simple sums such as `3 + 2 = __` recomputed;

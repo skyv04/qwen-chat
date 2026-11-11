@@ -116,20 +116,23 @@ def _json_fix_hint(exc: json.JSONDecodeError) -> str:
             "not rewrite the whole file.")
 
 
-def _find_once(text: str, old: str, name: str) -> tuple[int, int]:
-    """The one place `old` occurs: exactly, or else with any run of spaces/newlines matching."""
-    count = text.count(old)
-    if count == 1:
-        start = text.index(old)
-        return start, start + len(old)
-    if not count:
-        found = [m.span() for m in re.finditer(r"\s+".join(map(re.escape, old.split())), text)]
-        if len(found) == 1:
-            return found[0]
-        count = len(found)
-    if count:
-        raise ToolError(f"old_text matches {count} places in {name}. Include more of the nearby "
-                        "text so it matches exactly one place.")
+def _truthy(value) -> bool:
+    """A tool flag given as true, "true", 1 or "yes"."""
+    return value is True or str(value).strip().casefold() in ("true", "1", "yes")
+
+
+def _find_spans(text: str, old: str, name: str, every: bool = False) -> list[tuple[int, int]]:
+    """The place `old` occurs (with every, all of them): exactly, or else with any run of
+    spaces/newlines matching."""
+    spans = [m.span() for m in re.finditer(re.escape(old), text)]
+    if not spans:
+        spans = [m.span() for m in re.finditer(r"\s+".join(map(re.escape, old.split())), text)]
+    if len(spans) == 1 or (spans and every):
+        return spans
+    if spans:
+        raise ToolError(f"old_text matches {len(spans)} places in {name}. Include more of the "
+                        "nearby text so it matches exactly one place, or set replace_all to "
+                        f"true to change all {len(spans)}.")
     marker = placeholder_note(old)
     if marker:
         raise ToolError(f"old_text was not found in {name}: it contains {marker!r}, a note "
@@ -490,7 +493,7 @@ class Workspace:
             pass
         return ""
 
-    def edit_file(self, path: str, old_text: str, new_text: str) -> str:
+    def edit_file(self, path: str, old_text: str, new_text: str, replace_all=False) -> str:
         if not isinstance(old_text, str) or not isinstance(new_text, str):
             raise ToolError("old_text and new_text must be text.")
         f = self.resolve(path)
@@ -513,16 +516,21 @@ class Workspace:
             text = raw.decode("utf-8")
         except UnicodeError:
             raise ToolError(f"{name} is not a text file, so edit_file can't change it.") from None
-        start, end = _find_once(text, old_text, name)
-        if text[start:end] != old_text:
-            # Matched with different spacing: the file keeps its own surrounding whitespace.
-            lead = old_text[:len(old_text) - len(old_text.lstrip())]
-            trail = old_text[len(old_text.rstrip()):]
-            if lead and new_text.startswith(lead):
-                new_text = new_text[len(lead):]
-            if trail and new_text.endswith(trail):
-                new_text = new_text[:len(new_text) - len(trail)]
-        new = text[:start] + new_text + text[end:]
+        spans = _find_spans(text, old_text, name, _truthy(replace_all))
+        new, at = text, []
+        for start, end in reversed(spans):
+            replacement = new_text
+            if text[start:end] != old_text:
+                # Matched with different spacing: the file keeps its own surrounding whitespace.
+                lead = old_text[:len(old_text) - len(old_text.lstrip())]
+                trail = old_text[len(old_text.rstrip()):]
+                if lead and replacement.startswith(lead):
+                    replacement = replacement[len(lead):]
+                if trail and replacement.endswith(trail):
+                    replacement = replacement[:len(replacement) - len(trail)]
+            new = new[:start] + replacement + new[end:]
+            at.append(text.count(chr(10), 0, start) + 1)
+        start, end = spans[0]
         if new == text:
             return f"Unchanged: {name} already has this text."
         is_json = f.suffix.lower() == ".json"
@@ -562,8 +570,12 @@ class Workspace:
         if left:
             note += (f" {name} still contains {left!r}, a note from shortened chat history; "
                      "replace it with the real content.")
-        return (f"Edited {name} at line {text.count(chr(10), 0, start) + 1} "
-                f"({end - start:,} characters replaced with {len(new_text):,}).{backup}{note}")
+        if len(spans) > 1:
+            return (f"Edited {name} in {len(spans)} places (lines "
+                    f"{', '.join(map(str, reversed(at)))}).{backup}{note}")
+        return (f"Edited {name} at line {at[0]} "
+                f"({end - start:,} characters replaced with {len(new) - len(text) + end - start:,})."
+                f"{backup}{note}")
 
     def make_directory(self, path: str) -> str:
         d = self.resolve(path)
@@ -1855,12 +1867,15 @@ FILE_TOOLS = [
          "append": {"type": "boolean", "description": "Append instead of replacing"}},
         ["path", "content"]),
     _fn("edit_file", "Change part of an existing text file: replaces old_text, which must match "
-        "exactly one place, with new_text. Use it to fix one value or line instead of "
-        "rewriting the whole file.",
+        "exactly one place (or every place, with replace_all), with new_text. Use it to fix one "
+        "value or line instead of rewriting the whole file.",
         {"path": {**_S, "description": "File path relative to the workspace"},
          "old_text": {**_S, "description": "Exact current text to replace, copied from read_file, "
                                            "with enough nearby words to be unique"},
-         "new_text": {**_S, "description": "Replacement text"}},
+         "new_text": {**_S, "description": "Replacement text"},
+         "replace_all": {"type": "boolean",
+                         "description": "Change every place old_text matches, such as the same "
+                                        "field in each question"}},
         ["path", "old_text", "new_text"]),
     _fn("make_directory", "Create a folder in the workspace.",
         {"path": {**_S, "description": "Folder path relative to the workspace"}}, ["path"]),
@@ -2629,8 +2644,9 @@ class ToolBox:
         except DesignError as exc:
             raise ToolError(
                 f"The answer key is not ready: {exc}\n{shown} is worksheet JSON, so its key comes "
-                "from the answers stored in its own questions: fix them there with edit_file, "
-                "then call render_answer_key again. Do not write a separate key JSON for it.") from None
+                "from the choice and answer fields inside each of its questions: fix those with "
+                "edit_file, then call render_answer_key again. Do not write a separate key JSON "
+                "or an answers list for it.") from None
         target = self.ws.resolve(path)
         if target == source.with_suffix(".pdf") and not _keyish(path):
             raise ToolError(f"{self.ws.display(target)} is the worksheet's own PDF name. Give the "

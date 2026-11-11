@@ -10,7 +10,7 @@ from unittest import mock
 
 from qwen_chat import figures, mathtext, worksheet_pdf as pdf
 from qwen_chat.answer_key import (arithmetic_target, check_math, key_document, quiz_from_pdf,
-                                  quiz_from_spec, resolve_choice, worksheet_key)
+                                  quiz_from_spec, resolve_choice, resolve_choices, worksheet_key)
 
 ASTRONAUT = "\U0001f468\u200d\U0001f680"        # man + zero-width joiner + rocket
 MAN_TREX = "\U0001f468\u200d\U0001f996"         # not a real emoji: draws as two pictures
@@ -128,6 +128,42 @@ class WorksheetKeyTest(unittest.TestCase):
             with self.subTest(choice=choice, answer=answer), \
                     self.assertRaisesRegex(pdf.DesignError, message):
                 resolve_choice("Q", options, choice, answer)
+
+    def test_select_all_questions_take_every_correct_letter_but_others_take_one(self):
+        prompt = "Luna planted 3 seeds and then 5 more. Circle ALL the equations that match the story."
+        options = ["3 + 5 = 8", "5 + 3 = 8", "8 - 3 = 5", "3 + 8 = 11"]
+        for choice, answer in (("A,B", ""), ("A and B", ""), (["B", "A"], ""), ("", "A, B"),
+                               ("A,B", "A, B"), ("A,B", "8 seeds")):
+            with self.subTest(choice=choice, answer=answer):
+                self.assertEqual(resolve_choices("Q", options, choice, answer, prompt),
+                                 [("A", "3 + 5 = 8"), ("B", "5 + 3 = 8")])
+        self.assertEqual(resolve_choices("Q", options, "C", "", "Which is true?"), [("C", "8 - 3 = 5")])
+        for choice, answer, ask, message in (
+                ("A,B", "", "Which equation matches the story?", "names 2 options, but the question "
+                                                                 "asks for one answer"),
+                ("A,E", "", prompt, r"actual option letters \(A, B, C, D\), not E"),
+                ("A,B", "D", prompt, "name different options")):
+            with self.subTest(choice=choice, ask=ask), self.assertRaisesRegex(pdf.DesignError, message):
+                resolve_choices("Q", options, choice, answer, ask)
+
+    def test_a_circle_all_worksheet_gets_a_key_even_from_an_answers_list(self):
+        prompt = ("Luna planted 3 seeds in the morning and 5 seeds in the afternoon. How many "
+                  "seeds did she plant in total? Circle ALL the equations that match the story:")
+        data = {"title": "Pumpkin party", "questions": [
+            {"prompt": prompt, "options": ["3 + 5 = 8", "5 + 3 = 8", "8 - 3 = 5", "3 + 8 = 11"],
+             "choice": "A,B"},
+            {"prompt": prompt, "options": ["3 + 5 = 8", "5 + 3 = 8", "8 - 3 = 5"],
+             "answers": [{"source_path": "", "source_sha256": "", "option": "A",
+                          "evidence": "3 seeds in the morning and 5 seeds in the afternoon"},
+                         {"source_path": "", "source_sha256": "", "option": "B", "evidence": ""}]}]}
+        data, adjusted = pdf.normalize_spec(data, "party")
+        self.assertIn("read question field 'answers' as 'choice' and 'evidence' (Question 2)", adjusted)
+        document, audit = worksheet_key(pdf.validate_spec(data))
+        for paragraph in document["reading"]:
+            self.assertIn("Answer: A. 3 + 5 = 8; B. 5 + 3 = 8", paragraph["text"])
+        self.assertIn('Evidence: "3 seeds in the morning and 5 seeds in the afternoon"',
+                      document["reading"][1]["text"])
+        self.assertEqual(audit["multiple_choice_checked"], 2)
 
     def test_simple_sums_are_checked_and_unclear_numbers_are_left_alone(self):
         for prompt, value in (("3 + 4 = __", 7), ("What is 10 - 3?", 7), ("4 + __ = 9", 5),

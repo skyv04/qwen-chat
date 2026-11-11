@@ -76,8 +76,9 @@ hash, letters and quotes from read_quiz, never this example's answers.
 - `question`: the integer number returned by read_quiz. No duplicates, omissions
   or extra answers. Do not copy/rewrite prompts, options, story names or labels
   into the key format; the renderer gets them from the source.
-- `choice`: for multiple choice, one actual uppercase option letter. Omit `answer`
-  for these: the exact chosen option is inserted automatically.
+- `choice`: for multiple choice, one actual uppercase option letter, or every correct
+  letter (`"A,B"`) when the question asks for several ("Circle ALL ...", "Which
+  two ..."). Omit `answer` for these: the exact chosen options are inserted automatically.
 - `answer`: required for written questions. Accept equivalent supported answers.
   Use concise complete sentences, normally 1-3 sentences per answer.
 - `explanation`: explain a multiple-choice selection; optional for written answers

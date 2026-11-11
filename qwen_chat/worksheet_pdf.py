@@ -251,6 +251,42 @@ _OFF = ("", "none", "no", "off", "false", "plain")
 _LETTERED = re.compile(r"\s*\(?([A-Ha-h])[.):]\s+(\S.*)", re.S)
 _LETTER_ONLY = re.compile(r"\s*\(?[A-Ha-h]\)?[.):]?\s*")
 _NUMBERED = re.compile(r"\s*(\d{1,2})[.):]\s+(\S.*)", re.S)
+# Fields of an answer-key "answers" entry that a worksheet question can hold as choice and
+# evidence; the source fields only bind a key to an existing quiz.
+_ANSWER_ENTRY_FIELDS = frozenset({"option", "choice", "letter", "evidence", "question",
+                                  "source_path", "source_sha256"})
+
+
+def _fold_answers(item: dict, note, where: str) -> dict:
+    """Moves a question's answer-key style "answers" list ([{"option": "A", "evidence":
+    "..."}, ...]) to choice and evidence. Entries holding anything else, or letters that
+    contradict choice, are left in place, so validation reports them."""
+    entries = item.get("answers")
+    if not (isinstance(entries, list) and entries and all(
+            isinstance(e, dict) and set(e) <= _ANSWER_ENTRY_FIELDS for e in entries)):
+        return item
+    letters = [next((e[k] for k in ("option", "choice", "letter") if not _empty(e.get(k))), None)
+               for e in entries]
+    if not all(isinstance(x, str) and _LETTER_ONLY.fullmatch(x) for x in letters):
+        return item
+    letters = list(dict.fromkeys(x.strip(" ().:").upper() for x in letters))
+    current = item.get("choice")
+    if not _empty(current):
+        given = re.findall(r"(?<![A-Za-z])[A-Ha-h](?![A-Za-z])", current) if isinstance(current, str) else []
+        if sorted({x.upper() for x in given}) != sorted(letters):
+            return item
+    item = dict(item)
+    item["choice"] = current if not _empty(current) else ",".join(letters)
+    quotes = [] if _empty(item.get("evidence")) else (
+        item["evidence"] if isinstance(item["evidence"], list) else [item["evidence"]])
+    for entry in entries:
+        found = entry.get("evidence")
+        quotes += [q for q in (found if isinstance(found, list) else [found]) if not _empty(q)]
+    if quotes:
+        item["evidence"] = list(dict.fromkeys(quotes))
+    del item["answers"]
+    note("read question field 'answers' as 'choice' and 'evidence'", where)
+    return item
 
 
 @functools.lru_cache(maxsize=256)
@@ -986,6 +1022,7 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
                 item[field] = item.pop(alias)
                 note(f"read question field '{alias}' as '{field}'", where)
         item = _key_fields(item, note, where)
+        item = _fold_answers(item, note, where)
         for field in _IGNORED_QUESTION_FIELDS:
             if field in item:
                 del item[field]

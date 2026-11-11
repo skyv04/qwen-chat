@@ -18,7 +18,8 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
    options. Five questions including three multiple choice means three with options and
    two written. Do not add extra questions or an unrequested challenge.
 2. Make the content correct. A story may be invented, but its science, history and math
-   must be true. Each multiple-choice question needs exactly one correct option. When a
+   must be true. Each multiple-choice question needs exactly one correct option, unless
+   its prompt asks for several ("Circle ALL the equations that match the story"). When a
    key is wanted, work out every answer first: do each sum, find the sentence that
    proves each reading answer, and note the correct letter. For a quiz made from an
    existing PDF's questions, `read_file` the PDF first (it reads pictures of questions
@@ -103,7 +104,9 @@ All text is plain: no HTML, Markdown or scripts. Unknown fields are rejected.
 
 Answer fields, only for a parent key (never printed on the student PDF):
 - `choice`: the correct option's letter (A is the first option); required for
-  multiple choice.
+  multiple choice. When the prompt asks for several options ("Circle ALL the
+  equations that match", "Which two..."), list every correct letter: `"choice": "A,B"`.
+  Never add an `answers` list to a question.
 - `answer`: the expected answer; required for written questions. For open or creative
   prompts write "Answers will vary, for example: ...".
 - `evidence`: an exact quote, or a list of up to six, copied word for word from the
