@@ -10,6 +10,7 @@ import traceback
 from typing import Protocol
 
 from .history import NOTE_HEAD, NOTE_SEP, context_note, user_text
+from .images import ImageError, data_url, is_image
 from .llm import Cancelled, ChatStream, LLMError, ServerManager
 from .tools import ToolBox, ToolError, placeholder_note
 
@@ -31,6 +32,8 @@ CACHED_TOOLS = ("web_search", "fetch_url", "list_files", "read_file")
 # Files attached to a new message are read before the first reply, up to this many characters
 # in all (one read_file page), so it starts from what they hold, not from earlier replies.
 ATTACHED_READ_CHARS = 12_500
+IMAGE_TOKEN_BUDGET = 1536
+MAX_ATTACHED_IMAGES = 4
 ATTACHED_LINE = "Attached files (in the workspace): "
 ATTACHED_READ_NOTE = ("[The app read this attached file just now: this is what it holds. Where an "
                       "earlier reply in this chat says otherwise, trust this read.]\n")
@@ -55,7 +58,7 @@ class Events(Protocol):
     def round_end(self, message: dict, timings: dict) -> None: ...
 
 
-def system_prompt(toolbox: ToolBox, model_name: str) -> str:
+def system_prompt(toolbox: ToolBox, model_name: str, vision: bool = False) -> str:
     now = time.localtime()
     parts = [
         f"You are Qwen, a helpful AI assistant ({model_name}) running locally on the user's "
@@ -76,6 +79,15 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
         "not find, believe them: read the file again and look closely instead of repeating your "
         "earlier answer. Never describe a file's contents from memory. "
         "If it is still unclear what the user means, ask one short question.")
+    parts.append(
+        "\n## Image attachments\n"
+        + ("You can see image attachments directly. Inspect their visual content, text, handwriting "
+           "and layout yourself; never claim you cannot see them or substitute OCR unless the user "
+           "asks for OCR."
+           if vision else
+           "Native image understanding is unavailable in this session. If the user asks about an "
+           "image, say so plainly instead of guessing; the vision projector may need to be installed "
+           "and the model server restarted."))
     parts.append(
         "\n## Reusable skills\n"
         "Use list_skills to discover relevant reusable skills, and load_skill to read the ones "
@@ -109,9 +121,13 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "File tools cannot access other folders; skill tools manage only the shared skill "
             "library. When the user asks you to create, save, write, "
             "export or edit a file, actually do it with the file tools (don't just show the "
-            "content), then mention the file name. Read a file before changing it. Files attached "
-            "to a new message are read for you: the read_file result right after the message "
-            "shows what they hold now. Use clear "
+            "content), then mention the file name. Read a file before changing it. Text files "
+            "attached to a new message are read for you: the read_file result right after the "
+            "message shows what they hold now. "
+            + ("Image attachments are passed to you directly for visual inspection."
+               if vision else "Image attachments need the native vision projector and are not "
+               "read as text.")
+            + " Use clear "
             "file names with the right extension (.md, .txt, .csv, .py, .html, ...). To change "
             "part of an existing file, use edit_file instead of rewriting the whole file. One tool "
             f"call can hold at most about {CALL_CHARS:,} characters; longer calls get cut off and "
@@ -137,10 +153,8 @@ def system_prompt(toolbox: ToolBox, model_name: str) -> str:
             "in run_command) and explain why. Small installs run right away; big ones ask the "
             "user. Don't tell the user a task is "
             "impossible just because a tool is missing. If the user says no to a command or "
-            "install, don't try a workaround: stop and ask what they'd like instead. You can't see "
-            "images: when a task depends on what images show (text, page or question numbers, "
-            "order), read them first with OCR (`tesseract IMAGE -`; install tesseract-ocr "
-            "if it's missing). For a PDF, use read_file: it also reads the words in the PDF's "
+            "install, don't try a workaround: stop and ask what they'd like instead. "
+            "For a PDF, use read_file: it also reads the words in the PDF's "
             "pictures with OCR, which pdftotext misses; tesseract cannot open a PDF. Never guess "
             "the order or contents from file names. Commands get "
             "no keyboard input, so use non-interactive options, and keep files in the workspace. "
@@ -517,18 +531,37 @@ class Agent:
         last["_meta"] = {**(last.get("_meta") or {}), "context": note}
 
     def _read_attachments(self, messages: list[dict], events: Events, cancel: threading.Event,
-                          seen: dict[str, str]) -> None:
+                          seen: dict[str, str]) -> list[str]:
         """Reads the files attached to a new message before the first reply, saved in the chat as
         read_file calls. Otherwise the model may repeat an earlier reply about the same file
         (one made before OCR read a PDF's pictures called its questions a newsletter) instead
         of looking again."""
         last = messages[-1] if messages else None
         if not last or last.get("role") != "user" or not self.toolbox.files:
-            return
+            return []
         reads, total = [], 0
+        images = []
+        vision_enabled = bool(getattr(self.server, "vision_enabled", False))
         for path in dict.fromkeys(attached_files(last)):
             if cancel.is_set():
                 raise Cancelled()
+            try:
+                file_path = self.toolbox.ws.resolve(path)
+            except (ToolError, OSError, ValueError):
+                file_path = None
+            if file_path is not None and file_path.is_file() and is_image(file_path):
+                if not vision_enabled:
+                    reason = getattr(self.server, "vision_error", "")
+                    raise LLMError(reason or "Image understanding is not enabled. Install the Qwen "
+                                   "vision projector and restart the model server, then send the image again.")
+                if len(images) >= MAX_ATTACHED_IMAGES:
+                    raise LLMError(f"Attach no more than {MAX_ATTACHED_IMAGES} images per message.")
+                events.status(f"Preparing image {file_path.name}…")
+                try:
+                    images.append(data_url(file_path))
+                except ImageError as error:
+                    raise LLMError(str(error)) from error
+                continue
             events.status(f"Reading {path}…")
             args = {"path": path}
             ok, out = self.toolbox.run("read_file", json.dumps(args, ensure_ascii=False))
@@ -539,7 +572,7 @@ class Agent:
                 total += len(out)
                 reads.append((args, out))
         if not reads:
-            return
+            return images
         stamp = time.time()
         calls = [{"id": f"attached-{int(stamp * 1000)}-{i}", "type": "function",
                   "function": {"name": "read_file", "arguments": json.dumps(args, ensure_ascii=False)}}
@@ -557,6 +590,7 @@ class Agent:
             messages.append({"role": "tool", "tool_call_id": call["id"], "name": "read_file",
                              "content": out, "_meta": {"ok": True}})
             events.tool_end(call["id"], "read_file", args, True, out)
+        return images
 
     def respond(self, messages: list[dict], events: Events, cancel: threading.Event,
                 thinking: bool = False) -> None:
@@ -570,13 +604,15 @@ class Agent:
         self.toolbox.request_text = user_text(messages, last=REQUEST_TURNS)
         self._add_context_note(messages)
         seen: dict[str, str] = {}
-        self._read_attachments(messages, events, cancel, seen)
+        images = self._read_attachments(messages, events, cancel, seen)
         tools = self.toolbox.schemas()
-        sys_msg = {"role": "system", "content": system_prompt(self.toolbox, self.server.model_name)}
+        sys_msg = {"role": "system", "content": system_prompt(
+            self.toolbox, self.server.model_name, vision=bool(images))}
         n_ctx = self.server.n_ctx
         max_out = min(MAX_OUT_TOKENS + (2048 if thinking else 0), n_ctx // 3)
         tool_chars = len(json.dumps(tools)) if tools else 0
-        budget = int((n_ctx - max_out) * CHARS_PER_TOKEN) - len(sys_msg["content"]) - tool_chars
+        budget = (int((n_ctx - max_out - len(images) * IMAGE_TOKEN_BUDGET) * CHARS_PER_TOKEN)
+                  - len(sys_msg["content"]) - tool_chars)
         rounds = 0
         failed_outputs: dict[tuple[str, str], str] = {}
         # The (spec, student or key copy) jobs each failed PDF stands for.
@@ -623,6 +659,12 @@ class Agent:
             rounds += 1
             use_tools = tools
             history = self.fit(clean_for_api(messages), budget)
+            if images:
+                user = next((m for m in reversed(history) if m.get("role") == "user"), None)
+                if user is not None:
+                    text = user.get("content") or ""
+                    user["content"] = ([{"type": "text", "text": text}] if text else []) + [
+                        {"type": "image_url", "image_url": {"url": image}} for image in images]
             payload = {
                 "messages": [sys_msg] + history,
                 "max_tokens": max_out,

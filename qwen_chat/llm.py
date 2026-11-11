@@ -32,6 +32,17 @@ class Cancelled(Exception):
 
 
 GPU_BUSY = Path("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage")
+VISION_MEMORY_MB = 7500
+
+
+def available_memory_mb() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def gpu_busy_percent() -> int | None:
@@ -50,6 +61,8 @@ class ServerManager:
         self.proc: subprocess.Popen | None = None
         self.n_ctx = int(settings["context_size"])
         self.model_name = "Qwen"
+        self.vision_enabled = False
+        self.vision_error = ""
         self.log_path = CACHE_DIR / "server.log"
         self._lock = threading.Lock()
         self._token_ids: dict[str, int | None] = {}
@@ -84,6 +97,18 @@ class ServerManager:
                 cmd = [os.path.expanduser(c) for c in self.settings["server_command"]]
                 if not os.access(cmd[0], os.X_OK):
                     raise ServerError(f"Model launcher not found: {cmd[0]}")
+                projector = Path(os.path.expanduser(str(self.settings.get("vision_projector", ""))))
+                wants_vision = self.settings.get("vision", True)
+                has_projector_arg = any(arg == "--mmproj" or arg.startswith("--mmproj=") for arg in cmd)
+                if wants_vision and not has_projector_arg:
+                    if not projector.is_file():
+                        self.vision_error = f"Vision projector not found: {projector}"
+                    elif ((available := available_memory_mb()) is not None
+                          and available < VISION_MEMORY_MB):
+                        self.vision_error = (f"Vision needs at least {VISION_MEMORY_MB:,} MB of free "
+                                             "memory to start safely.")
+                    else:
+                        cmd += ["--mmproj", str(projector)]
                 env = dict(os.environ)
                 env.pop("LD_PRELOAD", None)
                 env["QWEN_CTX"] = str(self.settings["context_size"])
@@ -120,6 +145,14 @@ class ServerManager:
         except (OSError, ValueError):
             return
         self.n_ctx = int(props.get("default_generation_settings", {}).get("n_ctx") or self.n_ctx)
+        self.vision_enabled = bool((props.get("modalities") or {}).get("vision")
+                                   and self.settings.get("vision", True))
+        if self.vision_enabled:
+            self.vision_error = ""
+        elif not self.vision_error:
+            self.vision_error = ("Native vision is disabled in Qwen Chat settings."
+                                 if not self.settings.get("vision", True) else
+                                 "The running model server does not have a vision projector loaded.")
         path = props.get("model_alias") or props.get("model_path") or ""
         name = os.path.basename(path).removesuffix(".gguf")
         if name:

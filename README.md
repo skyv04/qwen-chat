@@ -85,8 +85,9 @@ started it.
   parse yet comes back with the line and column where it breaks.
 - **Think**: optional step-by-step reasoning, shown in a collapsible "Thoughts" section.
 - Attach files with the paperclip button or drag and drop. They're copied into
-  `workspace/attachments` and read for Qwen before it answers (a PDF's pictures by OCR),
-  so it works from what the files hold now, not from an earlier reply about them.
+  `workspace/attachments` and read for Qwen before it answers. With the optional vision
+  projector installed, Qwen can inspect attached JPEG, PNG, HEIF/HEIC and other supported
+  images directly; PDF pictures are still read by OCR.
 - Chats are saved, with a sidebar grouped by date (Today, Yesterday, …) to switch, delete
   and undo a delete. The pencil beside a chat renames it; for the current chat you can
   also use **F2** or menu → **Rename Chat...**. Renaming keeps its messages, settings

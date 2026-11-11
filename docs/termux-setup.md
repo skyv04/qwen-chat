@@ -53,8 +53,7 @@ env -u LD_PRELOAD apt-get install -y \
 
 Chromium and Poppler are for PDF rendering, not model inference. A PDF viewer
 such as Okular is optional; install it with `apt-get install okular`. For
-scanned text, `tesseract-ocr` is useful. This app does not load Qwen's vision
-projector: image-to-text work uses tools such as OCR, not native model vision.
+scanned text, `tesseract-ocr` is useful.
 
 On the tested PRoot desktop, the account is not fake root. The equivalent
 package command there is
@@ -115,6 +114,28 @@ printf '%s  %s\n' \
 
 The model is distributed by Unsloth; see its model card and license.
 It is downloaded separately and is not included in this repository.
+
+### Enable native image understanding
+
+Qwen Chat can inspect attached JPEG, PNG, HEIF/HEIC and other GdkPixbuf-readable
+images directly. Download the matching vision projector beside the text model:
+
+```sh
+cd "$HOME/models"
+curl --fail --location --continue-at - \
+  --output Qwen3.5-9B-mmproj-F16.gguf \
+  https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/mmproj-F16.gguf
+printf '%s  %s\n' \
+  f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f \
+  Qwen3.5-9B-mmproj-F16.gguf | sha256sum -c -
+```
+
+The projector is about 876 MiB. The launcher requires 7,500 MB available before
+starting with vision, rather than 6,000 MB for text-only use. It resizes images
+to at most 1,280 pixels before sending them to the model. If the projector is
+absent or available memory is below the vision threshold, Qwen Chat stays
+text-only and reports why image attachments cannot be inspected instead of
+silently ignoring them. Free memory and restart Qwen Chat to enable vision.
 
 The tested phone has about 14 GiB of usable RAM. Our launcher asks for at
 least 6,000 MB currently available before loading this model. That is a

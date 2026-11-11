@@ -49,7 +49,7 @@ class CutOffToolCallTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _respond(self, replies, messages, events=None):
+    def _respond(self, replies, messages, events=None, server=None):
         payloads = self.payloads
 
         class Stream:
@@ -63,7 +63,7 @@ class CutOffToolCallTest(unittest.TestCase):
                 return result
 
         with mock.patch.object(agent, "ChatStream", Stream):
-            Agent(_Server(), self.box).respond(messages, events or _Events(), threading.Event())
+            Agent(server or _Server(), self.box).respond(messages, events or _Events(), threading.Event())
 
     def test_cut_off_call_is_reported_and_never_stored_broken(self):
         msgs = [{"role": "user", "content": "make the pdf"}]
@@ -351,10 +351,9 @@ class CutOffToolCallTest(unittest.TestCase):
     def test_attached_files_are_read_before_the_first_reply(self):
         (self.root / "attachments").mkdir()
         (self.root / "attachments/boost.txt").write_text("The cook made 11 cheese pizzas. " * 8)
-        (self.root / "attachments/photo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00")
         # Chats saved before attachments were stored in _meta list them in the text only.
         msgs = [{"role": "user", "content": "Use its questions.\n\n" + agent.ATTACHED_LINE
-                 + "`attachments/boost.txt`, `attachments/photo.png`"}]
+                 + "`attachments/boost.txt`"}]
         self._respond([
             _reply({"tool_calls": [_call('{"path":"attachments/boost.txt"}', "c1", "read_file")]}),
             _reply({"content": "It has a pizza word problem."}),
@@ -362,7 +361,7 @@ class CutOffToolCallTest(unittest.TestCase):
         sent = self.payloads[0]["messages"]
         self.assertEqual([m["role"] for m in sent], ["system", "user", "assistant", "tool"])
         self.assertEqual([json.loads(c["function"]["arguments"]) for c in sent[2]["tool_calls"]],
-                         [{"path": "attachments/boost.txt"}])  # a picture is left to the model
+                         [{"path": "attachments/boost.txt"}])
         self.assertIn("11 cheese pizzas", sent[3]["content"])
         self.assertTrue(sent[3]["content"].startswith(agent.ATTACHED_READ_NOTE))
         self.assertTrue(msgs[1]["_meta"]["attachments_read"])
@@ -374,6 +373,32 @@ class CutOffToolCallTest(unittest.TestCase):
                          [agent.REPEAT_STUB, msgs[4]["content"]])
         self.assertEqual(agent.attached_files({"content": "Hi", "_meta": {"attachments": ["a b.pdf"]}}),
                          ["a b.pdf"])
+
+    def test_attached_images_are_sent_as_native_vision_parts(self):
+        (self.root / "attachments").mkdir()
+        (self.root / "attachments/photo.jpg").write_bytes(b"\xff\xd8\xfftest")
+        messages = [{"role": "user", "content": "What is in this picture?",
+                     "_meta": {"attachments": ["attachments/photo.jpg"]}}]
+        server = _Server()
+        server.vision_enabled = True
+        image = "data:image/jpeg;base64,ZmFrZQ=="
+        with mock.patch.object(agent, "data_url", return_value=image):
+            self._respond([_reply({"content": "A test image."})], messages, server=server)
+        sent = self.payloads[0]["messages"]
+        self.assertIn("You can see image attachments directly", sent[0]["content"])
+        user = next(m for m in sent if m["role"] == "user")
+        self.assertEqual(user["content"], [
+            {"type": "text", "text": "What is in this picture?"},
+            {"type": "image_url", "image_url": {"url": image}},
+        ])
+        self.assertIsInstance(messages[0]["content"], str)  # saved chat never stores base64
+
+    def test_attached_image_is_not_silently_ignored_without_vision(self):
+        (self.root / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        messages = [{"role": "user", "content": "Describe it.\n\n" + agent.ATTACHED_LINE
+                     + "`photo.png`"}]
+        with self.assertRaisesRegex(agent.LLMError, "Image understanding is not enabled"):
+            self._respond([_reply({"content": "unused"})], messages)
 
 
 class HistoryRepairTest(unittest.TestCase):

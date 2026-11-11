@@ -25,6 +25,8 @@ DEFAULTS = {
     "server_url": "http://127.0.0.1:8080",
     "server_command": ["~/.local/bin/qwen-server"],
     "context_size": 16384,
+    "vision": True,
+    "vision_projector": "~/models/Qwen3.5-9B-mmproj-F16.gguf",
     "web": True,
     "files": True,
     # Lets the model run programs and install software. Routine commands and small installs

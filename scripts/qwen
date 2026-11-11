@@ -27,8 +27,11 @@ if [ ! -r "$gpu_env" ]; then
 fi
 
 # Turnip copies the weights into shared system RAM. Running out can kill Termux,
-# taking the desktop with it. This guard is for the default 9B Q4_K_M model.
+# taking the desktop with it. Vision needs additional memory for the projector.
 need_mb=6000
+for arg in "$@"; do
+    case "$arg" in --mmproj|--mmproj=*) need_mb=7500 ;; esac
+done
 avail_mb=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
 if [ -z "$avail_mb" ]; then
     echo "qwen: could not read available RAM from /proc/meminfo." >&2

@@ -51,6 +51,8 @@ class InstallTests(unittest.TestCase):
         binary_dir.mkdir()
         model = self.home / "test model.gguf"
         model.touch()
+        projector = self.home / "vision projector.gguf"
+        projector.touch()
         gpu_env = self.home / "gpu.sh"
         gpu_env.write_text('export VK_DRIVER_FILES=/test/turnip.json\nexport LD_PRELOAD=/not-loaded.so\n')
         fixture = (
@@ -68,7 +70,8 @@ class InstallTests(unittest.TestCase):
         for name, tool in (("qwen", "llama-cli"), ("qwen-server", "llama-server")):
             with self.subTest(name=name):
                 result = subprocess.run(
-                    [str(self.home / ".local/bin" / name), "--port", "8181"], env=env,
+                    [str(self.home / ".local/bin" / name), "--mmproj", str(projector),
+                     "--port", "8181"], env=env,
                     check=True, capture_output=True, text=True, timeout=10)
                 report = json.loads(result.stdout)
                 self.assertEqual(report["tool"], tool)
@@ -78,6 +81,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(args[args.index("-m") + 1], str(model))
                 self.assertEqual(args[args.index("-c") + 1], "8192")
                 self.assertEqual(args[args.index("-ub") + 1], "128")
+                self.assertEqual(args[args.index("--mmproj") + 1], str(projector))
                 self.assertEqual(args[-2:], ["--port", "8181"])
                 if name == "qwen-server":
                     self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
