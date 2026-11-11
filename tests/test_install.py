@@ -82,6 +82,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(args[args.index("-c") + 1], "8192")
                 self.assertEqual(args[args.index("-ub") + 1], "128")
                 self.assertEqual(args[args.index("--mmproj") + 1], str(projector))
+                self.assertEqual(args[args.index("--image-max-tokens") + 1], "768")
                 self.assertEqual(args[-2:], ["--port", "8181"])
                 if name == "qwen-server":
                     self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
@@ -94,6 +95,7 @@ class InstallTests(unittest.TestCase):
         result = subprocess.run([str(self.home / ".local/bin/qwen-server")], env=default_env,
                                 check=True, capture_output=True, text=True, timeout=10)
         self.assertEqual(json.loads(result.stdout)["driver"], str(icd))
+        self.assertNotIn("--image-min-tokens", json.loads(result.stdout)["args"])
         icd.unlink()
         result = subprocess.run([str(self.home / ".local/bin/qwen-server")], env=default_env,
                                 capture_output=True, text=True, timeout=10)
@@ -104,6 +106,43 @@ class InstallTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("GPU environment not found", result.stderr)
+
+    def test_memory_guard_scales_with_the_model_and_projector(self):
+        self.install()
+        binary_dir = self.home / "backend"
+        binary_dir.mkdir()
+        server = binary_dir / "llama-server"
+        server.write_text("#!/bin/sh\necho started\n")
+        server.chmod(0o755)
+        model = self.home / "huge model.gguf"
+        model.touch()
+        os.truncate(model, 1 << 40)  # sparse 1 TiB, more than any machine has free
+        projector = self.home / "projector.gguf"
+        projector.touch()
+        os.truncate(projector, 3 << 20)
+        gpu_env = self.home / "gpu.sh"
+        gpu_env.write_text("")
+        env = {**self.env, "QWEN_LLAMA_BIN": str(binary_dir), "QWEN_MODEL": str(model),
+               "QWEN_GPU_ENV": str(gpu_env)}
+        env.pop("QWEN_SKIP_MEM_CHECK", None)
+        env.pop("QWEN_NEED_MB", None)
+        launcher = str(self.home / ".local/bin/qwen-server")
+        # 1,048,576 MB + 600, plus 3 + 600 with the projector, rounded to 100 MB.
+        for args, need in (([], "1049200"), (["--mmproj", str(projector)], "1049800"),
+                           ([f"--mmproj={projector}"], "1049800")):
+            with self.subTest(args=args):
+                result = subprocess.run([launcher, *args], env=env, capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"at least {need} MB", result.stderr)
+                self.assertNotIn("started", result.stdout)
+        result = subprocess.run([launcher], env={**env, "QWEN_NEED_MB": "0"},
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.stdout.strip(), "started")
+        result = subprocess.run([launcher], env={**env, "QWEN_NEED_MB": "lots"},
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("QWEN_NEED_MB must be a number", result.stderr)
 
 
 if __name__ == "__main__":

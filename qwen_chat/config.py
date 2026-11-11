@@ -25,8 +25,13 @@ DEFAULTS = {
     "server_url": "http://127.0.0.1:8080",
     "server_command": ["~/.local/bin/qwen-server"],
     "context_size": 16384,
+    # The GGUF to load; empty means the launcher's default (QWEN_MODEL or the 9B model).
+    # The Model menu lists every model in models_dir.
+    "model": "",
+    "models_dir": "~/models",
     "vision": True,
-    "vision_projector": "~/models/Qwen3.5-9B-mmproj-F16.gguf",
+    # Empty finds the projector named after the model, e.g. Qwen3.5-9B-mmproj-F16.gguf.
+    "vision_projector": "",
     "web": True,
     "files": True,
     # Lets the model run programs and install software. Routine commands and small installs

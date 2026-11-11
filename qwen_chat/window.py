@@ -15,10 +15,11 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
-from . import APP_ID, APP_NAME  # noqa: E402
+from . import APP_ID, APP_NAME, models  # noqa: E402
 from .agent import ATTACHED_LINE, Agent, repair_history, salvage_args  # noqa: E402
 from .history import ChatFiles, ChatScope  # noqa: E402
-from .llm import Cancelled, LLMError, ServerError, gpu_busy_percent  # noqa: E402
+from .llm import (Cancelled, LLMError, ServerError, available_memory_mb,  # noqa: E402
+                  gpu_busy_percent)
 from .skill_picker import SkillPicker  # noqa: E402
 from .skills import slash_query  # noqa: E402
 from .store import ChatStore, title_from  # noqa: E402
@@ -122,6 +123,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.attachments: list[str] = []
         self._status = ""
         self._server_state = "starting"
+        self._server_gen = 0
         self._flush_pending = False
         self._stick = True
         self._loading_list = False
@@ -298,7 +300,8 @@ class ChatWindow(Adw.ApplicationWindow):
         qbox.append(q_title)
         self.queue_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         qbox.append(self.queue_label)
-        qbox.set_tooltip_text("This message will be sent when Qwen finishes the current answer")
+        qbox.set_tooltip_text("This message will be sent when Qwen finishes the current answer "
+                              "or the model switch")
         q_edit = Gtk.Button(label="Edit", action_name="win.queue-edit", valign=Gtk.Align.CENTER,
                             tooltip_text="Put it back in the message box")
         q_edit.add_css_class("pill-small")
@@ -383,6 +386,25 @@ class ChatWindow(Adw.ApplicationWindow):
         self.tools_popover = self._build_tools_popover()
         self.tools_button.set_popover(self.tools_popover)
         row.append(self.tools_button)
+        self.model_button = Gtk.MenuButton(direction=Gtk.ArrowType.UP,
+                                           tooltip_text="Switch model (keeps this chat)")
+        self.model_button.add_css_class("composer-menu")
+        model_label = Gtk.Box(spacing=6)
+        model_label.append(Gtk.Image(icon_name="computer-symbolic"))
+        self.model_name_label = Gtk.Label(label="Model")
+        model_label.append(self.model_name_label)
+        self.model_summary = Gtk.Label()
+        self.model_summary.add_css_class("dim-label")
+        self.model_summary.add_css_class("caption")
+        model_label.append(self.model_summary)
+        self.model_button.set_child(model_label)
+        self.model_popover = Gtk.Popover(position=Gtk.PositionType.TOP, has_arrow=False,
+                                         halign=Gtk.Align.START)
+        self.model_popover.add_css_class("composer-options")
+        self.model_button.set_popover(self.model_popover)
+        self.model_button.set_create_popup_func(lambda *_: self._fill_model_popover())
+        row.append(self.model_button)
+        self._sync_model_summary()
         row.append(Gtk.Box(hexpand=True))
         self.ctx_label = Gtk.Label(valign=Gtk.Align.CENTER)
         self.ctx_label.add_css_class("ctx-label")
@@ -470,6 +492,7 @@ class ChatWindow(Adw.ApplicationWindow):
         s1.append("Skills", "win.skills")
         s1.append("Save This Workflow as a Skill", "win.save-skill")
         s1.append("Rename Chat...", "win.rename-chat")
+        s1.append("Switch Model...", "win.choose-model")
         s1.append("Restart Model", "win.restart-model")
         menu.append_section(None, s1)
         look = Gio.Menu()
@@ -505,6 +528,7 @@ class ChatWindow(Adw.ApplicationWindow):
         self.rename_action.set_enabled(False)
         add("escape", lambda *_: self._escape())
         add("restart-model", lambda *_: self.restart_model())
+        add("choose-model", lambda *_: self.model_button.popup())
         self.stop_action = add("stop", lambda *_: self.stop())
         add("toggle-sidebar", lambda *_: self.flap.set_reveal_flap(not self.flap.get_reveal_flap()))
         add("focus-composer", lambda *_: self.textview.grab_focus())
@@ -593,19 +617,27 @@ class ChatWindow(Adw.ApplicationWindow):
         self._sync_tools_summary()
 
     # ================================================================== model server
-    def preload_model(self) -> None:
+    def preload_model(self, restart: bool = False, status: str = "Starting…") -> None:
         self.banner.set_reveal_child(False)
-        self._server_state = "starting"
-        self._set_status("Starting…")
+        # A newer start or switch makes older results stale; they must not flip the status.
+        self._server_gen += 1
+        gen = self._server_gen
+        self._server_state = "switching" if restart else "starting"
+        self._set_status(status)
+        self._sync_model_summary()
 
         def work():
+            on_status = lambda s: GLib.idle_add(self._set_status_idle, s)  # noqa: E731
             try:
-                self.server.ensure_running(lambda s: GLib.idle_add(self._set_status_idle, s))
-                GLib.idle_add(self._server_ready)
+                if restart:
+                    self.server.restart(on_status)
+                else:
+                    self.server.ensure_running(on_status)
+                GLib.idle_add(self._server_ready, gen)
             except ServerError as e:
-                GLib.idle_add(self._server_failed, str(e))
+                GLib.idle_add(self._server_failed, str(e), gen)
             except Exception as e:  # never leave the UI stuck on "Starting…"
-                GLib.idle_add(self._server_failed, f"{type(e).__name__}: {e}")
+                GLib.idle_add(self._server_failed, f"{type(e).__name__}: {e}", gen)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -614,38 +646,166 @@ class ChatWindow(Adw.ApplicationWindow):
             self._set_status(text)
         return False
 
-    def _server_ready(self):
+    def _server_ready(self, gen=None):
+        if gen is not None and gen != self._server_gen:
+            return False
+        switched = self._server_state == "switching"
         self._server_state = "ready"
         self.banner.set_reveal_child(False)
         if not self.running:
             self._set_status(self._ready_text())
         self._update_context()
+        self._sync_model_summary()
+        if switched:
+            self.toast(f"Now using {self._model_text()}. This chat is still here.")
+            self._send_held()
         return False
 
     def _ready_text(self) -> str:
         return f"{self.server.model_name} · on GPU · ready"
 
-    def _server_failed(self, text):
+    def _server_failed(self, text, gen=None):
+        if gen is not None and gen != self._server_gen:
+            return False
         self._server_state = "failed"
         self.banner_label.set_label("The model could not start.\n" + text)
         self.banner.set_reveal_child(True)
         self._set_status("Model not running")
+        self._sync_model_summary()
+        if self._queued is not None and not self.running:
+            self._edit_queued()
+            self.toast("Your message is back in the box. Send it once a model is running.")
         return False
 
-    def restart_model(self) -> None:
+    def _send_held(self) -> None:
+        """Sends the message written while the model was switching."""
+        if self._queued is not None and not self.running:
+            text, atts = self._take_queued()
+            self._submit(text, atts)
+
+    def _can_restart(self) -> bool:
         if self.running:
             self.toast("Stop the current answer first.")
-            return
+            return False
         if not self.server.owned and self.server.health() == "ok":
             self.toast("The model server was started outside Qwen Chat. Restart it there.")
+            return False
+        return True
+
+    def restart_model(self) -> None:
+        if self._can_restart():
+            self.preload_model(restart=True, status="Restarting the model…")
+
+    # ------------------------------------------------------------------ model menu
+    def _current_model(self) -> tuple[Path, bool]:
+        """The model answering now, or the one that starts next when none is ready."""
+        server = self.server
+        if self._server_state == "ready":
+            path = getattr(server, "model_path", None) or getattr(server, "started_model", None)
+            if path:
+                return Path(path), bool(getattr(server, "vision_enabled", False))
+        model = models.selected_model(self.settings)
+        vision = bool(self.settings.get("vision", True)
+                      and models.projector_for(model, self.settings.get("vision_projector") or ""))
+        return model, vision
+
+    def _model_text(self) -> str:
+        path, vision = self._current_model()
+        return f"{models.base_name(path)} · {'Vision' if vision else 'Text only'}"
+
+    def _sync_model_summary(self) -> None:
+        if not hasattr(self, "model_button"):
             return
-        self._set_status("Restarting the model…")
+        path, vision = self._current_model()
+        self.model_name_label.set_label(models.short_name(path))
+        self.model_summary.set_label("Vision" if vision else "Text")
+        state = {"switching": "Switching to", "starting": "Starting"}.get(self._server_state, "Using")
+        self.model_button.set_tooltip_text(
+            f"{state} {self._model_text()}. Click to switch models; this chat stays open.")
 
-        def work():
-            self.server.stop()
-            GLib.idle_add(self.preload_model)
+    def _fill_model_popover(self) -> None:
+        available = available_memory_mb()
+        unload = getattr(self.server, "unload_frees_mb", None)
+        frees = unload() if callable(unload) else 0
+        current, vision = self._current_model()
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=340)
+        heading = Gtk.Label(label="Model", xalign=0)
+        heading.add_css_class("heading")
+        body.append(heading)
+        if available is None:
+            memory = "Free memory is unknown."
+        elif frees:
+            memory = (f"{models.gb(available)} free now, about {models.gb(available + frees)} "
+                      f"once {models.short_name(current)} is unloaded.")
+        else:
+            memory = f"{models.gb(available)} free now."
+        self.model_memory_label = Gtk.Label(label=memory, xalign=0, wrap=True, max_width_chars=44)
+        self.model_memory_label.add_css_class("caption")
+        body.append(self.model_memory_label)
+        self.model_rows: list[tuple[Adw.ActionRow, Gtk.CheckButton, models.ModelChoice]] = []
+        group = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        group.add_css_class("boxed-list")
+        first = None
+        for choice in models.choices(self.settings):
+            is_current = choice.path == current and choice.vision == vision
+            fits = available is None or available + frees >= choice.need_mb
+            subtitle = f"Needs about {models.gb(choice.need_mb)} free"
+            if is_current:
+                subtitle = ("Starting now" if self._server_state in ("starting", "switching")
+                            else "In use") + " · " + subtitle
+            elif not fits:
+                subtitle += " · not enough now"
+            check = Gtk.CheckButton(active=is_current, valign=Gtk.Align.CENTER)
+            if first is None:
+                first = check
+            else:
+                check.set_group(first)
+            row = Adw.ActionRow(title=choice.label, subtitle=subtitle, subtitle_lines=2)
+            row.add_prefix(check)
+            row.set_activatable_widget(check)
+            row.set_sensitive(fits or is_current)
+            check.connect("toggled", self._on_model_toggled, choice)
+            group.append(row)
+            self.model_rows.append((row, check, choice))
+        if self.model_rows:
+            body.append(group)
+        else:
+            empty = Gtk.Label(label=f"No models found in {self.settings.get('models_dir') or '~/models'}.",
+                              xalign=0, wrap=True)
+            empty.add_css_class("dim-label")
+            body.append(empty)
+        hint = Gtk.Label(label="This chat stays open. The new model reads it before its first "
+                               "answer, which takes longer in a long chat.",
+                         xalign=0, wrap=True, max_width_chars=44)
+        hint.add_css_class("caption")
+        hint.add_css_class("dim-label")
+        body.append(hint)
+        self.model_popover.set_child(body)
 
-        threading.Thread(target=work, daemon=True).start()
+    def _on_model_toggled(self, check, choice) -> None:
+        if check.get_active():
+            self.switch_model(choice)
+
+    def switch_model(self, choice: models.ModelChoice) -> None:
+        self.model_popover.popdown()
+        current, vision = self._current_model()
+        if choice.path == current and choice.vision == vision and self._server_state != "failed":
+            return
+        if not self._can_restart():
+            return
+        available = available_memory_mb()
+        unload = getattr(self.server, "unload_frees_mb", None)
+        frees = unload() if callable(unload) else 0
+        if available is not None and available + frees < choice.need_mb:
+            self.toast(f"{choice.label} needs about {models.gb(choice.need_mb)} free; only about "
+                       f"{models.gb(available + frees)} would be. Close other apps and try again.")
+            return
+        self.settings["model"] = str(choice.path)
+        self.settings["vision"] = choice.vision
+        if choice.projector is not None:
+            self.settings["vision_projector"] = str(choice.projector)
+        self.settings.save()
+        self.preload_model(restart=True, status=f"Switching to {choice.label}…")
 
     def _set_status(self, text: str) -> None:
         self._status = text
@@ -1179,7 +1339,7 @@ class ChatWindow(Adw.ApplicationWindow):
             self.buffer.set_text("")
         self._clear_chips()
         self._update_composer()
-        if self.running:
+        if self.running or self._server_state == "switching":
             self._queue(text, atts)
         else:
             self._submit(text, atts)
@@ -1245,6 +1405,9 @@ class ChatWindow(Adw.ApplicationWindow):
 
     def regenerate(self) -> None:
         if self.running or not self.chat:
+            return
+        if self._server_state == "switching":
+            self.toast("Wait until the model has switched, then try again.")
             return
         msgs = self.chat["messages"]
         last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)

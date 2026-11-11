@@ -98,6 +98,7 @@ class WindowUiTest(unittest.TestCase):
             dialog.destroy()
         self.win.skill_picker.popdown()
         self.win.tools_popover.popdown()
+        self.win.model_popover.popdown()
         self.win.destroy()
         self.app.window = None
         pump(0.1)
@@ -393,6 +394,88 @@ class WindowUiTest(unittest.TestCase):
         self.assertLess(self.win.tools_popover.get_width(), self.win.get_width())
         self.assertLess(self.win.tools_popover.get_height(), self.win.get_height())
         self.capture("composer-tools-dark")
+
+    def test_model_menu_switches_models_and_keeps_the_chat(self):
+        folder = ROOT / "models"
+        folder.mkdir(exist_ok=True)
+
+        def sized(name, mib):
+            path = folder / name
+            path.write_bytes(b"")
+            os.truncate(path, mib << 20)
+            return path
+
+        big = sized("Qwen3.5-9B-Q4_K_M.gguf", 5420)
+        big_projector = sized("Qwen3.5-9B-mmproj-F16.gguf", 876)
+        small = sized("Qwen3.5-4B-Q4_K_M.gguf", 2614)
+        sized("Qwen3.5-4B-mmproj-F16.gguf", 641)
+        self.addCleanup(self.app.settings.update, model="", vision=True, vision_projector="",
+                        models_dir="~/models")
+        self.app.settings.update(models_dir=str(folder), model=str(big), vision=True,
+                                 vision_projector=str(big_projector))
+        release = threading.Event()
+
+        class Server(_Server):
+            owned = True
+            model_path = big
+            vision_enabled = True
+            restart_calls = []
+
+            def unload_frees_mb(self):
+                return 2500
+
+            def restart(self, on_status):
+                self.restart_calls.append(self.model_path)
+                release.wait(5)
+                self.model_path, self.vision_enabled = small, False
+
+        server = Server()
+        self.win.server = server
+        self.win.chat = self.win.store.new()
+        self.win.chat["messages"] = [{"role": "user", "content": "Remember the word lantern."},
+                                     {"role": "assistant", "content": "Got it: lantern."}]
+        self.win._server_ready()
+        self.assertEqual(self.win.model_name_label.get_label(), "9B")
+        self.assertEqual(self.win.model_summary.get_label(), "Vision")
+        with mock.patch("qwen_chat.window.available_memory_mb", return_value=1500):
+            self.click(self.win.model_button)
+        self.assertTrue(self.win.model_popover.get_visible())
+        rows = {row.get_title(): (row, check) for row, check, _ in self.win.model_rows}
+        self.assertEqual(list(rows), ["Qwen3.5-9B · Vision", "Qwen3.5-9B · Text only",
+                                      "Qwen3.5-4B · Vision", "Qwen3.5-4B · Text only"])
+        self.assertTrue(rows["Qwen3.5-9B · Vision"][1].get_active())
+        # 1.5 GB free plus 2.5 GB from unloading 9B: only 4B text-only (3.2 GB) fits.
+        self.assertTrue(rows["Qwen3.5-9B · Vision"][0].get_sensitive())
+        self.assertFalse(rows["Qwen3.5-9B · Text only"][0].get_sensitive())
+        self.assertFalse(rows["Qwen3.5-4B · Vision"][0].get_sensitive())
+        self.assertTrue(rows["Qwen3.5-4B · Text only"][0].get_sensitive())
+        self.assertIn("not enough now", rows["Qwen3.5-4B · Vision"][0].get_subtitle())
+        self.capture("model-menu")
+        with mock.patch("qwen_chat.window.available_memory_mb", return_value=1500):
+            self.click(rows["Qwen3.5-4B · Text only"][1])
+        self.assertFalse(self.win.model_popover.get_visible())
+        self.assertEqual(self.win._server_state, "switching")
+        self.assertEqual(self.win.settings["model"], str(small))
+        self.assertFalse(self.win.settings["vision"])
+        self.assertIn("Switching to Qwen3.5-4B · Text only", self.win._status)
+
+        self.draft("What was the word?")
+        self.click(self.win.send_btn)
+        self.assertEqual(self.win._queued, ("What was the word?", []))
+        self.win._start_turn.assert_not_called()
+
+        release.set()
+        deadline = time.monotonic() + 5
+        while self.win._server_state != "ready" and time.monotonic() < deadline:
+            pump(0.05)
+        self.assertEqual(server.restart_calls, [big])
+        self.assertEqual(self.win._server_state, "ready")
+        self.assertEqual(self.win.model_name_label.get_label(), "4B")
+        self.assertEqual(self.win.model_summary.get_label(), "Text")
+        self.assertIsNone(self.win._queued)
+        self.win._start_turn.assert_called_once()
+        self.assertEqual([m["content"] for m in self.win.chat["messages"]],
+                         ["Remember the word lantern.", "Got it: lantern.", "What was the word?"])
 
     def test_page_budget_conflict_is_a_decision_not_a_failed_retry(self):
         self.win._submit("Make the worksheet PDF.", [])

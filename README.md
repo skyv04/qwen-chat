@@ -42,10 +42,16 @@ started it.
 
 - Answers stream in as they're written, with Markdown: code blocks with syntax
   highlighting and copy buttons, tables, lists, quotes and clickable links.
-- The message box has one compact toolbar: **Attach**, **Skills**, **Tools** and
+- The message box has one compact toolbar: **Attach**, **Skills**, **Tools**, **Model** and
   **Send**, with the context-token counter always visible beside Send. **Tools**
   contains Web, Files, Run and Think switches, with explanations. Its button shows
   how many tools are on.
+- **Model**: switch between installed models, such as Qwen3.5-9B and the smaller 4B,
+  with or without vision, without closing the app or losing the chat. The menu shows
+  free memory and how much each choice needs, and greys out choices that won't fit.
+  Only the model server restarts. The next answer re-reads the chat with the new model,
+  and a message sent during the switch is sent once it's ready. See
+  [docs/termux-setup.md](docs/termux-setup.md#optional-a-smaller-model-for-low-memory).
 - **Web**: searches DuckDuckGo, reads pages and downloads files. Each page comes with its
   list of links, so answers can link to the exact article.
 - **Files**: list, read, write, edit, move and delete files, plus create folders, all inside
@@ -410,6 +416,10 @@ Existing conversations can use them; a new chat is not required.
 | `server_url` | `http://127.0.0.1:8080` | llama-server address |
 | `server_command` | `["~/.local/bin/qwen-server"]` | How to start the server |
 | `context_size` | `16384` | Context window for a server the app starts |
+| `model` | `""` (`QWEN_MODEL` or Qwen3.5-9B) | Model file the app starts (**Model** menu) |
+| `models_dir` | `~/models` | Folder the **Model** menu lists |
+| `vision` | `true` | Load the model's vision projector when memory allows (**Model** menu → *Vision* or *Text only*) |
+| `vision_projector` | `""` | Projector to prefer; empty finds `<model>-mmproj-*.gguf` beside the model. A projector for another model is ignored |
 | `commands` | `true` | Let Qwen run commands and install programs (**Tools → Run**) |
 | `ask_commands` | `false` | Ask before every command and install, not only risky commands and big installs (menu → *Ask Before Every Command*) |
 | `ask_file_changes` | `false` | Also ask before overwriting or deleting a file, on top of the Trash backup (menu → *Ask Before Replacing or Deleting Files*) |
@@ -431,6 +441,9 @@ is no longer used and can be deleted; Qwen reinstalls packages when it needs the
 - The server runs with `-ub 128`. llama.cpp's default micro-batch of 512 crashes the
   Adreno driver (`ErrorDeviceLost`) on prompts longer than about 512 tokens. 128 is just
   as fast and stable.
+- With vision, images get 512–768 tokens (`--image-min-tokens 512 --image-max-tokens 768`).
+  The default gives a 1280 × 900 screenshot about 1,100 tokens, which crashed the Adreno
+  the same way. With fewer than 512 tokens, Qwen misread text in images.
 - Speeds: reading runs at about 30 tokens/s and writing at 5–10 tokens/s. Writing slows
   down when the phone gets hot and lowers the GPU clock.
 - The first message after the server starts is slower because the instructions and

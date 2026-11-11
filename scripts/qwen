@@ -27,11 +27,32 @@ if [ ! -r "$gpu_env" ]; then
 fi
 
 # Turnip copies the weights into shared system RAM. Running out can kill Termux,
-# taking the desktop with it. Vision needs additional memory for the projector.
-need_mb=6000
+# taking the desktop with it. Allow each loaded file's size plus 600 MB for its
+# buffers and Android (9B: 6,000 MB, or 7,500 MB with vision). qwen_chat/models.py
+# makes the same estimate and passes it as QWEN_NEED_MB.
+size_mb() { echo $(( $(stat -c %s "$1") / 1048576 )); }
+need_mb=$(( $(size_mb "$model") + 600 ))
+projector=
+next_is_projector=0
 for arg in "$@"; do
-    case "$arg" in --mmproj|--mmproj=*) need_mb=7500 ;; esac
+    if [ "$next_is_projector" = 1 ]; then
+        projector=$arg
+        next_is_projector=0
+        continue
+    fi
+    case "$arg" in
+        -mm|--mmproj) next_is_projector=1 ;;
+        --mmproj=*) projector=${arg#--mmproj=} ;;
+    esac
 done
+if [ -n "$projector" ] && [ -r "$projector" ]; then
+    need_mb=$(( need_mb + $(size_mb "$projector") + 600 ))
+fi
+need_mb=$(( (need_mb + 50) / 100 * 100 ))
+need_mb="${QWEN_NEED_MB:-$need_mb}"
+case "$need_mb" in
+    ''|*[!0-9]*) echo "qwen: QWEN_NEED_MB must be a number of megabytes." >&2; exit 1 ;;
+esac
 avail_mb=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
 if [ -z "$avail_mb" ]; then
     echo "qwen: could not read available RAM from /proc/meminfo." >&2
@@ -53,6 +74,11 @@ unset LD_PRELOAD
 
 # A 512-token micro-batch faulted on the tested Adreno driver. Keep the stable 128.
 defaults=(-m "$model" -ngl 99 -t 6 -c "$ctx" -fa on -ctk q8_0 -ctv q8_0 -ub 128 --reasoning off)
+if [ -n "$projector" ]; then
+    # Qwen-VL misreads text in images given fewer than ~512 tokens, and the Adreno hung
+    # (vk ErrorDeviceLost) encoding about 1,000, as a 1280 x 900 screenshot gets by default.
+    defaults+=(--image-min-tokens 512 --image-max-tokens 768)
+fi
 if [ "$tool" = llama-server ]; then
     defaults+=(--host 127.0.0.1 --port 8080)
     echo "qwen-server: local API at http://127.0.0.1:8080 (Ctrl+C to stop)" >&2

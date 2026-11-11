@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from . import models
 from .config import CACHE_DIR
 
 
@@ -63,6 +64,10 @@ class ServerManager:
         self.model_name = "Qwen"
         self.vision_enabled = False
         self.vision_error = ""
+        self.model_path: Path | None = None
+        # What this app started, so the Model menu can tell how much memory unloading frees.
+        self.started_model: Path | None = None
+        self.started_projector: Path | None = None
         self.log_path = CACHE_DIR / "server.log"
         self._lock = threading.Lock()
         self._token_ids: dict[str, int | None] = {}
@@ -92,50 +97,84 @@ class ServerManager:
     def ensure_running(self, on_status: Callable[[str], None] = lambda s: None,
                        cancel: threading.Event | None = None) -> None:
         with self._lock:
+            self._ensure_locked(on_status, cancel)
+
+    def restart(self, on_status: Callable[[str], None] = lambda s: None) -> None:
+        """Stop this app's model server and start the model chosen in the settings. The lock is
+        held from stop to ready, so no chat request can reach the old model on its way out."""
+        self.stop()  # ends a load in progress too, so its ensure_running lets go of the lock
+        with self._lock:
+            self.stop()
+            self._ensure_locked(on_status, None)
+
+    def _ensure_locked(self, on_status: Callable[[str], None],
+                       cancel: threading.Event | None) -> None:
+        state = self.health()
+        if state == "down" and not self.owned:
+            cmd = [os.path.expanduser(c) for c in self.settings["server_command"]]
+            if not os.access(cmd[0], os.X_OK):
+                raise ServerError(f"Model launcher not found: {cmd[0]}")
+            model = models.selected_model(self.settings)
+            known = model.is_file()
+            explicit = str(self.settings.get("vision_projector") or "")
+            if known:
+                projector = models.projector_for(model, explicit)
+            else:  # a custom launcher picks its own model
+                projector = Path(os.path.expanduser(explicit)) if explicit else None
+                projector = projector if projector is not None and projector.is_file() else None
+            wants_vision = self.settings.get("vision", True)
+            has_projector_arg = any(arg == "--mmproj" or arg.startswith("--mmproj=") for arg in cmd)
+            self.vision_error = ""
+            use_projector = None
+            if wants_vision and not has_projector_arg:
+                need = models.need_mb(model, projector) if known and projector else VISION_MEMORY_MB
+                if projector is None:
+                    self.vision_error = (f"No vision projector is installed for {models.base_name(model)}. "
+                                         "Choose a Vision model from the Model menu.")
+                elif ((available := available_memory_mb()) is not None and available < need):
+                    self.vision_error = (
+                        f"Vision for {models.base_name(model)} needs about {need:,} MB of free "
+                        f"memory to start safely; {available:,} MB was free, so it started "
+                        "text only. Choose a smaller Vision model from the Model menu, or "
+                        "free memory and choose this one again.")
+                else:
+                    use_projector = projector
+                    cmd += ["--mmproj", str(projector)]
+            env = dict(os.environ)
+            env.pop("LD_PRELOAD", None)
+            env["QWEN_CTX"] = str(self.settings["context_size"])
+            if known:
+                env["QWEN_MODEL"] = str(model)
+                env["QWEN_NEED_MB"] = str(models.need_mb(model, use_projector))
+            self.started_model = model if known else None
+            self.started_projector = use_projector
+            port = urllib.parse.urlsplit(self.url).port or 8080
+            if port != 8080:
+                cmd += ["--port", str(port)]
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            on_status("Starting the model on the GPU…")
+            with open(self.log_path, "wb") as log:
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
+                                             stderr=subprocess.STDOUT, env=env,
+                                             start_new_session=True)
+        deadline = time.monotonic() + 420
+        watched = self.proc
+        while True:
             state = self.health()
-            if state == "down" and not self.owned:
-                cmd = [os.path.expanduser(c) for c in self.settings["server_command"]]
-                if not os.access(cmd[0], os.X_OK):
-                    raise ServerError(f"Model launcher not found: {cmd[0]}")
-                projector = Path(os.path.expanduser(str(self.settings.get("vision_projector", ""))))
-                wants_vision = self.settings.get("vision", True)
-                has_projector_arg = any(arg == "--mmproj" or arg.startswith("--mmproj=") for arg in cmd)
-                if wants_vision and not has_projector_arg:
-                    if not projector.is_file():
-                        self.vision_error = f"Vision projector not found: {projector}"
-                    elif ((available := available_memory_mb()) is not None
-                          and available < VISION_MEMORY_MB):
-                        self.vision_error = (f"Vision needs at least {VISION_MEMORY_MB:,} MB of free "
-                                             "memory to start safely.")
-                    else:
-                        cmd += ["--mmproj", str(projector)]
-                env = dict(os.environ)
-                env.pop("LD_PRELOAD", None)
-                env["QWEN_CTX"] = str(self.settings["context_size"])
-                port = urllib.parse.urlsplit(self.url).port or 8080
-                if port != 8080:
-                    cmd += ["--port", str(port)]
-                self.log_path.parent.mkdir(parents=True, exist_ok=True)
-                on_status("Starting the model on the GPU…")
-                with open(self.log_path, "wb") as log:
-                    self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
-                                                 stderr=subprocess.STDOUT, env=env,
-                                                 start_new_session=True)
-            deadline = time.monotonic() + 420
-            while True:
-                state = self.health()
-                if state == "ok":
-                    break
-                if self.proc is not None and self.proc.poll() is not None:
-                    self.proc = None
-                    raise ServerError(self._log_tail() or "The model server exited during startup.")
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled()
-                if time.monotonic() > deadline:
-                    raise ServerError("The model took more than 7 minutes to load.")
-                on_status("Loading Qwen onto the GPU…")
-                time.sleep(0.8)
-            self._read_props()
+            if state == "ok":
+                break
+            if watched is not None and self.proc is not watched:
+                raise ServerError("The model server was stopped before it finished loading.")
+            if self.proc is not None and self.proc.poll() is not None:
+                self.proc = None
+                raise ServerError(self._log_tail() or "The model server exited during startup.")
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            if time.monotonic() > deadline:
+                raise ServerError("The model took more than 7 minutes to load.")
+            on_status("Loading Qwen onto the GPU…")
+            time.sleep(0.8)
+        self._read_props()
 
     def _read_props(self) -> None:
         self._token_ids.clear()
@@ -150,10 +189,13 @@ class ServerManager:
         if self.vision_enabled:
             self.vision_error = ""
         elif not self.vision_error:
-            self.vision_error = ("Native vision is disabled in Qwen Chat settings."
+            self.vision_error = ("Vision is off for this model. Choose a Vision model from the "
+                                 "Model menu, then send the image again."
                                  if not self.settings.get("vision", True) else
                                  "The running model server does not have a vision projector loaded.")
-        path = props.get("model_alias") or props.get("model_path") or ""
+        path = props.get("model_path") or ""
+        self.model_path = Path(path) if path else None
+        path = props.get("model_alias") or path
         name = os.path.basename(path).removesuffix(".gguf")
         if name:
             # "Qwen3.5-9B-Q4_K_M" -> "Qwen3.5-9B"
@@ -179,8 +221,15 @@ class ServerManager:
             self._token_ids[text] = tid
         return self._token_ids[text]
 
+    def unload_frees_mb(self) -> int:
+        """Memory that stopping this app's model server would give back (0 if it isn't ours)."""
+        if not self.owned or self.started_model is None:
+            return 0
+        return models.loaded_mb(self.started_model, self.started_projector)
+
     def stop(self) -> None:
         proc, self.proc = self.proc, None
+        self.vision_enabled = False
         if proc is None or proc.poll() is not None:
             return
         proc.terminate()

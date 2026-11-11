@@ -130,17 +130,65 @@ printf '%s  %s\n' \
   Qwen3.5-9B-mmproj-F16.gguf | sha256sum -c -
 ```
 
-The projector is about 876 MiB. The launcher requires 7,500 MB available before
-starting with vision, rather than 6,000 MB for text-only use. It resizes images
-to at most 1,280 pixels before sending them to the model. If the projector is
-absent or available memory is below the vision threshold, Qwen Chat stays
-text-only and reports why image attachments cannot be inspected instead of
-silently ignoring them. Free memory and restart Qwen Chat to enable vision.
+The projector is about 876 MiB. The launcher requires about 7,500 MB available
+before starting this model with vision, rather than 6,000 MB for text-only use.
+It resizes images to at most 1,280 pixels before sending them to the model. If
+the projector is absent or available memory is below the vision threshold, Qwen
+Chat starts text-only and reports why image attachments cannot be inspected
+instead of silently ignoring them. Free memory, then choose a **Vision** model
+from the **Model** menu; there is no need to restart the app.
 
-The tested phone has about 14 GiB of usable RAM. Our launcher asks for at
-least 6,000 MB currently available before loading this model. That is a
-practical guard, not a guarantee: weights, working buffers, Android apps and
-the desktop all share the same memory. Android may kill Termux if it runs out.
+With a projector, the launcher adds `--image-min-tokens 512 --image-max-tokens 768`.
+With fewer image tokens, Qwen misread large text in a test image. With the default
+of about 1,100 tokens for a 1280 × 900 screenshot, the Adreno failed with
+`ErrorDeviceLost` and the server crashed. Within this range, the 4B model read the
+text correctly and answered in about 20–30 seconds.
+
+### Optional: a smaller model for low memory
+
+Qwen3.5-4B needs much less memory and still understands images. Download it
+beside the 9B model (Apache-2.0, distributed by Unsloth):
+
+```sh
+cd "$HOME/models"
+rev=e87f176479d0855a907a41277aca2f8ee7a09523
+curl --fail --location --continue-at - \
+  --output Qwen3.5-4B-Q4_K_M.gguf \
+  "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/$rev/Qwen3.5-4B-Q4_K_M.gguf"
+curl --fail --location --continue-at - \
+  --output Qwen3.5-4B-mmproj-F16.gguf \
+  "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/$rev/mmproj-F16.gguf"
+printf '%s  %s\n' \
+  00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4 Qwen3.5-4B-Q4_K_M.gguf \
+  cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864 Qwen3.5-4B-mmproj-F16.gguf \
+  | sha256sum -c -
+```
+
+Keep the `<model>-mmproj-<type>.gguf` naming. Qwen Chat only pairs a projector with
+the model whose name it starts with, because another model's projector would fail.
+
+The **Model** button beside **Tools** lists every model in `~/models`, each as
+**Vision** and **Text only**. The memory it needs is estimated as each file's size
+plus 600 MB:
+
+| Choice | Free memory needed |
+|---|---|
+| Qwen3.5-9B · Vision | about 7.5 GB |
+| Qwen3.5-9B · Text only | about 6.0 GB |
+| Qwen3.5-4B · Vision | about 4.5 GB |
+| Qwen3.5-4B · Text only | about 3.2 GB |
+
+The menu shows free memory now and after unloading the current model, and greys out
+choices that would not fit. Choosing one restarts only the model server, in about
+10 seconds for 4B; the chat stays open. Qwen Chat sends the whole chat with every
+message, so the new model reads it all before its first answer, which takes longer
+in a long chat. A message sent during the switch waits and is sent once the new model
+is ready. The choice is saved for the next launch. Manual launches can use
+`QWEN_MODEL=~/models/Qwen3.5-4B-Q4_K_M.gguf ~/.local/bin/qwen-server`.
+
+The tested phone has about 14 GiB of usable RAM. These limits are a practical
+guard, not a guarantee: weights, working buffers, Android apps and the desktop
+all share the same memory. Android may kill Termux if it runs out.
 
 ## 5. Install Qwen Chat
 
@@ -182,6 +230,9 @@ The shared launcher `scripts/qwen` supplies these defaults:
 -ngl 99 -t 6 -c 16384 -fa on -ctk q8_0 -ctv q8_0 -ub 128 --reasoning off
 ```
 
+With a vision projector (`--mmproj`) it also adds
+`--image-min-tokens 512 --image-max-tokens 768`.
+
 `-ub 128` matters. The default 512-token micro-batch caused
 `ErrorDeviceLost` on longer prompts on this driver. The smaller batch was
 stable in our runs. The 8-bit KV cache saves memory; neither setting makes
@@ -194,6 +245,7 @@ all phones equivalent. Do not treat an always-busy GPU as a performance target.
 | `QWEN_GPU_ENV` | `~/.local/share/qwen-chat-harness/turnip-env.sh` (respects `XDG_DATA_HOME`) |
 | `MESA_ADRENO_PREFIX` | `/opt/mesa-adreno` for the bundled Turnip helper |
 | `QWEN_CTX` | `16384` for manual launches; the GUI uses `context_size` from settings |
+| `QWEN_NEED_MB` | Free memory required to start: each loaded file's size plus 600 MB. The GUI sets it |
 | `QWEN_SKIP_MEM_CHECK` | Unset. `1` bypasses the memory check, at your own risk |
 
 Flags passed to `qwen` or `qwen-server` come after the defaults. Keep the
@@ -233,8 +285,9 @@ and are not replaced.
   Python or a venv that cannot see the distro's GI packages.
 - **Only a software Vulkan device:** fix the Mesa/KGSL setup before starting
   the model. Zink is for OpenGL applications, not llama.cpp inference.
-- **Low memory:** close Android applications and browser tabs. The guard
-  refuses to risk the whole desktop just to start a model.
+- **Low memory:** close Android applications and browser tabs, or choose a
+  smaller model from the **Model** menu. The guard refuses to risk the whole
+  desktop just to start a model.
 - **Slow first reply:** the server reads the system instructions and tool
   descriptions first. Later replies can reuse the cached prefix.
 - **Slower after a while:** the GPU throttles when the phone gets hot.
