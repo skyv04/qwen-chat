@@ -449,6 +449,12 @@ is no longer used and can be deleted; Qwen reinstalls packages when it needs the
 - With vision, images get 512–768 tokens (`--image-min-tokens 512 --image-max-tokens 768`).
   The default gives a 1280 × 900 screenshot about 1,100 tokens, which crashed the Adreno
   the same way. With fewer than 512 tokens, Qwen misread text in images.
+- With vision, the launcher also sets `GGML_VK_MAX_NODES_PER_SUBMIT=20`. The kernel resets
+  the Adreno (`ErrorDeviceLost`, shown in the app as "failed to process mtmd chunk") when
+  one GPU submission runs for about 2 seconds. llama.cpp's default of 100 graph nodes per
+  submission put 4–5 image-encoder layers in one, about 2 seconds on this GPU, so both the
+  4B and 9B models crashed while reading images. With 20, images read just as fast and
+  replies are written about 6% slower. Text-only models keep the default.
 - Speeds: reading runs at about 30 tokens/s and writing at 5–10 tokens/s. Writing slows
   down when the phone gets hot and lowers the GPU clock.
 - The first message after the server starts is slower because the instructions and

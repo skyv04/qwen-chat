@@ -78,6 +78,10 @@ if [ -n "$projector" ]; then
     # Qwen-VL misreads text in images given fewer than ~512 tokens, and the Adreno hung
     # (vk ErrorDeviceLost) encoding about 1,000, as a 1280 x 900 screenshot gets by default.
     defaults+=(--image-min-tokens 512 --image-max-tokens 768)
+    # The kernel resets the Adreno (vk ErrorDeviceLost, "failed to process mtmd chunk") when
+    # one GPU submission runs about 2 s. llama.cpp's 100 nodes per submission is 4-5 encoder
+    # layers (480-580 GFLOP). 20 read images as fast; replies are ~6% slower, so only vision.
+    export GGML_VK_MAX_NODES_PER_SUBMIT="${GGML_VK_MAX_NODES_PER_SUBMIT:-20}"
 fi
 if [ "$tool" = llama-server ]; then
     defaults+=(--host 127.0.0.1 --port 8080)

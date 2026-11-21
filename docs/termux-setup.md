@@ -144,6 +144,14 @@ of about 1,100 tokens for a 1280 × 900 screenshot, the Adreno failed with
 `ErrorDeviceLost` and the server crashed. Within this range, the 4B model read the
 text correctly and answered in about 20–30 seconds.
 
+With a projector, the launcher also sets `GGML_VK_MAX_NODES_PER_SUBMIT=20`. The
+kernel resets the Adreno when one GPU submission runs for about 2 seconds.
+llama.cpp submits 100 graph nodes at a time by default. For the image encoder
+that is 4–5 layers (480 GFLOP for 4B, 580 GFLOP for 9B), and both models failed
+with `ErrorDeviceLost` (shown in the app as "failed to process mtmd chunk").
+With 20 nodes, both encoded a 576 × 1280 image in 11–14 seconds in repeated
+runs. Replies are written about 6% slower, so text-only models keep the default.
+
 ### Optional: a smaller model for low memory
 
 Qwen3.5-4B needs much less memory and still understands images. Download it
@@ -231,7 +239,8 @@ The shared launcher `scripts/qwen` supplies these defaults:
 ```
 
 With a vision projector (`--mmproj`) it also adds
-`--image-min-tokens 512 --image-max-tokens 768`.
+`--image-min-tokens 512 --image-max-tokens 768` and sets
+`GGML_VK_MAX_NODES_PER_SUBMIT=20` unless it is already set.
 
 `-ub 128` matters. The default 512-token micro-batch caused
 `ErrorDeviceLost` on longer prompts on this driver. The smaller batch was
@@ -247,6 +256,7 @@ all phones equivalent. Do not treat an always-busy GPU as a performance target.
 | `QWEN_CTX` | `16384` for manual launches; the GUI uses `context_size` from settings |
 | `QWEN_NEED_MB` | Free memory required to start: each loaded file's size plus 600 MB. The GUI sets it |
 | `QWEN_SKIP_MEM_CHECK` | Unset. `1` bypasses the memory check, at your own risk |
+| `GGML_VK_MAX_NODES_PER_SUBMIT` | `20` with a vision projector; llama.cpp's `100` without |
 
 Flags passed to `qwen` or `qwen-server` come after the defaults. Keep the
 server bound to `127.0.0.1`; it is not an authenticated public service.

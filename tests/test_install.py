@@ -21,6 +21,7 @@ class InstallTests(unittest.TestCase):
                     "XDG_CACHE_HOME": str(self.home / ".cache")}
         self.env.pop("LD_PRELOAD", None)
         self.env.pop("PYTHONPATH", None)
+        self.env.pop("GGML_VK_MAX_NODES_PER_SUBMIT", None)
 
     def install(self):
         return subprocess.run([sys.executable, str(ROOT / "install.py"), "--desktop"],
@@ -59,7 +60,8 @@ class InstallTests(unittest.TestCase):
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
             "print(json.dumps({'tool': os.path.basename(sys.argv[0]), 'args': sys.argv[1:], "
-            "'preload': os.environ.get('LD_PRELOAD'), 'driver': os.environ.get('VK_DRIVER_FILES')}))\n"
+            "'preload': os.environ.get('LD_PRELOAD'), 'driver': os.environ.get('VK_DRIVER_FILES'), "
+            "'submit': os.environ.get('GGML_VK_MAX_NODES_PER_SUBMIT')}))\n"
         )
         for name in ("llama-cli", "llama-server"):
             target = binary_dir / name
@@ -83,9 +85,15 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(args[args.index("-ub") + 1], "128")
                 self.assertEqual(args[args.index("--mmproj") + 1], str(projector))
                 self.assertEqual(args[args.index("--image-max-tokens") + 1], "768")
+                self.assertEqual(report["submit"], "20")
                 self.assertEqual(args[-2:], ["--port", "8181"])
                 if name == "qwen-server":
                     self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
+        result = subprocess.run(
+            [str(self.home / ".local/bin/qwen-server"), "--mmproj", str(projector)],
+            env={**env, "GGML_VK_MAX_NODES_PER_SUBMIT": "50"},
+            check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(json.loads(result.stdout)["submit"], "50")
         prefix = self.home / "mesa-adreno"
         icd = prefix / "share/vulkan/icd.d/freedreno_icd.aarch64.json"
         icd.parent.mkdir(parents=True)
@@ -96,6 +104,7 @@ class InstallTests(unittest.TestCase):
                                 check=True, capture_output=True, text=True, timeout=10)
         self.assertEqual(json.loads(result.stdout)["driver"], str(icd))
         self.assertNotIn("--image-min-tokens", json.loads(result.stdout)["args"])
+        self.assertIsNone(json.loads(result.stdout)["submit"])
         icd.unlink()
         result = subprocess.run([str(self.home / ".local/bin/qwen-server")], env=default_env,
                                 capture_output=True, text=True, timeout=10)
