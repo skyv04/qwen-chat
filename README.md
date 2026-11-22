@@ -197,8 +197,9 @@ as an object, such as `{"title": ..., "passage": [...]}`, becomes the paragraph 
 with its title as `reading_title`. In a reading list, empty entries are paragraph
 breaks: the lines between them make one paragraph. Evidence such as "N/A" is ignored.
 An unavailable motif becomes `dots`, a too-pale accent is darkened, an answer-key style
-`answers` list inside a question becomes its `choice` and `evidence`, and line breaks
-typed inside JSON text are accepted. The result lists these under "Handled
+`answers` list inside a question becomes its `choice` and `evidence`, `source_path` and
+`source_sha256` copied into a new worksheet are dropped (a worksheet is its own source),
+and line breaks typed inside JSON text are accepted. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
 with its line, column and text, so one `edit_file` call can fix it. `edit_file` with
 `replace_all` changes every match at once, such as the same field in each question.
@@ -289,7 +290,9 @@ answers stored with the questions. Drafts written in nearby shapes are read with
 note instead of failing: a separate `answer_key` summary is moved into its questions,
 a title or emoji placed inside `theme` is moved where it belongs, and swapped student
 and key file names are put back by their names. A restyle that changes nothing saves
-no copy.
+no copy. `write_file` refuses to replace a worksheet JSON with answer-key JSON, which
+would lose its questions; a key left naming itself as its source, or a file that only
+points to another JSON, is reported as such with the call that works.
 
 ### Answer keys for an existing quiz
 
@@ -297,7 +300,8 @@ Ask normally, or suggest `/answer-key Make a PDF answer key for practice/quiz.pd
 Qwen is instructed to reread the actual quiz using `read_quiz`, even in an old chat.
 The reader uses worksheet JSON, checks a matching JSON companion against the PDF,
 or extracts sequential numbered questions and lettered options from a text PDF.
-Failures are reported rather than filled with invented questions. `read_file` reads a
+Failures are reported rather than filled with invented questions; given answer-key
+JSON instead of a quiz, `read_quiz` names the quiz the key belongs to. `read_file` reads a
 PDF's text and, for pages whose questions are pictures (screenshots, scans), the words
 in those pictures by OCR (short numbers included, such as a written-out sum's), marked
 as such and cached. A `pdftotext`-style command on such a PDF gets a note that its

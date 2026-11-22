@@ -94,6 +94,38 @@ def _refuse_placeholder(text: str, name: str, existed: bool) -> None:
                f"Write the complete content of {name} instead."))
 
 
+# Fields of an answer-key JSON (or of a file pointing to a spec) that a worksheet never holds.
+_KEY_JSON_FIELDS = frozenset({"answers", "source_path", "source_sha256", "spec_path"})
+_WORKSHEET_PARTS = frozenset({"questions", "challenge", "reading", "passage", "story"})
+
+
+def _refuse_key_over_worksheet(f: Path, content: str, name: str) -> None:
+    """A worksheet JSON's questions hold its answers. Answer-key JSON written over it loses
+    them (Qwen3.5-4B did, then looped on rendering the key), so that write is refused."""
+    try:
+        new = json.loads(content, strict=False)
+    except (ValueError, RecursionError):
+        return
+    if (not isinstance(new, dict) or new.keys() & _WORKSHEET_PARTS
+            or not new.keys() & _KEY_JSON_FIELDS):
+        return
+    try:
+        with f.open("rb") as fh:
+            old = json.loads(fh.read(MAX_WRITE_BYTES + 1), strict=False)
+    except (OSError, ValueError, RecursionError):
+        return
+    questions = old.get("questions") if isinstance(old, dict) else None
+    if not isinstance(questions, list) or not questions:
+        return
+    count = f"{len(questions)} question{'s' if len(questions) != 1 else ''}"
+    raise ToolError(
+        f"Nothing was saved: {name} is a worksheet ({count}), and this answer-key JSON would "
+        "replace it. A worksheet keeps each answer inside its question (choice: the correct "
+        "letter; answer for written questions; evidence optional), so it needs no separate key "
+        "JSON: add or fix answers there with edit_file. Then call render_worksheet with "
+        f"spec_path \"{name}\" and answer_key_path to make the student PDF and the answer key.")
+
+
 def json_error(exc: json.JSONDecodeError) -> str:
     """Where JSON breaks (message, line, column, excerpt), so one edit can fix it."""
     lines = exc.doc.splitlines() if isinstance(exc.doc, str) else []
@@ -451,6 +483,8 @@ class Workspace:
                 "history was shortened. Continue with the next step (for example, render it), or "
                 "use edit_file to change part of it.")
         _refuse_placeholder(content, name, existed)
+        if existed and not append and f.is_file() and f.suffix.lower() == ".json":
+            _refuse_key_over_worksheet(f, content, name)
         if (existed and not append and f.is_file() and f.stat().st_size == len(data)
                 and f.read_bytes() == data):
             return (f"Unchanged: {name} already has exactly this content. If a tool reported an "
@@ -2546,7 +2580,10 @@ class ToolBox:
         snapshots = {source: digest}
         try:
             if source.suffix.lower() == ".json":
-                quiz = quiz_from_spec(json.loads(raw, strict=False))
+                data = json.loads(raw, strict=False)
+                if isinstance(data, dict):
+                    data, _ = self._key_fields(source, data, "read_quiz")
+                quiz = quiz_from_spec(data)
             else:
                 if not raw.startswith(b"%PDF-"):
                     raise ToolError("The source file is not a PDF.")
@@ -2586,6 +2623,59 @@ class ToolBox:
         }
         return _text_page(json.dumps(report, ensure_ascii=False, indent=2), name, start_line, "read_quiz")
 
+    def _key_fields(self, source: Path, data: dict, tool: str) -> tuple[dict, list[str]]:
+        """Answer-key fields in the JSON given to a render tool or read_quiz. A worksheet loses
+        them with a note (it is its own source) unless they name another existing quiz.
+        Without questions, a key naming itself (written over its worksheet, which is gone), a
+        file only pointing to another, or a key given where its quiz belongs gets an error
+        naming the call that works."""
+        if not data.keys() & _KEY_JSON_FIELDS:
+            return data, []
+        shown = self.ws.display(source)
+        named = None
+        for field in ("source_path", "spec_path"):
+            value = data.get(field)
+            if isinstance(value, str) and value.strip():
+                with contextlib.suppress(ToolError):
+                    named = self.ws.resolve(value)
+                break
+        if data.keys() & _WORKSHEET_PARTS:
+            own = [k for k in ("source_path", "source_sha256", "spec_path") if k in data]
+            # A quiz file it names binds a key to that quiz; for a key, even a missing one may
+            # be a mistyped path to the real quiz, so its usual error stays.
+            quiz = (named not in (None, source) and named.suffix.lower() in (".pdf", ".json")
+                    and (named.is_file() or tool == "render_answer_key"))
+            if not own or quiz:
+                return data, []
+            return ({k: v for k, v in data.items() if k not in own},
+                    [f"ignored {', '.join(own)} (a worksheet is its own source)"])
+        if named == source:
+            fields = ", ".join(sorted(data.keys() & _KEY_JSON_FIELDS))
+            verb = {"render_worksheet": "render", "read_quiz": "read"}.get(tool, "answer")
+            raise ToolError(
+                f"{shown} has no questions to {verb}"
+                f": it holds answer-key fields ({fields}) and names itself as the source, so the "
+                "worksheet it held was replaced, probably when this key was written over it. "
+                f"Write the complete worksheet back to {shown} with write_file (title, theme, and "
+                "questions with prompt, options and choice: the correct letter), then call "
+                "render_worksheet with answer_key_path to make both PDFs. A new worksheet needs "
+                "no separate key JSON.")
+        if named is None or not named.is_file():
+            return data, []
+        there = self.ws.display(named)
+        arg = "path" if tool == "read_quiz" else "spec_path"
+        if "answers" not in data and not isinstance(data.get("source_path"), str):
+            raise ToolError(f"{shown} only points to {there} and holds no questions or answers. "
+                            f"Call {tool} with {arg} \"{there}\" instead.")
+        if tool == "render_worksheet":
+            raise ToolError(f"{shown} is answer-key JSON for {there}, not a worksheet: make its "
+                            f"PDF with render_answer_key (spec_path \"{shown}\"), not "
+                            "render_worksheet.")
+        if tool == "read_quiz":
+            raise ToolError(f"{shown} is answer-key JSON for {there}, not a quiz: call read_quiz "
+                            f"with path \"{there}\" instead.")
+        return data, []
+
     def render_answer_key(self, spec_path: str, path: str) -> str:
         from .answer_key import key_document
         from .worksheet_pdf import DesignError, validate_spec
@@ -2595,9 +2685,10 @@ class ToolBox:
             raise ToolError("Stopped by the user.")
         source = self.ws.resolve(spec_path)
         data, _ = self._json_data(source)
+        data, notes = self._key_fields(source, data, "render_answer_key")
         if not isinstance(data.get("source_path"), str):
-            if data.keys() & {"questions", "challenge", "reading", "passage", "story"}:
-                return self._worksheet_answer_key(source, data, path)
+            if data.keys() & _WORKSHEET_PARTS:
+                return self._worksheet_answer_key(source, data, path, notes)
             raise ToolError("Load answer-key, then call read_quiz. The key JSON needs source_path, "
                             "source_sha256 and an answers list, not rewritten worksheet questions.")
         quiz, name, digest, snapshots = self._quiz_source(data["source_path"])
@@ -2625,13 +2716,15 @@ class ToolBox:
         return (result + _handled(adjusted) + "\nSource checks: "
                 + json.dumps(audit, ensure_ascii=False))
 
-    def _worksheet_answer_key(self, source: Path, data: dict, path: str) -> str:
+    def _worksheet_answer_key(self, source: Path, data: dict, path: str,
+                              notes: list[str] = ()) -> str:
         """The answer key of a worksheet JSON whose questions hold their own answers."""
         from .answer_key import worksheet_key
         from .worksheet_pdf import DesignError, normalize_spec, validate_spec
 
         shown = self.ws.display(source)
         data, adjusted = normalize_spec(data, source.stem)
+        adjusted = [*notes, *adjusted]
         adjusted += self._requested_limits(data, {"answer_key_max_pages": ("key", "any")})
         try:
             spec = validate_spec(data)
@@ -2697,8 +2790,10 @@ class ToolBox:
         source = self.ws.resolve(spec_path)
         change = _theme_change(theme)
         data, _ = self._json_data(source)
+        data, own = self._key_fields(source, data, "render_worksheet")
         pictures: list[str] = []
         data, adjusted = normalize_spec(data, source.stem, pictures)
+        adjusted = [*own, *adjusted]
         if answer_key_path and _keyish(path) and not _keyish(answer_key_path):
             # A file named like a key must hold the answers, or a child could get them.
             path, answer_key_path = answer_key_path, path

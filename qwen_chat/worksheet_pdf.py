@@ -209,6 +209,8 @@ _SUMMARY_FIELDS = ("answer_key", "answers", "answer_sheet", "answerkey", "answer
 _QUESTION_REF = re.compile(r"\s*(?:q(?:uestion)?|#|no\.?|number)?\s*[#_.-]?\s*(\d{1,2})\s*[.):]?\s*",
                            re.I)
 _IGNORED_QUESTION_FIELDS = ("type", "kind", "id", "number", "points", "difficulty")
+# They bind an answer-key JSON to an existing quiz; a worksheet's question has nothing to bind.
+_SOURCE_FIELDS = ("source_path", "source_sha256", "spec_path")
 _IGNORED_DOCUMENT_FIELDS = ("version", "schema_version", "id")
 # meta is one line of plain text; these keys of a meta object hold that line.
 _META_LINE_KEYS = ("text", "line", "meta")
@@ -1023,11 +1025,12 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
                 note(f"read question field '{alias}' as '{field}'", where)
         item = _key_fields(item, note, where)
         item = _fold_answers(item, note, where)
-        for field in _IGNORED_QUESTION_FIELDS:
+        for field in (*_IGNORED_QUESTION_FIELDS, *_SOURCE_FIELDS):
             if field in item:
                 del item[field]
                 why = (" (options make a question multiple choice)" if field in ("type", "kind")
-                       else " (the PDF numbers questions)" if field in ("id", "number") else "")
+                       else " (the PDF numbers questions)" if field in ("id", "number")
+                       else " (a worksheet is its own source)" if field in _SOURCE_FIELDS else "")
                 note(f"ignored question field '{field}'{why}", where)
         if "answer_text" in item:
             extra, answer = item.pop("answer_text"), item.get("answer")

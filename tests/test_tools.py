@@ -1171,6 +1171,61 @@ class ProgramToolsTest(unittest.TestCase):
         self.assertEqual(self.asked, [])
         self.assertFalse(self.ws.trash_dir.exists())
 
+    def test_a_key_json_never_replaces_its_worksheet_and_a_lost_worksheet_is_named(self):
+        # Qwen3.5-4B wrote a key JSON naming the worksheet over the worksheet itself, then
+        # looped on rendering it until the turn stopped.
+        data = self._homework_spec()
+        key = {"spec_path": "moon.json", "source_path": "moon.json", "source_sha256": "placeholder",
+               "answers": {"0": {"answer": "A", "evidence": "Mia flew her rocket to the Moon."}}}
+        ok, text = self.run_tool("write_file", path="moon.json", content=json.dumps(key))
+        self.assertFalse(ok)
+        self.assertIn("Nothing was saved: moon.json is a worksheet (2 questions)", text)
+        self.assertIn('render_worksheet with spec_path "moon.json" and answer_key_path', text)
+        self.assertEqual(json.loads((self.ws.root / "moon.json").read_text()), data)
+        (self.ws.root / "moon.json").write_text(json.dumps(key))  # as an older version left it
+        (self.ws.root / "moon-key.json").write_text('{"spec_path": "moon.json"}')
+        with mock.patch.object(tools, "run_streaming") as run:
+            for tool, verb in (("render_worksheet", "render"), ("render_answer_key", "answer"),
+                               ("read_quiz", "read")):
+                arg = "path" if tool == "read_quiz" else "spec_path"
+                out = {} if tool == "read_quiz" else {"path": "moon-key.pdf"}
+                ok, text = self.run_tool(tool, **{arg: "moon.json"}, **out)
+                self.assertFalse(ok)
+                self.assertIn(f"moon.json has no questions to {verb}: it holds answer-key fields "
+                              "(answers, source_path, source_sha256, spec_path) and names itself", text)
+                self.assertIn("Write the complete worksheet back to moon.json", text)
+                ok, text = self.run_tool(tool, **{arg: "moon-key.json"}, **out)
+                self.assertIn(f"moon-key.json only points to moon.json and holds no questions or "
+                              f'answers. Call {tool} with {arg} "moon.json" instead.', text)
+            ok, text = self.run_tool("write_file", path="moon.json", content=json.dumps(data))
+            self.assertTrue(ok, text)
+            (self.ws.root / "answers.json").write_text('{"source_path": "moon.json", "answers": []}')
+            ok, text = self.run_tool("render_worksheet", spec_path="answers.json", path="a.pdf")
+            self.assertIn("answers.json is answer-key JSON for moon.json, not a worksheet: make its "
+                          'PDF with render_answer_key (spec_path "answers.json")', text)
+            ok, text = self.run_tool("read_quiz", path="answers.json")
+            self.assertIn("answers.json is answer-key JSON for moon.json, not a quiz: call "
+                          'read_quiz with path "moon.json" instead.', text)
+            run.assert_not_called()
+        self.assertEqual(self.asked, [])
+
+    def test_source_fields_drafted_into_a_new_worksheet_are_dropped_with_a_note(self):
+        data = self._homework_spec()
+        for item in (data, *data["questions"]):
+            item.update(source_path="moon.json", source_sha256="placeholder")
+        (self.ws.root / "moon.json").write_text(json.dumps(data))
+        with mock.patch.object(tools, "run_streaming", side_effect=self._render_ok):
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon.pdf",
+                                     answer_key_path="moon-key.pdf")
+            self.assertTrue(ok, text)
+            ok, key_text = self.run_tool("render_answer_key", spec_path="moon.json",
+                                         path="moon-key-2.pdf")
+            self.assertTrue(ok, key_text)
+        for result in (text, key_text):
+            self.assertIn("ignored source_path, source_sha256 (a worksheet is its own source)", result)
+            self.assertIn("ignored question field 'source_sha256' (a worksheet is its own source) "
+                          "(Question 1, Question 2)", result)
+
     def _key_spec(self):
         (self.ws.root / "quiz.json").write_text(json.dumps({
             "title": "The umbrella", "reading": ["Nora left her wet umbrella beside the door."],
