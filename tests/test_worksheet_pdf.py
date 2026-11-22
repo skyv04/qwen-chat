@@ -417,6 +417,46 @@ class NormalizeSpecTest(unittest.TestCase):
                                     r"Allowed: answer, choice, evidence, explanation, figure, icon, label"):
             pdf.validate_spec({"title": "Math", "questions": [{"prompt": "Q?", "hint": "x"}]})
 
+    def test_numbered_titles_and_option_objects_become_a_plain_question(self):
+        draft = {"title": "Weekly Recap", "reading": ["Mia said thank you."], "questions": [
+            {"question_title": "Question 1", "question": "Which word means thankful?",
+             "options": [{"letter": "A", "text": "angry"},
+                         {"letter": "B", "text": "grateful", "correct": True}]},
+            {"prompt": "Question 2", "question": "What do you do when the music stops?",
+             "options": {"A": "freeze", "B": "run"}},
+            {"question_number": 3, "text": "Pick one.", "options": [{"A": "red"}, {"B": "blue"}],
+             "choice": "A"}]}
+        data, notes = pdf.normalize_spec(draft)
+        self.assertEqual(data["questions"], [
+            {"prompt": "Which word means thankful?", "options": ["angry", "grateful"],
+             "choice": "B"},
+            {"prompt": "What do you do when the music stops?", "options": ["freeze", "run"]},
+            {"prompt": "Pick one.", "options": ["red", "blue"], "choice": "A"}])
+        self.assertIn("read the option marked correct as 'choice' (Question 1)", notes)
+        self.assertTrue(any("question_number" in n and "Question 3" in n for n in notes))
+        pdf.validate_spec(data)
+        for options, choice in (([{"letter": "A", "text": "x", "correct": True}], "B"),
+                                ([{"letter": "B", "text": "x"}, {"letter": "A", "text": "y"}], None),
+                                ([{"letter": "A", "text": "x", "image": "cat.png"}], None)):
+            with self.subTest(options=options):
+                item = {"prompt": "Pick.", "options": options, **({"choice": choice} if choice else {})}
+                self.assertEqual(pdf.normalize_spec({"title": "T", "questions": [item]})[0]
+                                 ["questions"], [item])
+
+    def test_every_question_problem_is_reported_at_once_with_an_example(self):
+        draft = {"title": "T", "questions": [
+            {"prompt": "a", "hint": 1}, {"prompt": "b", "hint": 2},
+            {"prompt": "Question 3", "options": [{"x": 1, "y": 2}]}]}
+        with self.assertRaises(pdf.DesignError) as caught:
+            pdf.validate_spec(draft)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("3 problems; fix all of them before rendering again: "
+                                           "(1) Unknown Questions 1 and 2 field(s): hint."), message)
+        self.assertIn("(2) Question 3 options must be plain strings", message)
+        self.assertIn("(3) Question 3 prompt is only the question number ('Question 3')", message)
+        self.assertIn(pdf.QUESTION_EXAMPLE, message)
+        pdf.validate_spec({"title": "T", "questions": [{"prompt": "3", "lines": 1}]})
+
     def test_a_look_change_swaps_the_mascot_and_adds_a_rainbow(self):
         old = {"name": "Whispering Woods", "accent": "#1B4D3E", "motif": "leaves",
                "icons": ["\U0001f332", "\U0001f98a", "\U0001f338", "\U0001f50d"]}

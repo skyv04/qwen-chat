@@ -149,6 +149,34 @@ def _json_fix_hint(exc: json.JSONDecodeError) -> str:
             "not rewrite the whole file.")
 
 
+def duplicate_keys(raw) -> str:
+    """A note naming each key written twice in one JSON object with different values. JSON
+    keeps only the last one, so the first is silently lost (a draft with "question":
+    "Question 1" and "question": "Which...?" in one question, say)."""
+    found: list[str] = []
+    brief = lambda v: (lambda s: s if len(s) <= 50 else s[:47] + "…")(
+        json.dumps(v, ensure_ascii=False))
+
+    def pairs(items):
+        seen: dict = {}
+        for key, value in items:
+            if key in seen and seen[key] != value:
+                found.append(f"'{key}' (kept {brief(value)}, lost {brief(seen[key])})")
+            seen[key] = value
+        return seen
+
+    try:
+        json.loads(raw, strict=False, object_pairs_hook=pairs)
+    except (ValueError, UnicodeError, RecursionError):
+        return ""
+    found = list(dict.fromkeys(found))
+    if not found:
+        return ""
+    return ("the JSON gives a key twice in one object, and only the last value counts: "
+            + "; ".join(found[:4]) + ("; …" if len(found) > 4 else "")
+            + ". Give each field once")
+
+
 def _truthy(value) -> bool:
     """A tool flag given as true, "true", 1 or "yes"."""
     return value is True or str(value).strip().casefold() in ("true", "1", "yes")
@@ -2836,7 +2864,8 @@ class ToolBox:
             raise ToolError("Stopped by the user.")
         source = self.ws.resolve(spec_path)
         change = _theme_change(theme)
-        data, _ = self._json_data(source)
+        data, raw = self._json_data(source)
+        twice = duplicate_keys(raw)
         data, own = self._key_fields(source, data, "render_worksheet")
         pictures: list[str] = []
         data, adjusted = normalize_spec(data, source.stem, pictures)
@@ -2867,7 +2896,13 @@ class ToolBox:
                     and data.keys() & {"answers", "source_path", "source_sha256"} else
                     " Fix the theme argument and render again." if change
                     and "theme" in str(exc).split("Allowed", 1)[0] else
+                    " Fix every problem listed, then render again. When the same fix is needed "
+                    "in several questions, rewrite the whole file once with write_file instead "
+                    "of one edit_file per question." if re.search(r"Questions \d|problems; fix",
+                                                                    str(exc)) else
                     " Fix that spot with edit_file, then render again.")
+            if twice:
+                hint += f" Also, {twice}."
             if not change:
                 hint += self._restyle_hint(source, data)
             raise ToolError(f"Invalid worksheet specification: {exc}{hint}") from None
@@ -2919,6 +2954,9 @@ class ToolBox:
                        f"{self.ws.display(source)}; only the look changed.")
         result += "\nLook: " + json.dumps(spec["theme"], ensure_ascii=False)
         result += _handled(adjusted, json_kept=not change)
+        if twice:
+            result += (f"\nCheck: {twice}. Make sure the PDF has what you meant; if a lost value "
+                       "was the one you wanted, fix the JSON and render again.")
         if pictures:
             result += ("\nPictures missing from the PDF: " + "; ".join(dict.fromkeys(pictures))
                        + f". Fix each in the JSON with edit_file ({FIGURE_FORMAT}), or reword a "

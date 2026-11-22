@@ -49,7 +49,7 @@ class CutOffToolCallTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _respond(self, replies, messages, events=None, server=None):
+    def _respond(self, replies, messages, events=None, server=None, bot=None):
         payloads = self.payloads
 
         class Stream:
@@ -63,7 +63,8 @@ class CutOffToolCallTest(unittest.TestCase):
                 return result
 
         with mock.patch.object(agent, "ChatStream", Stream):
-            Agent(server or _Server(), self.box).respond(messages, events or _Events(), threading.Event())
+            (bot or Agent(server or _Server(), self.box)).respond(
+                messages, events or _Events(), threading.Event())
 
     def test_cut_off_call_is_reported_and_never_stored_broken(self):
         msgs = [{"role": "user", "content": "make the pdf"}]
@@ -295,6 +296,48 @@ class CutOffToolCallTest(unittest.TestCase):
         self.assertIn("Task incomplete", messages[-1]["content"])
         self.assertIn("missing or empty", messages[-1]["content"])
         self.assertFalse(messages[2]["_meta"]["ok"])
+
+    def test_a_pdf_failing_in_new_ways_asks_for_one_full_fix_then_stops(self):
+        self.box.commands = True
+        render = '{"spec_path":"quiz.json","path":"quiz.pdf"}'
+        replies = []
+        for i in range(5):
+            spec = json.dumps({"title": "Quiz", "questions": [{"prompt": "Q?", f"hint{i}": 1}]})
+            replies.append(_reply({"tool_calls": [
+                _call(json.dumps({"path": "quiz.json", "content": spec}), f"w{i}"),
+                _call(render, f"r{i}", "render_worksheet")]}))
+        messages = [{"role": "user", "content": "Make the quiz PDF."}]
+        self._respond(replies, messages)
+        self.assertEqual(len(self.payloads), agent.PDF_FAIL_LIMIT)
+        results = [m["content"] for m in messages if m.get("name") == "render_worksheet"]
+        self.assertEqual(len(results), agent.PDF_FAIL_LIMIT)
+        self.assertNotIn("in a row", results[0])
+        self.assertIn("failed 2 times in a row", results[1])
+        self.assertIn("failed 3 times in a row", results[2])
+        final = messages[-1]["content"]
+        for expected in ("Task incomplete", f"Stopped after {agent.PDF_FAIL_LIMIT} failed attempts "
+                         "in a row at `quiz.pdf`", "Reply **continue**"):
+            self.assertIn(expected, final)
+
+    def test_the_history_budget_follows_the_size_the_server_reports(self):
+        bot, budgets = Agent(_Server(), self.box), []
+        fit = bot.fit
+        bot.fit = lambda msgs, budget: budgets.append(budget) or fit(msgs, budget)
+        listing = _reply({"tool_calls": [_call("{}", "c1", "list_files")]})
+        listing["timings"] = {"prompt_n": 900, "cache_n": 100}
+        self._respond([listing, _reply({"content": "Done."})],
+                      [{"role": "user", "content": "List the files."}], bot=bot)
+        self._respond([_reply({"content": "Again."})],
+                      [{"role": "user", "content": "And again."}], bot=bot)
+        # 1,000 tokens is far less than the conservative estimate, so history gets more room,
+        # and the measurement holds for the next reply with the same model.
+        self.assertGreater(budgets[1], budgets[0])
+        self.assertEqual(budgets[2], budgets[1])
+        dense = _reply({"tool_calls": [_call("{}", "c2", "list_files")]})
+        dense["timings"] = {"prompt_n": 9000, "cache_n": 4000}
+        self._respond([dense, _reply({"content": "Done."})],
+                      [{"role": "user", "content": "List them once more."}], bot=bot)
+        self.assertLess(budgets[4], budgets[0])
 
     def test_successful_retry_clears_only_the_resolved_failure(self):
         self.box.commands = True
@@ -562,6 +605,27 @@ class HistoryRepairTest(unittest.TestCase):
                 self.assertLessEqual(size(out), budget * agent.TRIM_TARGET)
             prev = out
         self.assertLessEqual(retrims, 5)  # re-trimming every round would be 12
+
+    def test_the_latest_results_are_cut_last_and_older_edits_shrink_first(self):
+        edit = lambda cid: {"role": "assistant", "content": "", "tool_calls": [_call(json.dumps(
+            {"path": "quiz.json", "old_text": "o" * 700, "new_text": "n" * 700}), cid, "edit_file")]}
+        read = lambda cid: {"role": "assistant", "content": "", "tool_calls": [
+            _call('{"path":"quiz.json"}', cid, "read_file")]}
+        messages = [{"role": "user", "content": "Fix the quiz."}]
+        for i in range(4):
+            messages += [edit(f"e{i}"), {"role": "tool", "tool_call_id": f"e{i}", "name": "edit_file",
+                                         "content": "Edited quiz.json"}]
+        messages += [read("r1"), {"role": "tool", "tool_call_id": "r1", "name": "read_file",
+                                  "content": "older read " * 400},
+                     read("r2"), {"role": "tool", "tool_call_id": "r2", "name": "read_file",
+                                  "content": "newest read " * 300}]
+        trimmed = fit_context(messages, 6500)
+        self.assertLessEqual(sum(agent._size(m) for m in trimmed), 6500)
+        args = json.loads(trimmed[1]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(args["new_text"], "[700 characters omitted here to save context space]")
+        # The model has not seen the newest read yet: cutting it made it read again and again.
+        self.assertEqual(trimmed[-1]["content"], messages[-1]["content"])
+        self.assertTrue(trimmed[-3]["content"].endswith(agent.CUT_NOTE))
 
     def test_a_follow_up_keeps_the_earlier_requests_and_only_the_newest_note(self):
         msgs = []

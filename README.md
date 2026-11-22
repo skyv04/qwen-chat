@@ -204,10 +204,21 @@ breaks: the lines between them make one paragraph. Evidence such as "N/A" is ign
 An unavailable motif becomes `dots`, a too-pale accent is darkened, an answer-key style
 `answers` list inside a question becomes its `choice` and `evidence`, `source_path` and
 `source_sha256` copied into a new worksheet are dropped (a worksheet is its own source),
-and line breaks typed inside JSON text are accepted. The result lists these under "Handled
+and line breaks typed inside JSON text are accepted. A question number or title given
+instead of, or beside, the question (`"question_title": "Question 1"`, `"prompt": "Q2"`
+next to `"question": "..."`, `"question_number": 3`) is dropped and the real question
+used. Option objects (`{"letter": "A", "text": "..."}`, `{"A": "..."}`, or an options
+object `{"A": ..., "B": ...}`) become plain option text, and one marked `"correct": true`
+becomes `choice`; letters out of order, extra content or a clash with `choice` are left
+for validation to report. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
 with its line, column and text, so one `edit_file` call can fix it. `edit_file` with
 `replace_all` changes every match at once, such as the same field in each question.
+Every question problem is reported in one error, with the same problem in several
+questions listed once (`Unknown Questions 1, 2 and 3 field(s): ...`) and an example of
+a correct question, so the draft is fixed in one rewrite rather than one render per
+problem. A key written twice in one JSON object (only the last value counts) is named,
+with the kept and lost values, both in an error and after a successful render.
 
 Math reads like a textbook. A fraction typed as `3/4` or `1 1/2` prints stacked, with
 the numerator over the denominator; `6 x 4`, `10 - 4`, `5^2` and simple LaTeX such as
@@ -338,7 +349,10 @@ worksheet JSON, also under new file names (as after "use three different file na
 On reaching the 30-tool-round limit, the app pauses explicitly and
 keeps completed steps; reply **continue** to resume. It does not ask a tool-less model
 to print pretend commands. A second identical tool error tells Qwen its last change
-didn't fix it; a third stops the reply with the error, instead of looping. Reading lines
+didn't fix it; a third stops the reply with the error, instead of looping. A PDF that
+keeps failing in new ways (each fix revealing the next problem) gets a note from its
+second failure in a row to fix every listed problem at once, and the reply stops after
+four failed attempts in a row at the same PDF. Reading lines
 of an unchanged file that an earlier read in the same reply showed, and that are still
 in view, is let through once; after that it is an error saying the lines are still
 above, so reading the same file over and over ends the reply the same way. Rewriting
@@ -354,7 +368,14 @@ edits refuse text containing such a note, so a copied note can never replace rea
 content in a file; refusing such a note for an existing file says that the file still
 holds its earlier content.
 History is trimmed with room to spare and then only appended to,
-so the server keeps its cached prompt instead of re-reading it every round. A file
+so the server keeps its cached prompt instead of re-reading it every round. The room
+for history starts from a conservative estimate; once llama-server reports a request's
+real token count, the measured cost of the system prompt, tool list and pictures is
+used instead (kept per model, context size and picture count, and re-measured if a
+request still overflows), which roughly doubled the room with a picture attached.
+When the current turn must be shortened, its older edits are reduced to notes before
+the newest file content, and the results of the latest tool calls, which Qwen has not
+seen yet, are cut last. A file
 read again after any change is read afresh, never from an earlier result.
 
 ### Follow-ups and separate chats

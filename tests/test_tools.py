@@ -847,6 +847,27 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn(note, text)
         self.assertEqual((self.ws.root / "harvest.json").read_text(), raw)
 
+    def test_a_key_given_twice_is_named_and_every_problem_asks_for_one_rewrite(self):
+        raw = ('{"title": "Recap", "questions": [\n'
+               ' {"question": "Question 1", "question": "Which word means thankful?",\n'
+               '  "options": ["angry", "grateful"]}]}')
+        (self.ws.root / "recap.json").write_text(raw)
+        with mock.patch.object(tools, "run_streaming", side_effect=self._render_ok):
+            ok, text = self.run_tool("render_worksheet", spec_path="recap.json", path="recap.pdf")
+        self.assertTrue(ok, text)
+        self.assertIn("Check: the JSON gives a key twice in one object, and only the last value "
+                      "counts: 'question' (kept \"Which word means thankful?\", lost "
+                      "\"Question 1\")", text)
+        (self.ws.root / "recap.json").write_text(raw.replace(
+            '"angry", "grateful"]}', '"angry", "grateful"], "hint": 1},\n {"prompt": "b", "hint": 2}'))
+        with mock.patch.object(tools, "run_streaming") as run:
+            ok, text = self.run_tool("render_worksheet", spec_path="recap.json", path="recap.pdf")
+        self.assertFalse(ok)
+        run.assert_not_called()
+        self.assertIn("Unknown Questions 1 and 2 field(s): hint.", text)
+        self.assertIn("rewrite the whole file once with write_file", text)
+        self.assertIn("Also, the JSON gives a key twice", text)
+
     def test_worksheet_shapes_are_drawn_from_prompts_and_missing_pictures_are_reported(self):
         spec = {"title": "Shapes", "questions": [
             {"prompt": "A rectangle is 6 cm long and 4 cm wide. What is its area?",

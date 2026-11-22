@@ -189,7 +189,20 @@ FIGURE_FORMAT = ('a figure is an object such as {"shape": "rectangle", "length":
                  '"unit": "cm"}; load worksheet-pdf for every shape')
 _READING_ALIASES = ("passage", "story")
 _ICON_ALIASES = ("icons", "emoji", "emojis", "color_emoji")
-_QUESTION_ALIASES = {"question": "prompt", "text": "prompt", "choices": "options"}
+_QUESTION_ALIASES = {"question": "prompt", "text": "prompt", "question_text": "prompt",
+                     "stem": "prompt", "choices": "options"}
+# A question's number or title written out ("Question 1", "Q2", "#3"): the PDF numbers the
+# questions itself, so such a value holds no content.
+_NUMBER_LABEL = re.compile(
+    r"\s*(?:question|q|problem|item|exercise|task|no\.?|number|#)\s*[#.:-]?\s*\d{1,2}\s*[.):]?\s*", re.I)
+# Field-name words of a question number given as a bare number ("question_number": 1).
+_NUMBER_WORDS = {"number", "num", "no", "index", "idx", "id", "order", "n"}
+# An option drafted as an object, such as {"letter": "B", "text": "gratitude", "correct": true}.
+_OPTION_LETTER_KEYS = ("letter", "label", "key", "id", "option_letter", "choice_letter")
+_OPTION_TEXT_KEYS = ("text", "value", "option", "answer", "content", "choice", "option_text",
+                     "label", "description")
+_OPTION_FLAG_KEYS = ("correct", "is_correct", "isCorrect", "right", "is_answer", "isAnswer",
+                     "answer")
 # Answer-key fields under other names. An option letter given as the answer is resolved
 # against the options when the key is checked.
 _KEY_ALIASES = {
@@ -288,6 +301,110 @@ def _fold_answers(item: dict, note, where: str) -> dict:
         item["evidence"] = list(dict.fromkeys(quotes))
     del item["answers"]
     note("read question field 'answers' as 'choice' and 'evidence'", where)
+    return item
+
+
+def _number_only(value) -> bool:
+    return isinstance(value, str) and bool(_NUMBER_LABEL.fullmatch(value))
+
+
+def _numbering(field: str, value) -> bool:
+    """An extra question field that only numbers or titles the question by its number, such
+    as "question_title": "Question 1" or "question_number": 1."""
+    if _number_only(value):
+        return True
+    words = set(re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", field).casefold()))
+    bare = type(value) is int or (isinstance(value, str) and value.strip().isdigit())
+    return bare and bool(words & _NUMBER_WORDS)
+
+
+def _question_text(item: dict, note, where: str) -> dict:
+    """The question's words in prompt when a draft keeps them under another name next to a
+    prompt that only numbers the question ("prompt": "Question 1", "question": "Which...?")."""
+    for alias in ("question", "text", "question_text", "stem"):
+        if alias not in item or "prompt" not in item:
+            continue
+        prompt, other = item["prompt"], item[alias]
+        if (_number_only(prompt) and isinstance(other, str) and other.strip()
+                and not _number_only(other)):
+            item["prompt"] = item.pop(alias)
+            note(f"read question field '{alias}' as 'prompt' ('prompt' held only the question "
+                 "number; the PDF numbers questions)", where)
+        elif _number_only(other):
+            del item[alias]
+            note(f"ignored question field '{alias}' (only the question number)", where)
+        elif (isinstance(other, str) and isinstance(prompt, str)
+              and other.strip().casefold() == prompt.strip().casefold()):
+            del item[alias]
+            note(f"ignored question field '{alias}' (same as 'prompt')", where)
+    if "prompt" not in item:
+        for alias in ("title", "heading"):
+            value = item.get(alias)
+            if isinstance(value, str) and value.strip() and not _number_only(value):
+                item["prompt"] = item.pop(alias)
+                note(f"read question field '{alias}' as 'prompt'", where)
+                break
+    return item
+
+
+def _plain_options(item: dict, note, where: str) -> dict:
+    """Options drafted as objects ({"letter": "B", "text": "gratitude", "correct": true}) or
+    as {"A": "...", "B": "..."} become the plain strings the PDF letters itself; an option
+    marked correct becomes choice. Anything else in them, letters out of order, or marks that
+    contradict choice are left for validation to report."""
+    options = item.get("options")
+    if isinstance(options, dict) and 0 < len(options) <= 8:
+        keys = [str(k).strip(" ().:").upper() for k in options]
+        if (keys == [chr(65 + i) for i in range(len(keys))]
+                and all(isinstance(v, str) for v in options.values())):
+            item = dict(item)
+            item["options"] = list(options.values())
+            note('read the options object {"A": ..., "B": ...} as a list (the PDF adds the '
+                 "letters)", where)
+        return item
+    if not (isinstance(options, list) and options
+            and any(isinstance(o, dict) for o in options)):
+        return item
+    texts, marked = [], []
+    for i, option in enumerate(options):
+        letter = None
+        if isinstance(option, str):
+            texts.append(option)
+            continue
+        if not isinstance(option, dict):
+            return item
+        option = dict(option)
+        if len(option) == 1:
+            (key, value), = option.items()
+            if isinstance(key, str) and _LETTER_ONLY.fullmatch(key) and isinstance(value, str):
+                option = {"letter": key, "text": value}
+        flags = [option.pop(k) for k in _OPTION_FLAG_KEYS if isinstance(option.get(k), bool)]
+        for k in _OPTION_LETTER_KEYS:
+            if isinstance(option.get(k), str) and _LETTER_ONLY.fullmatch(option[k]):
+                letter = option.pop(k).strip(" ().:").upper()
+                break
+        text = next((option.pop(k) for k in _OPTION_TEXT_KEYS
+                     if isinstance(option.get(k), str) and option[k].strip()), None)
+        if (text is None or any(not _empty(v) for v in option.values())
+                or (letter is not None and letter != chr(65 + i)) or len(set(flags)) > 1):
+            return item
+        if flags and flags[0]:
+            marked.append(chr(65 + i))
+        texts.append(text)
+    item = dict(item)
+    if marked:
+        current = item.get("choice")
+        if _empty(current):
+            item["choice"] = ",".join(marked)
+            note("read the option marked correct as 'choice'", where)
+        else:
+            given = (re.findall(r"(?<![A-Za-z])[A-Ha-h](?![A-Za-z])", current)
+                     if isinstance(current, str) else [])
+            if sorted({x.upper() for x in given}) != marked:
+                return {**item, "options": options}
+    item["options"] = texts
+    note("read option objects as plain option text (the PDF adds the letters; the correct "
+         "letter goes in 'choice')", where)
     return item
 
 
@@ -1023,8 +1140,10 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
             if alias in item and field not in item:
                 item[field] = item.pop(alias)
                 note(f"read question field '{alias}' as '{field}'", where)
+        item = _question_text(item, note, where)
         item = _key_fields(item, note, where)
         item = _fold_answers(item, note, where)
+        item = _plain_options(item, note, where)
         for field in (*_IGNORED_QUESTION_FIELDS, *_SOURCE_FIELDS):
             if field in item:
                 del item[field]
@@ -1032,6 +1151,10 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
                        else " (the PDF numbers questions)" if field in ("id", "number")
                        else " (a worksheet is its own source)" if field in _SOURCE_FIELDS else "")
                 note(f"ignored question field '{field}'{why}", where)
+        for field in [k for k in item if k not in QUESTION_FIELDS and _numbering(k, item[k])]:
+            del item[field]
+            note(f"ignored question field '{field}' (only the question number; the PDF numbers "
+                 "questions)", where)
         if "answer_text" in item:
             extra, answer = item.pop("answer_text"), item.get("answer")
             bare = [isinstance(v, str) and bool(_LETTER_ONLY.fullmatch(v)) for v in (answer, extra)]
@@ -1092,6 +1215,36 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
         notes.append(text + (f" ({', '.join(places[:4])}{', …' if len(places) > 4 else ''})"
                              if places else ""))
     return data, notes
+
+
+QUESTION_EXAMPLE = ('A multiple-choice question looks like {"prompt": "Which word means thankful?", '
+                    '"options": ["angry", "grateful", "sleepy"], "choice": "B"}: the PDF numbers '
+                    "the questions and letters the options, so leave numbers, titles and letters "
+                    "out of them.")
+
+
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _question_problems(problems: list[tuple[str, str]]) -> str:
+    """One message for every question's problems, so a draft is fixed in one pass rather than
+    one error per render. The same problem in several questions is listed once."""
+    grouped: dict[str, list[str]] = {}
+    for where, text in problems:
+        grouped.setdefault(text.replace(where, "\0", 1) if where else text, []).append(where)
+    lines = []
+    for template, places in grouped.items():
+        numbers = [p.removeprefix("Question ") for p in places if p.startswith("Question ")]
+        names = ("Questions " + _and(numbers) if len(numbers) == len(places) > 1
+                 else _and(places))
+        lines.append(template.replace("\0", names))
+    shown = lines[:8] + ([f"and {len(lines) - 8} more"] if len(lines) > 8 else [])
+    text = (shown[0] if len(shown) == 1 else f"{len(lines)} problems; fix all of them before "
+            "rendering again: " + " ".join(f"({i}) {line}" for i, line in enumerate(shown, 1)))
+    if any(word in t for t in lines for word in ("Unknown", "plain strings", "question number")):
+        text += " " + QUESTION_EXAMPLE
+    return text
 
 
 def validate_spec(value) -> dict:
@@ -1163,26 +1316,65 @@ def validate_spec(value) -> dict:
 
     def question(item, number: int, bonus: bool = False) -> dict:
         where = "challenge" if bonus else f"Question {number}"
-        item = _object(item, QUESTION_FIELDS, where)
+        if not isinstance(item, dict):
+            raise DesignError(f"{where} must be an object.")
+        problems: list[str] = []
+
+        def checked(check, *args, default=None):
+            try:
+                return check(*args)
+            except DesignError as exc:
+                problems.append(str(exc))
+                return default
+
+        unknown = item.keys() - QUESTION_FIELDS
+        if unknown:
+            problems.append(f"Unknown {where} field(s): {', '.join(sorted(unknown))}. "
+                            f"Allowed: {', '.join(sorted(QUESTION_FIELDS))}.")
         options = item.get("options", [])
         if not isinstance(options, list) or len(options) > 8:
-            raise DesignError(f"{where} options must be a list of at most eight strings.")
-        return {
-            "prompt": _text(item.get("prompt", ""), f"{where} prompt", 3000, True),
-            "label": _text(item.get("label", "Extra Challenge:" if bonus else f"Question {number}:"),
-                           f"{where} label", 100, True),
-            "lines": _integer(item.get("lines", 0 if options else 5), f"{where} lines",
-                              0 if options else 1, 12),
-            "options": [_text(o, f"{where} option", 1000, True) for o in options],
-            "icon": _icon(item.get("icon", icons[(number - 1) % len(icons)]),
-                          f"{where} icon"),
-            "figure": _figures(item.get("figure", []), where),
+            problems.append(f"{where} options must be a list of at most eight strings.")
+            options = []
+        elif not all(isinstance(o, str) for o in options):
+            problems.append(f"{where} options must be plain strings, not objects or lists.")
+            options = [o for o in options if isinstance(o, str)]
+        prompt = checked(_text, item.get("prompt", ""), f"{where} prompt", 3000, True)
+        if _number_only(prompt):
+            problems.append(f"{where} prompt is only the question number ({prompt.strip()!r}); "
+                            "put the question's own words in prompt.")
+        result = {
+            "prompt": prompt,
+            "label": checked(_text, item.get("label", "Extra Challenge:" if bonus
+                                             else f"Question {number}:"), f"{where} label", 100, True),
+            "lines": checked(_integer, item.get("lines", 0 if options else 5), f"{where} lines",
+                             0 if options else 1, 12),
+            "options": [checked(_text, o, f"{where} option", 1000, True) for o in options],
+            "icon": checked(_icon, item.get("icon", icons[(number - 1) % len(icons)]),
+                            f"{where} icon"),
+            "figure": checked(_figures, item.get("figure", []), where, default=[]),
             # Parent-key data: checked by answer_key.worksheet_key, never rendered here.
             "key": {k: item[k] for k in KEY_FIELDS if k in item},
         }
+        if problems:
+            error = DesignError(" ".join(dict.fromkeys(problems)))
+            error.problems = [(where, p) for p in dict.fromkeys(problems)]
+            raise error
+        return result
 
-    spec["questions"] = [question(q, i) for i, q in enumerate(questions, 1)]
-    spec["challenge"] = question(value["challenge"], len(questions) + 1, True) if "challenge" in value else None
+    spec["questions"], problems = [], []
+    for i, q in enumerate([*questions, *([value["challenge"]] if "challenge" in value else [])], 1):
+        try:
+            done = question(q, i, i > len(questions))
+        except DesignError as exc:
+            problems += getattr(exc, "problems", [("", str(exc))])
+            continue
+        if i <= len(questions):
+            spec["questions"].append(done)
+        else:
+            spec["challenge"] = done
+    if problems:
+        raise DesignError(_question_problems(problems))
+    spec.setdefault("challenge", None)
     if not reading and not questions and not spec["challenge"]:
         raise DesignError("Provide a reading passage or questions; a title page alone is not a worksheet.")
     if figure_count(spec) > figures.PER_DOCUMENT:

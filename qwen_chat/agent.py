@@ -22,6 +22,7 @@ MAX_OUT_TOKENS = 4096      # per reply, tool call arguments included
 CALL_CHARS = 8000          # what the model is told one tool call may hold (well under the cap)
 CHARS_PER_TOKEN = 3.0      # conservative; real English text is ~3.5-4
 LONG_ARG = 1500            # tool call strings longer than this get shortened when space is tight
+SHORT_ARG = 200            # ... and, for this turn's older calls, when that is not enough
 # History trimming. Every note says "to save context space" in brackets: write tools refuse
 # text containing one (tools.placeholder_note), because a copied note would replace real content.
 OLD_TOOL_STUB = "[Earlier tool output removed to save context space. Run the tool again if you need it.]"
@@ -34,6 +35,11 @@ CACHED_TOOLS = ("web_search", "fetch_url", "list_files", "read_file")
 # in all (one read_file page), so it starts from what they hold, not from earlier replies.
 ATTACHED_READ_CHARS = 12_500
 IMAGE_TOKEN_BUDGET = 1536
+OVERHEAD_MARGIN = 256      # tokens kept free when the prompt's fixed part has been measured
+# A PDF that keeps failing in new ways (one fixed problem reveals the next) is a draft the
+# model cannot get right: after this many failed attempts in a row the turn stops, instead
+# of running to MAX_TOOL_ROUNDS (35 minutes once). From the second, it is told to fix all.
+PDF_FAIL_LIMIT = 4
 MAX_ATTACHED_IMAGES = 4
 ATTACHED_READ_NOTE = ("[The app read this attached file just now: this is what it holds. Where an "
                       "earlier reply in this chat says otherwise, trust this read.]\n")
@@ -289,7 +295,7 @@ def clean_for_api(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _shrink_call(call: dict) -> bool:
+def _shrink_call(call: dict, limit: int = LONG_ARG) -> bool:
     """Replaces long strings (like a whole file) in a tool call's arguments with a short note.
     No fragment is kept: a model continues a fragment, then copies it into a file."""
     try:
@@ -300,7 +306,7 @@ def _shrink_call(call: dict) -> bool:
         return False
     changed = False
     for k, v in args.items():
-        if isinstance(v, str) and len(v) > LONG_ARG:
+        if isinstance(v, str) and len(v) > limit:
             args[k] = f"[{len(v):,} characters omitted here to save context space]"
             changed = True
     if changed:
@@ -413,6 +419,14 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
         if (m["role"] == "tool" and m.get("name") not in ("read_quiz", "load_skill")
                 and len(m.get("content") or "") > len(OLD_TOOL_STUB)):
             _stub(m)
+    # Then the text of this turn's older edits (one edit_file per question adds up), which
+    # the file itself now holds.
+    for m in msgs[last_user:-4]:
+        if total() <= goal:
+            break
+        for call in m.get("tool_calls") or []:
+            if id(call) not in drafts:
+                _shrink_call(call, SHORT_ARG)
     # The newest content of each file goes last: without it the model cannot fix that file
     # and tends to write a placeholder over it.
     for m in msgs[last_user:]:
@@ -422,14 +436,18 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
             _shrink_call(call)
     while total() > goal and len(earlier_turns()) > 1:
         drop_oldest()
-    # Last resort: cut the biggest output, but only as far as needed. A skill is cut before a
-    # quiz source, which is needed to check the answers.
+    # Last resort: cut the biggest output, but only as far as needed. The results of the latest
+    # calls go last (the model has not seen them yet: one cut there made it re-read a file
+    # again and again), and a skill is cut before a quiz source, which is needed to check the
+    # answers.
+    latest = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i]["role"] != "tool"), -1)
+    newest = {id(m) for m in msgs[latest + 1:]}
     while total() > budget_chars:
         tools = [m for m in msgs if m["role"] == "tool" and len(m.get("content") or "") > 600]
         if not tools:
             break
-        big = max(tools, key=lambda m: (m.get("name") != "read_quiz", m.get("name") != "load_skill",
-                                        len(m["content"])))
+        big = max(tools, key=lambda m: (id(m) not in newest, m.get("name") != "read_quiz",
+                                        m.get("name") != "load_skill", len(m["content"])))
         over = total() - budget_chars
         keep = max(400, len(big["content"]) - over - 200)
         big["content"] = big["content"][:keep] + CUT_NOTE
@@ -565,6 +583,9 @@ class Agent:
         self.toolbox = toolbox
         self.stream: ChatStream | None = None
         self.fit = ContextFitter()
+        # What the system prompt, tools and pictures cost beyond CHARS_PER_TOKEN, as measured
+        # by llama-server, per (model, context size, picture count).
+        self._overhead: dict[tuple, int] = {}
 
     def abort(self) -> None:
         if self.stream is not None:
@@ -684,13 +705,29 @@ class Agent:
         n_ctx = self.server.n_ctx
         max_out = min(MAX_OUT_TOKENS + (2048 if thinking else 0), n_ctx // 3)
         tool_chars = len(json.dumps(tools)) if tools else 0
-        budget = (int((n_ctx - max_out - len(images) * IMAGE_TOKEN_BUDGET) * CHARS_PER_TOKEN)
-                  - len(sys_msg["content"]) - tool_chars)
+        fixed_chars = len(sys_msg["content"]) + tool_chars
+        estimate = (int((n_ctx - max_out - len(images) * IMAGE_TOKEN_BUDGET) * CHARS_PER_TOKEN)
+                    - fixed_chars)
+        # The system prompt, tool schemas and pictures cost far fewer tokens than the estimate
+        # (5,500 instead of 8,700 with a picture), which left history so little room that it
+        # was re-trimmed, and re-read by llama-server, every round. Once the server has
+        # reported a request's real size, what they cost beyond CHARS_PER_TOKEN is known.
+        fixed_key = (self.server.model_name, n_ctx, len(images))
+        squeeze, measured = 1.0, False
+
+        def history_budget() -> int:
+            extra = self._overhead.get(fixed_key)
+            if extra is None:
+                return int(estimate * squeeze)
+            return int(((n_ctx - max_out - OVERHEAD_MARGIN - extra) * CHARS_PER_TOKEN
+                        - fixed_chars) * squeeze)
+
         rounds = 0
         failed_outputs: dict[tuple[str, str], str] = {}
         # The (spec, student or key copy) jobs each failed PDF stands for.
         failed_jobs: dict[tuple[str, str], set[tuple[str, str]]] = {}
         repeats: dict[tuple[str, str], int] = {}
+        streaks: dict[tuple[str, str], int] = {}  # failed attempts in a row at each PDF
 
         def shown(path) -> str:
             try:
@@ -731,11 +768,14 @@ class Agent:
                 return
             rounds += 1
             use_tools = tools
+            budget = history_budget()
             history = self.fit(clean_for_api(without_resent(messages)), budget)
+            sent_chars = fixed_chars + sum(_size(m) for m in history)
             if images:
                 user = next((m for m in reversed(history) if m.get("role") == "user"), None)
                 if user is not None:
                     text = "\n\n".join(t for t in (user.get("content") or "", image_note) if t)
+                    sent_chars += len(text) - len(user.get("content") or "")
                     user["content"] = ([{"type": "text", "text": text}] if text else []) + [
                         {"type": "image_url", "image_url": {"url": image}} for image in images]
             payload = {
@@ -771,12 +811,21 @@ class Agent:
                     lambda name, chars: events.status(_drafting(name, chars)))
             except LLMError as e:
                 if e.context_overflow and budget > 6000:
-                    budget = int(budget * 0.7)
+                    squeeze *= 0.7
+                    self._overhead.pop(fixed_key, None)
                     continue
                 raise
             finally:
                 self.stream = None
             msg, timings = result["message"], result["timings"]
+            used = [timings.get(k) for k in ("prompt_n", "cache_n")]
+            if all(type(n) is int and n >= 0 for n in used) and sum(used) > 0:
+                extra = round(sum(used) - sent_chars / CHARS_PER_TOKEN)
+                # Within a reply the largest measurement holds (denser text costs more), so
+                # the budget only shrinks; each reply starts from its own first measurement.
+                if measured and fixed_key in self._overhead:
+                    extra = max(extra, self._overhead[fixed_key])
+                self._overhead[fixed_key], measured = extra, True
             cut_off = result["finish_reason"] == "length"
             if cut_off and not msg.get("tool_calls"):
                 msg["content"] = (msg.get("content") or "") + "\n\n*[Stopped: reached the response length limit.]*"
@@ -803,7 +852,7 @@ class Agent:
             calls = msg.get("tool_calls") or []
             if not calls:
                 return
-            stuck = ""
+            stuck = gave_up = ""
             for call in calls:
                 if cancel.is_set():
                     raise Cancelled()
@@ -843,15 +892,20 @@ class Agent:
                 elif name == "run_command":
                     outputs = [(self.toolbox.open_command_path(args.get("command", "")), None)]
                     action = "Open file" if outputs[0][0] is not None else ""
+                streak, streak_path = 0, ""
                 for path, job in outputs if action else []:
                     path = shown(path)
                     if ok:
                         failed_outputs.pop((action, path), None)
                         failed_jobs.pop((action, path), None)
+                        streaks.pop((action, path), None)
                     else:
                         failed_outputs[action, path] = out
                         if job:
                             failed_jobs.setdefault((action, path), set()).add(job)
+                        streaks[action, path] = streaks.get((action, path), 0) + 1
+                        if action == "Create PDF" and streaks[action, path] > streak:
+                            streak, streak_path = streaks[action, path], path
                 if ok and action == "Create PDF":
                     # A retry of the same worksheet under new names (after "use three different
                     # file names", say) does the job the failed call could not.
@@ -869,10 +923,18 @@ class Agent:
                     repeats[name, out[:400]] = seen_before + 1
                     if seen_before + 1 >= REPEAT_LIMIT:
                         stuck = stuck or out
+                    elif streak >= PDF_FAIL_LIMIT:
+                        gave_up = gave_up or streak_path
                     elif seen_before:
                         out += ("\n[Same error as before: the last change did not fix it. Change "
                                 "exactly the field or value this error names, or explain the "
                                 "problem to the user. Do not resubmit unchanged content.]")
+                    elif streak >= 2:
+                        out += (f"\n[This PDF has now failed {streak} times in a row. Read the "
+                                "whole error: it lists every problem found. Fix them all in one "
+                                "step (when several questions need the same fix, rewrite the "
+                                "whole file once with write_file), then render again. After "
+                                f"{PDF_FAIL_LIMIT} failed attempts in a row the task stops.]")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name,
                                  "content": out,
                                  "_meta": {"ok": ok, **({"files": files} if files
@@ -887,4 +949,9 @@ class Agent:
                          "> " + line for line in stuck[:600].splitlines()))
                      + "\n\nReply **continue** to let Qwen try a different fix, "
                      "or say how to proceed.")
+                return
+            if gave_up and ("Create PDF", gave_up) in failed_outputs:
+                stop(incomplete() + f"\n\nStopped after {PDF_FAIL_LIMIT} failed attempts in a "
+                     f"row at `{gave_up}`: each change left or revealed another problem. Reply "
+                     "**continue** to let Qwen try again, or say how to proceed.")
                 return

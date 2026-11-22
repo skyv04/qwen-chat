@@ -51,10 +51,12 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
    `answer_key_path` when no key is wanted. The three names must differ. To add a key
    later, call `render_answer_key` with this same JSON as `spec_path`; do not write a
    separate key JSON for it.
-7. If it fails, the error names the exact field or value and lists every answer problem.
-   Fix exactly those spots with edit_file, then render again. Do not rewrite the whole
-   file to change one value, and never resubmit unchanged JSON: the same error three
-   times stops the task.
+7. If it fails, the error names the exact field or value and lists every problem it
+   found, in the answers and in the questions. Fix all of them before rendering again:
+   one value with edit_file, but when several questions need the same change, rewrite
+   the whole file once with write_file instead of one edit per question. Never resubmit
+   unchanged JSON: the same error three times stops the task, and so do four failed
+   renders of the same PDF in a row.
 8. If the user's page limit is too tight, the tool asks the user to allow more pages. Do
    not remove questions, shorten the reading or shrink writing space to avoid that.
    After a failed page-limit run, render the saved JSON again. If the user says no,
