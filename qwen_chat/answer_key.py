@@ -6,8 +6,9 @@ import re
 import unicodedata
 from typing import NamedTuple
 
-from .worksheet_pdf import (MAX_PAGES, DesignError, _empty, _integer, _key_fields, _normalize,
-                            _question_number, _text, normalize_spec, source_texts, validate_spec)
+from .worksheet_pdf import (MAX_PAGES, DesignError, _and, _empty, _integer, _key_fields, _normalize,
+                            _plural_subject, _question_number, _text, normalize_spec,
+                            source_texts, validate_spec)
 
 
 def _plain(text: str) -> str:
@@ -67,12 +68,16 @@ def resolve_choice(where: str, options: list[str], choice, answer: str) -> tuple
 
 
 # A prompt that asks for more than one option: "Circle ALL the equations that match",
-# "Which two animals ...", "Select all that apply".
+# "Which two animals ...", "Select all that apply", "Circle the words that rhyme".
 _SELECT_MANY = re.compile(
     r"\b(?:circle|choose|select|pick|mark|colou?r|tick|check|underline|shade|find)\s+"
     r"(?:all|both|every|each|two|three|four|the\s+(?:two|three|four))\b"
     r"|\ball\s+(?:that|which)\b|\bthat\s+apply\b|\bmore\s+than\s+one\b"
-    r"|\bwhich\s+(?:two|three|four)\b", re.I)
+    r"|\bwhich\s+(?:two|three|four)\b"
+    r"|\b(?:circle|choose|select|pick|mark|colou?r|tick|check|underline|shade|find)\s+"
+    r"(?:the\s+|any\s+)?(?:[\w'-]+\s+){0,2}(?:words|pictures|letters|numbers|sentences|animals|"
+    r"objects|items|answers|options|shapes|names|nouns|verbs|adjectives|things|ones|equations|"
+    r"facts|examples)\s+(?:that|which|with|in|from)\b", re.I)
 _SEVERAL_LETTERS = re.compile(r"\s*\(?[A-Ha-h]\)?\.?(?:\s*(?:[,;/&+]|\band\b|\s)\s*\(?[A-Ha-h]\)?\.?)+"
                               r"\s*")
 
@@ -142,8 +147,19 @@ class _NotQuoted(DesignError):
 # Quoted words inside evidence such as: The story says "Maya smiled." An apostrophe inside
 # a word (didn't) does not end a single-quoted segment.
 _QUOTED = re.compile(r"“([^”]+)”|\"([^\"]+)\"|‘([^’]+)’|(?<!\w)'((?:[^']|(?<=\w)'(?=\w))+?)'(?!\w)")
-_SENTENCE_END = re.compile(r"(?<=[.!?])[\"'”’)\]]*\s+")
-_PIECES = re.compile(r"(?<=[.!?])[\"'”’)\]]*\s+|\s*(?:\.{3}|…)\s*")
+# A period after a title or "e.g." does not end a sentence ("Mrs. Driftmier came to talk").
+_NOT_AN_END = r"(?<!\bMr\.)(?<!\bMrs\.)(?<!\bMs\.)(?<!\bDr\.)(?<!\bSt\.)(?<!\bMt\.)(?<!\be\.g\.)(?<!\bi\.e\.)"
+_SENTENCE_END = re.compile(_NOT_AN_END + r"(?<=[.!?])[\"'”’)\]]*\s+")
+_PIECES = re.compile(_NOT_AN_END + r"(?<=[.!?])[\"'”’)\]]*\s+|\s*(?:\.{3}|…)\s*")
+# Evidence that gives a reason instead of a quote: worked math ("5 + 3 = 8") or words about
+# the question or the child ("The question asks the student to ...").
+_REASONING = re.compile(
+    r"\d\s*(?:[-+−–×x*/÷]|plus|minus|times)\s*\d+\s*=\s*\d"
+    r"|\b(?:the|this)\s+(?:question|task|prompt|exercise)\s+(?:asks|is|wants|needs|requires|"
+    r"tests|checks)\b"
+    r"|\b(?:the|a)\s+(?:student|child|learner|kid)s?\s+(?:should|can|must|needs?|is|are|will|"
+    r"has|have|writes?|uses?)\b"
+    r"|\bthis\s+is\s+an?\s+(?:[\w-]+\s+){0,2}(?:problem|question)\b", re.I)
 NEAR_QUOTE = 0.9    # a quote this close to one source sentence is a misquote of it
 REASON_BELOW = 0.5  # evidence this far from every sentence is a reason, not a quote
 GAP_WORDS = 3       # most words a shortened quote may leave out between two of its words
@@ -288,6 +304,12 @@ def _cite(where: str, quote, sources: list[str], hint: str) -> tuple[list[int], 
     closest = (f" The closest source sentence is {sentence!r}: if it supports the answer, copy it "
                "exactly; otherwise move this to explanation." if closeness >= REASON_BELOW else "")
     raise _NotQuoted(f"{where}: evidence is not in the source: {quote!r}.{closest} {hint}", closeness)
+
+
+def _quotes_words(text: str) -> bool:
+    """Whether text puts source-length words in quotation marks (The story says "...")."""
+    return any(len(_plain(next(g for g in m.groups() if g is not None))) >= 12
+               for m in _QUOTED.finditer(text))
 
 
 def _cited(numbers: list[int], label: str) -> str:
@@ -830,10 +852,28 @@ def _with_reasons(explanation: str, reasons: list[str], where: str) -> str:
                           for i, p in enumerate(pieces)), f"{where} explanation", 1600)
 
 
+_WHERE = re.compile(r"(Question (\d+)|challenge)(?![\w])")
+
+
 def _problems(errors: list[str]) -> DesignError:
-    return DesignError(f"{len(errors)} answer problem(s); fix them all in one edit, then render "
-                       "again. Nothing was rendered.\n- " + "\n- ".join(errors[:12])
-                       + (f"\n- …and {len(errors) - 12} more" if len(errors) > 12 else ""))
+    """Every answer problem in one message. The same problem in several questions is listed
+    once ("Questions 5, 6 and 7 have no options; ..."), so it reads as one fix."""
+    grouped: dict[str, list[str]] = {}
+    for error in errors:
+        m = _WHERE.match(error)
+        template = error[:m.start()] + "\0" + error[m.end():] if m else error
+        grouped.setdefault(template, []).append(m[1] if m else "")
+    lines = []
+    for template, places in grouped.items():
+        if len(places) > 1 and "\0" in template:
+            numbers = [p.removeprefix("Question ") for p in places if p.startswith("Question ")]
+            names = "Questions " + _and(numbers) if len(numbers) == len(places) else _and(places)
+            lines.append(_plural_subject(template).replace("\0", names, 1))
+        else:
+            lines += [template.replace("\0", place, 1) for place in places]
+    return DesignError(f"{len(errors)} answer problem(s); fix them all, then render again. "
+                       "Nothing was rendered.\n- " + "\n- ".join(lines[:12])
+                       + (f"\n- …and {len(lines) - 12} more" if len(lines) > 12 else ""))
 
 
 def key_document(value, quiz: dict, source_path: str, digest: str) -> tuple[dict, dict]:
@@ -964,16 +1004,18 @@ def key_document(value, quiz: dict, source_path: str, digest: str) -> tuple[dict
     return document, {**audit, "semantic_accuracy_verified": False}
 
 
-def worksheet_key(spec: dict) -> tuple[dict, dict]:
+def worksheet_key(spec: dict, lenient: bool = False) -> tuple[dict, dict]:
     """A parent/teacher key from answers stored with a validated worksheet's own questions.
-    Reports every problem at once, so one edit can fix them all."""
+    Reports every problem at once, so one edit can fix them all. With lenient (a retry after
+    a failed key), evidence that is still not in the source is left out rather than failing
+    the key again: the answer stands without a quote, and the checks list it."""
     questions = [*spec["questions"], *([spec["challenge"]] if spec["challenge"] else [])]
     if not any(q["key"].get(k) not in (None, "") for q in questions for k in ("choice", "answer")):
         raise DesignError("No answers found. For an answer key, add choice (the correct option "
                           "letter) or answer (the expected written answer) to every question.")
     passages = [p["text"] for p in spec["reading"]]
     sources = passages or [q["prompt"] for q in questions]
-    paragraphs, errors, unverified, reasons, notes = [], [], [], [], []
+    paragraphs, errors, unverified, reasons, notes, left_out = [], [], [], [], [], []
     counts = {"multiple_choice_checked": 0, "evidence_quotes_checked": 0, "arithmetic_checked": 0,
               "worked_math_checked": 0}
     hint = ("Copy exact words from the reading, or move this sentence to explanation. Do not "
@@ -991,6 +1033,13 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
                     raise DesignError(f"{where} needs choice: the letter of its correct option.")
                 response, values = _shown(picked), [text for _letter, text in picked]
             elif key.get("choice") not in (None, ""):
+                given = key["choice"]
+                if _letters(given) or _letters(answer):
+                    raise DesignError(
+                        f"{where} has no options, so {(answer if _letters(answer) else given)!r} "
+                        "names options it does not have: write the expected answer itself in "
+                        "answer (the words or number the child writes) and remove choice, or add "
+                        "the options those letters stand for.")
                 raise DesignError(f"{where} has no options; put its expected answer in answer, not choice.")
             elif not answer.strip():
                 raise DesignError(f"{where} needs answer: the expected answer, or for open "
@@ -1001,15 +1050,21 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
             quotes = [quotes] if isinstance(quotes, str) else quotes
             if not isinstance(quotes, list) or len(quotes) > 6:
                 raise DesignError(f"{where} evidence must be one quote or a list of up to six quotes.")
-            citations, reasoning, bad = [], [], []
+            citations, reasoning, bad, dropped = [], [], [], []
             for quote in quotes:
                 try:
                     found, shown, cite_notes = _cite(where, quote, sources, hint)
                 except DesignError as exc:
                     # Without a reading there is nothing to quote: a worked reason (common for
-                    # math) is an explanation, which the key shows as "Why:".
-                    if passages or not isinstance(quote, str) or not quote.strip():
-                        bad.append(str(exc))
+                    # math) is an explanation, which the key shows as "Why:". With a reading,
+                    # so is evidence that plainly reasons and is far from every sentence.
+                    if not isinstance(quote, str) or not quote.strip() or (passages and not (
+                            isinstance(exc, _NotQuoted) and exc.closeness < REASON_BELOW
+                            and _REASONING.search(quote) and not _quotes_words(quote))):
+                        if lenient and isinstance(exc, _NotQuoted):
+                            dropped.append(quote)
+                        else:
+                            bad.append(str(exc))
                     else:
                         reasoning.append(quote.strip())
                     continue
@@ -1019,6 +1074,9 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
                 raise DesignError(" ".join(bad))
             if reasoning:  # a reason the explanation already gives is not repeated
                 explanation = _with_reasons(explanation, reasoning, where)
+                if passages:
+                    notes.append(f"{where}: evidence that gives a reason rather than a quote "
+                                 "is shown as the explanation")
             math = all([check_math(where, q["prompt"], value) for value in values])
             worked = check_working(where, q["prompt"], explanation, response)
         except DesignError as exc:
@@ -1026,6 +1084,10 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
             continue
         if reasoning:
             reasons.append(number)
+        if dropped:
+            left_out.append(number)
+            notes.append(f"{where}: evidence that is not in the source was left out of the key "
+                         f"({'; '.join(repr(d[:80]) for d in dropped)})")
         counts["multiple_choice_checked"] += bool(q["options"])
         counts["evidence_quotes_checked"] += len(citations)
         counts["arithmetic_checked"] += math
@@ -1059,6 +1121,8 @@ def worksheet_key(spec: dict) -> tuple[dict, dict]:
     audit = {"answers_checked": len(questions), **counts, "unverified_questions": unverified}
     if reasons:
         audit["evidence_used_as_explanation"] = reasons
+    if left_out:
+        audit["evidence_left_out"] = left_out
     if notes:
         audit["adjusted"] = list(dict.fromkeys(notes))
     return document, {**audit, "semantic_accuracy_verified": False}

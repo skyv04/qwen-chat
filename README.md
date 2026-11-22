@@ -207,13 +207,20 @@ An unavailable motif becomes `dots`, a too-pale accent is darkened, an answer-ke
 and line breaks typed inside JSON text are accepted. A question number or title given
 instead of, or beside, the question (`"question_title": "Question 1"`, `"prompt": "Q2"`
 next to `"question": "..."`, `"question_number": 3`) is dropped and the real question
-used. Option objects (`{"letter": "A", "text": "..."}`, `{"A": "..."}`, or an options
+used; a section name in such a field (`"question_title": "Section 1: Phonics"`) becomes
+the question's `label`, shown beside its number, while a question type there
+(`"category": "multiple_choice"`) is dropped. On a question without options, a
+`choice` letter next to a written `answer` is dropped, and a `choice` holding the
+answer's words becomes `answer`. Option objects (`{"letter": "A", "text": "..."}`, `{"A": "..."}`, or an options
 object `{"A": ..., "B": ...}`) become plain option text, and one marked `"correct": true`
 becomes `choice`; letters out of order, extra content or a clash with `choice` are left
 for validation to report. The result lists these under "Handled
 automatically"; the JSON file itself is not changed. A real JSON mistake is reported
 with its line, column and text, so one `edit_file` call can fix it. `edit_file` with
-`replace_all` changes every match at once, such as the same field in each question.
+`replace_all` changes every match at once, such as the same field in each question:
+the error hints suggest it over rewriting the whole file, which takes about five
+minutes on a phone. A question that repeats another word for word, answers included
+(as when an edit copies one question over the next), is reported.
 Every question problem is reported in one error, with the same problem in several
 questions listed once (`Unknown Questions 1, 2 and 3 field(s): ...`) and an example of
 a correct question, so the draft is fixed in one rewrite rather than one render per
@@ -289,16 +296,24 @@ one letter. One `render_worksheet` call with `answer_key_path` then:
 - recomputes worked steps written in an explanation, such as `$10 - $6 - $4 = $0`, and
   for "how many" or "how much" questions requires them to reach the chosen answer, so
   a letter that points at the wrong option is caught;
-- lists every problem in one message, so one edit fixes them all, and renders nothing
-  until they are fixed;
+- lists every problem in one message, the same problem in several questions once
+  (`Questions 5, 6 and 7 have no options; ...`), and renders nothing until they are
+  fixed;
 - creates the student PDF with no answers and a matching-theme key, after one approval,
   and replaces neither file unless both pass their checks.
 
 On a sheet with no reading, such as a math page, there is nothing to quote: a reason
 written as `evidence` is shown in the key as the explanation ("Why: …") and listed in
-the audit. With a reading, evidence must quote it exactly. A quote that only leaves a
-few words out of one sentence (never a "not" or "never") is shown as that whole
-sentence, and when only part of a quote is wrong, the error names that part.
+the audit. With a reading, evidence must quote it exactly, except that evidence which
+plainly reasons instead of quoting (worked math such as `5 + 3 = 8`, or "The question
+asks the student to ...") and is far from every sentence becomes the explanation too.
+A quote that only leaves a few words out of one sentence (never a "not" or "never") is
+shown as that whole sentence (a title such as "Mrs." does not end a sentence), and
+when only part of a quote is wrong, the error names that part. If the next try of a
+key that failed still has evidence that is not in the reading, that evidence is left
+out of the key with a note and listed as `evidence_left_out`, instead of failing again
+over a quote; wrong answers still fail. "Circle the words that ..." asks for several
+options, like "Circle ALL ...".
 
 `max_pages` and `answer_key_max_pages` keep the two page budgets separate. A key can
 also be made later with `render_answer_key` on the same worksheet JSON: it uses the
@@ -352,7 +367,7 @@ to print pretend commands. A second identical tool error tells Qwen its last cha
 didn't fix it; a third stops the reply with the error, instead of looping. A PDF that
 keeps failing in new ways (each fix revealing the next problem) gets a note from its
 second failure in a row to fix every listed problem at once, and the reply stops after
-four failed attempts in a row at the same PDF. Reading lines
+three failed attempts in a row at the same PDF. Reading lines
 of an unchanged file that an earlier read in the same reply showed, and that are still
 in view, is let through once; after that it is an error saying the lines are still
 above, so reading the same file over and over ends the reply the same way. Rewriting

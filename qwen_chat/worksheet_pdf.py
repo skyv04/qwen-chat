@@ -347,6 +347,78 @@ def _question_text(item: dict, note, where: str) -> dict:
     return item
 
 
+# A question's section or topic name under its own field ("question_title": "Section 1:
+# Phonics"): label shows it beside the question number.
+_SECTION_FIELDS = ("question_title", "section", "section_title", "section_name",
+                   "section_heading", "heading", "header", "title", "topic", "category", "skill")
+# A question type given where a section name could be ("category": "multiple_choice").
+_QUESTION_TYPE = re.compile(
+    r"\s*(?:multiple[\s_-]*choice|mcq|open(?:[\s_-]*ended)?|short[\s_-]*answer|long[\s_-]*answer|"
+    r"written|free[\s_-]*response|true[\s_/-]*(?:or[\s_-]*)?false|fill[\s_-]*in(?:[\s_-]*the"
+    r"[\s_-]*blanks?)?|essay|matching)\s*", re.I)
+# Several option letters ("A,B,C", "A and C").
+_OPTION_LETTERS = re.compile(r"\s*\(?[A-Ha-h]\)?[.):]?(?:\s*(?:[,;/&+]|\band\b|\s)\s*"
+                             r"\(?[A-Ha-h]\)?[.):]?)+\s*")
+
+
+def _section_label(item: dict, note, where: str) -> dict:
+    """A section name drafted as a question field becomes label, which the PDF prints beside
+    the question number in place of "Question 1:". One already in label or prompt is dropped;
+    a long one is left for validation to report."""
+    for field in _SECTION_FIELDS:
+        value = item.get(field)
+        if not isinstance(value, str) or not value.strip() or _number_only(value):
+            continue
+        text, label = " ".join(value.split()), item.get("label")
+        prompt = " ".join(str(item.get("prompt") or "").split()).casefold()
+        if _QUESTION_TYPE.fullmatch(text):
+            del item[field]
+            note(f"ignored question field '{field}' (only the question type; options make a "
+                 "question multiple choice)", where)
+        elif text.casefold() in prompt or (isinstance(label, str)
+                                         and text.casefold() in label.casefold()):
+            del item[field]
+            note(f"ignored question field '{field}' (already in "
+                 f"{'prompt' if text.casefold() in prompt else 'label'})", where)
+        elif _empty(label) and len(text) <= 100:
+            del item[field]
+            item["label"] = text
+            note(f"read question field '{field}' as 'label' (shown beside the question number)",
+                 where)
+        elif isinstance(label, str) and len(f"{label.strip()} · {text}") <= 100:
+            del item[field]
+            item["label"] = f"{label.strip().rstrip(':')} · {text}"
+            note(f"added question field '{field}' to 'label' (shown beside the question number)",
+                 where)
+    return item
+
+
+def _open_choice(item: dict, note, where: str) -> dict:
+    """choice is the letter of a correct option, so a question without options has none to
+    name: a letter or a copy of answer next to the real answer is dropped, and text with no
+    answer is the answer. Option letters as the answer ("A,B,C") are left for the key check
+    to report: the answer itself is missing."""
+    choice, answer = item.get("choice"), item.get("answer")
+    if item.get("options") or not isinstance(choice, str) or not choice.strip():
+        return item
+    letters = bool(_LETTER_ONLY.fullmatch(choice) or _OPTION_LETTERS.fullmatch(choice))
+    if _empty(answer):
+        if not letters:
+            item["answer"] = item.pop("choice")
+            note("read 'choice' as 'answer' (the question has no options; choice is only for "
+                 "option letters)", where)
+        return item
+    if not isinstance(answer, (str, int, float)) or isinstance(answer, bool) or (
+            isinstance(answer, str) and _OPTION_LETTERS.fullmatch(answer)):
+        return item
+    if _LETTER_ONLY.fullmatch(choice) or " ".join(choice.split()).casefold() == \
+            " ".join(str(answer).split()).casefold():
+        del item["choice"]
+        note("ignored 'choice' (the question has no options; its expected answer is in "
+             "'answer')", where)
+    return item
+
+
 def _plain_options(item: dict, note, where: str) -> dict:
     """Options drafted as objects ({"letter": "B", "text": "gratitude", "correct": true}) or
     as {"A": "...", "B": "..."} become the plain strings the PDF letters itself; an option
@@ -1141,9 +1213,11 @@ def normalize_spec(value, name: str = "", warnings: list[str] | None = None
                 item[field] = item.pop(alias)
                 note(f"read question field '{alias}' as '{field}'", where)
         item = _question_text(item, note, where)
+        item = _section_label(item, note, where)
         item = _key_fields(item, note, where)
         item = _fold_answers(item, note, where)
         item = _plain_options(item, note, where)
+        item = _open_choice(item, note, where)
         for field in (*_IGNORED_QUESTION_FIELDS, *_SOURCE_FIELDS):
             if field in item:
                 del item[field]
@@ -1227,6 +1301,15 @@ def _and(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
+_PLURAL_VERBS = {"has": "have", "needs": "need", "is": "are", "names": "name", "repeats": "repeat"}
+
+
+def _plural_subject(template: str) -> str:
+    """The verb after the \0 placeholder agreeing with several questions ("\0 have")."""
+    return re.sub(r"\0 (has|needs|is|names|repeats) ", lambda m: f"\0 {_PLURAL_VERBS[m[1]]} ",
+                  template, count=1)
+
+
 def _question_problems(problems: list[tuple[str, str]]) -> str:
     """One message for every question's problems, so a draft is fixed in one pass rather than
     one error per render. The same problem in several questions is listed once."""
@@ -1238,7 +1321,8 @@ def _question_problems(problems: list[tuple[str, str]]) -> str:
         numbers = [p.removeprefix("Question ") for p in places if p.startswith("Question ")]
         names = ("Questions " + _and(numbers) if len(numbers) == len(places) > 1
                  else _and(places))
-        lines.append(template.replace("\0", names))
+        lines.append((_plural_subject(template) if len(places) > 1 else template)
+                     .replace("\0", names))
     shown = lines[:8] + ([f"and {len(lines) - 8} more"] if len(lines) > 8 else [])
     text = (shown[0] if len(shown) == 1 else f"{len(lines)} problems; fix all of them before "
             "rendering again: " + " ".join(f"({i}) {line}" for i, line in enumerate(shown, 1)))
@@ -1361,13 +1445,22 @@ def validate_spec(value) -> dict:
             raise error
         return result
 
-    spec["questions"], problems = [], []
+    spec["questions"], problems, seen = [], [], {}
     for i, q in enumerate([*questions, *([value["challenge"]] if "challenge" in value else [])], 1):
         try:
             done = question(q, i, i > len(questions))
         except DesignError as exc:
             problems += getattr(exc, "problems", [("", str(exc))])
             continue
+        where = "challenge" if i > len(questions) else f"Question {i}"
+        same = json.dumps([" ".join(done["prompt"].split()).casefold(), done["options"],
+                           done["figure"], done["key"]], sort_keys=True, ensure_ascii=False,
+                          default=str)
+        if same in seen:
+            problems.append((where, f"{where} repeats {seen[same]} word for word (an edit may "
+                                    "have copied one question over another): restore the "
+                                    "question that was lost, or write a new one."))
+        seen.setdefault(same, where)
         if i <= len(questions):
             spec["questions"].append(done)
         else:

@@ -312,8 +312,9 @@ class CutOffToolCallTest(unittest.TestCase):
         results = [m["content"] for m in messages if m.get("name") == "render_worksheet"]
         self.assertEqual(len(results), agent.PDF_FAIL_LIMIT)
         self.assertNotIn("in a row", results[0])
-        self.assertIn("failed 2 times in a row", results[1])
-        self.assertIn("failed 3 times in a row", results[2])
+        for streak in range(2, agent.PDF_FAIL_LIMIT):
+            self.assertIn(f"failed {streak} times in a row", results[streak - 1])
+            self.assertIn("replace_all", results[streak - 1])
         final = messages[-1]["content"]
         for expected in ("Task incomplete", f"Stopped after {agent.PDF_FAIL_LIMIT} failed attempts "
                          "in a row at `quiz.pdf`", "Reply **continue**"):

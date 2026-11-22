@@ -114,6 +114,63 @@ class WorksheetKeyTest(unittest.TestCase):
         with self.assertRaisesRegex(pdf.DesignError, "No answers found"):
             worksheet_key(pdf.validate_spec(data))
 
+    def test_the_same_answer_problem_in_several_questions_is_listed_once(self):
+        data = homework_fixture()
+        for question in data["questions"][1:]:
+            question["choice"] = "A"
+        data["questions"].append({"prompt": "Write the verbs.", "answer": "A,B,C", "choice": "A,B,C"})
+        with self.assertRaises(pdf.DesignError) as error:
+            worksheet_key(pdf.validate_spec(data))
+        message = str(error.exception)
+        self.assertIn("3 answer problem(s); fix them all, then render again.", message)
+        self.assertIn("\n- Questions 2 and 3 have no options; put its expected answer in answer, "
+                      "not choice.", message)
+        self.assertIn("\n- Question 4 has no options, so 'A,B,C' names options it does not have",
+                      message)
+
+    def test_reasons_given_as_evidence_next_to_a_reading_become_explanations(self):
+        # From Qwen's grade-1 key: math questions under a reading, with worked reasons as
+        # evidence, failed four renders in a row as "not in the source".
+        data = homework_fixture()
+        data["questions"][1]["evidence"] = ("3 + 2 = 5. The question asks the student to add "
+                                            "the craters.")
+        data["questions"][2]["evidence"] = "The student should draw a rocket with a name."
+        document, audit = worksheet_key(pdf.validate_spec(data))
+        self.assertEqual(audit["evidence_used_as_explanation"], [2, 3])
+        self.assertIn("Why: 3 + 2 = 5. The question asks the student to add the craters.",
+                      document["reading"][1]["text"])
+        self.assertIn("Question 2: evidence that gives a reason rather than a quote is shown as "
+                      "the explanation", audit["adjusted"])
+        data["questions"][2]["evidence"] = "Mia drew a rocket called Zoom."
+        with self.assertRaisesRegex(pdf.DesignError, "Question 3: evidence is not in the source"):
+            worksheet_key(pdf.validate_spec(data))
+
+    def test_a_retry_leaves_out_evidence_that_is_still_not_in_the_source(self):
+        data = homework_fixture()
+        data["challenge"]["evidence"] = "Mia found a dinosaur on the Moon."
+        with self.assertRaisesRegex(pdf.DesignError, "challenge: evidence is not in the source"):
+            worksheet_key(pdf.validate_spec(data))
+        document, audit = worksheet_key(pdf.validate_spec(data), lenient=True)
+        self.assertEqual(audit["evidence_left_out"], [4])
+        self.assertNotIn("dinosaur", document["reading"][-1]["text"])
+        self.assertIn("Answer: six", document["reading"][-1]["text"])
+        self.assertIn("challenge: evidence that is not in the source was left out of the key "
+                      "('Mia found a dinosaur on the Moon.')", audit["adjusted"])
+        data["questions"][0]["choice"] = "C"
+        with self.assertRaisesRegex(pdf.DesignError, "actual option letters"):
+            worksheet_key(pdf.validate_spec(data), lenient=True)
+
+    def test_a_title_such_as_mrs_does_not_end_a_sentence(self):
+        reading = ["We thanked Zaina for her gratitude. Mrs. Driftmier, our school counselor, "
+                   "came to talk about self-control and body safety."]
+        document, _audit = worksheet_key(pdf.validate_spec({
+            "title": "Recap", "reading": reading, "questions": [
+                {"prompt": "Who talked about body safety?", "answer": "Mrs. Driftmier",
+                 "evidence": "The passage says 'Mrs. Driftmier came to talk about self-control "
+                             "and body safety.'"}]}))
+        self.assertIn('"Mrs. Driftmier, our school counselor, came to talk about self-control '
+                      'and body safety."', document["reading"][0]["text"])
+
     def test_choices_accept_letters_or_exact_text_but_never_a_rewritten_option(self):
         options = ["A wet umbrella", "A book"]
         for choice, answer in (("B", ""), ("(b)", ""), ("", "B"), ("", "B. A book"),
@@ -138,6 +195,9 @@ class WorksheetKeyTest(unittest.TestCase):
                 self.assertEqual(resolve_choices("Q", options, choice, answer, prompt),
                                  [("A", "3 + 5 = 8"), ("B", "5 + 3 = 8")])
         self.assertEqual(resolve_choices("Q", options, "C", "", "Which is true?"), [("C", "8 - 3 = 5")])
+        self.assertEqual(resolve_choices("Q", ["think", "cat", "three"], "A,C", "",
+                                         "Circle the words that begin with th."),
+                         [("A", "think"), ("C", "three")])
         for choice, answer, ask, message in (
                 ("A,B", "", "Which equation matches the story?", "names 2 options, but the question "
                                                                  "asks for one answer"),
@@ -442,6 +502,47 @@ class NormalizeSpecTest(unittest.TestCase):
                 item = {"prompt": "Pick.", "options": options, **({"choice": choice} if choice else {})}
                 self.assertEqual(pdf.normalize_spec({"title": "T", "questions": [item]})[0]
                                  ["questions"], [item])
+
+    def test_section_titles_become_labels_and_open_questions_lose_a_stray_choice(self):
+        # From Qwen's grade-1 quiz: "question_title": "Section 1: Phonics Decoding" failed as an
+        # unknown field, and "choice": "A" next to a written answer failed the key.
+        draft = {"title": "Weekly Recap", "reading": ["We learned about th and ch."], "questions": [
+            {"question_title": "Section 1: Phonics Decoding", "prompt": "Which word starts "
+             "with th?", "options": ["think", "cat"], "choice": "A"},
+            {"section": "Grammar", "label": "Question 2:", "prompt": "They ___ playing.",
+             "answer": "were", "choice": "A"},
+            {"heading": "Math", "prompt": "Math: what is 12 - 4?", "answer": 8, "choice": "8"},
+            {"prompt": "Name a word with ch.", "choice": "chair", "category": "short_answer"},
+            {"prompt": "Write the verbs.", "answer": "A,B,C", "choice": "A,B,C"}]}
+        data, notes = pdf.normalize_spec(draft)
+        self.assertEqual(data["questions"], [
+            {"prompt": "Which word starts with th?", "options": ["think", "cat"], "choice": "A",
+             "label": "Section 1: Phonics Decoding"},
+            {"label": "Question 2 · Grammar", "prompt": "They ___ playing.", "answer": "were"},
+            {"prompt": "Math: what is 12 - 4?", "answer": 8},
+            {"prompt": "Name a word with ch.", "answer": "chair"},
+            {"prompt": "Write the verbs.", "answer": "A,B,C", "choice": "A,B,C"}])
+        for expected in ("read question field 'question_title' as 'label' (shown beside the "
+                         "question number) (Question 1)",
+                         "ignored question field 'heading' (already in prompt) (Question 3)",
+                         "ignored 'choice' (the question has no options; its expected answer is "
+                         "in 'answer') (Question 2, Question 3)",
+                         "read 'choice' as 'answer' (the question has no options; choice is only "
+                         "for option letters) (Question 4)",
+                         "ignored question field 'category' (only the question type; options "
+                         "make a question multiple choice) (Question 4)"):
+            self.assertIn(expected, notes)
+        spec = pdf.validate_spec(data)
+        self.assertEqual(spec["questions"][0]["label"], "Section 1: Phonics Decoding")
+        with self.assertRaisesRegex(pdf.DesignError, "Question 5 has no options, so 'A,B,C'"):
+            worksheet_key(spec)
+
+    def test_a_question_copied_over_another_is_reported(self):
+        verb = {"prompt": "They (is/are) playing.", "answer": "are"}
+        with self.assertRaisesRegex(pdf.DesignError, r"^Question 3 repeats Question 1 word for "
+                                                     "word .*restore the question that was lost"):
+            pdf.validate_spec({"title": "T", "questions": [verb, {"prompt": "Why?"}, dict(verb)]})
+        pdf.validate_spec({"title": "T", "questions": [verb, {**verb, "answer": "is"}]})
 
     def test_every_question_problem_is_reported_at_once_with_an_example(self):
         draft = {"title": "T", "questions": [
@@ -820,7 +921,8 @@ class WorksheetRenderTest(unittest.TestCase):
     def test_page_overflow_keeps_existing_output(self):
         spec = fixture()
         spec["questions"] = [copy.deepcopy(spec["questions"][0]) for _ in range(8)]
-        for question in spec["questions"]:
+        for i, question in enumerate(spec["questions"]):
+            question["prompt"] = f"Explain observation {i + 1}. " + question["prompt"]
             question["lines"] = 8
         target = self.root / "existing.pdf"
         target.write_bytes(b"original PDF content")

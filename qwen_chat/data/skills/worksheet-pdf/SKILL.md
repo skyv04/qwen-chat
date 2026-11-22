@@ -53,10 +53,12 @@ key to an EXISTING quiz, load `answer-key` and use `read_quiz` and `render_answe
    separate key JSON for it.
 7. If it fails, the error names the exact field or value and lists every problem it
    found, in the answers and in the questions. Fix all of them before rendering again:
-   one value with edit_file, but when several questions need the same change, rewrite
-   the whole file once with write_file instead of one edit per question. Never resubmit
-   unchanged JSON: the same error three times stops the task, and so do four failed
-   renders of the same PDF in a row.
+   one value with edit_file; the same change in several questions with one edit_file
+   with `replace_all: true`. Rewrite the whole file with write_file only when most of
+   it must change: a rewrite is slow. When only answer fields changed, call only
+   render_answer_key again. Evidence you cannot copy exactly can be deleted. Never
+   resubmit unchanged JSON: the same error three times stops the task, and so do three
+   failed renders of the same PDF in a row.
 8. If the user's page limit is too tight, the tool asks the user to allow more pages. Do
    not remove questions, shorten the reading or shrink writing space to avoid that.
    After a failed page-limit run, render the saved JSON again. If the user says no,
@@ -96,7 +98,8 @@ All text is plain: no HTML, Markdown or scripts. Unknown fields are rejected.
   "Question 1:" and the A/B/C letters itself.
 - `lines`: Use about 4-6 answer lines for explanations and evidence, 1-2 for short facts
   or sums, and 0 for multiple choice (1-12 without options, 0-12 with options).
-- Optional per question: `icon` (one emoji) and `label` (a custom label).
+- Optional per question: `icon` (one emoji) and `label` (a short label shown beside the
+  question number instead of "Question 1:", such as a section name "Phonics").
 - `challenge`: optional, same shape as a question, only when requested; it is not
   counted in the expected question numbers.
 - Other optional fields: `subtitle`, `series`, `student_line`, `meta`, `reading_title`,
@@ -109,8 +112,9 @@ Answer fields, only for a parent key (never printed on the student PDF):
   multiple choice. When the prompt asks for several options ("Circle ALL the
   equations that match", "Which two..."), list every correct letter: `"choice": "A,B"`.
   Never add an `answers` list to a question.
-- `answer`: the expected answer; required for written questions. For open or creative
-  prompts write "Answers will vary, for example: ...".
+- `answer`: the expected answer; required for written questions, and never option
+  letters when the question has no `options`. For open or creative prompts write
+  "Answers will vary, for example: ...".
 - `evidence`: an exact quote, or a list of up to six, copied word for word from the
   reading; quote whole sentences. Without a reading, put the reason in `explanation`
   instead. For creative or math questions no sentence supports, leave evidence out

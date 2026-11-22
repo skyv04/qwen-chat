@@ -847,7 +847,7 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn(note, text)
         self.assertEqual((self.ws.root / "harvest.json").read_text(), raw)
 
-    def test_a_key_given_twice_is_named_and_every_problem_asks_for_one_rewrite(self):
+    def test_a_key_given_twice_is_named_and_a_shared_fix_asks_for_replace_all(self):
         raw = ('{"title": "Recap", "questions": [\n'
                ' {"question": "Question 1", "question": "Which word means thankful?",\n'
                '  "options": ["angry", "grateful"]}]}')
@@ -865,7 +865,7 @@ class ProgramToolsTest(unittest.TestCase):
         self.assertFalse(ok)
         run.assert_not_called()
         self.assertIn("Unknown Questions 1 and 2 field(s): hint.", text)
-        self.assertIn("rewrite the whole file once with write_file", text)
+        self.assertIn("one edit_file call with replace_all: true", text)
         self.assertIn("Also, the JSON gives a key twice", text)
 
     def test_worksheet_shapes_are_drawn_from_prompts_and_missing_pictures_are_reported(self):
@@ -1282,6 +1282,29 @@ class ProgramToolsTest(unittest.TestCase):
             self.assertIn("ignored source_path, source_sha256 (a worksheet is its own source)", result)
             self.assertIn("ignored question field 'source_sha256' (a worksheet is its own source) "
                           "(Question 1, Question 2)", result)
+
+    def test_a_second_key_try_leaves_out_a_quote_that_is_still_not_in_the_reading(self):
+        data = self._homework_spec()
+        data["questions"][0]["evidence"] = "Mia saw a comet on the way."
+        (self.ws.root / "moon.json").write_text(json.dumps(data))
+        with mock.patch.object(tools, "run_streaming", side_effect=self._render_ok):
+            ok, text = self.run_tool("render_answer_key", spec_path="moon.json", path="moon-key.pdf")
+            self.assertFalse(ok)
+            for expected in ("Question 1: evidence is not in the source",
+                             "the student PDF stays the same: call only render_answer_key again",
+                             "Evidence that cannot be copied word for word from the source may "
+                             "be deleted", "replace_all: true"):
+                self.assertIn(expected, text)
+            ok, text = self.run_tool("render_answer_key", spec_path="moon.json", path="moon-key.pdf")
+            self.assertTrue(ok, text)
+            self.assertIn("Question 1: evidence that is not in the source was left out of the key", text)
+            self.assertIn('"evidence_left_out": [1]', text)
+            data["questions"][0]["evidence"] = "Mia saw a meteor."
+            (self.ws.root / "moon.json").write_text(json.dumps(data))
+            ok, text = self.run_tool("render_worksheet", spec_path="moon.json", path="moon.pdf",
+                                     answer_key_path="moon-key.pdf")
+            self.assertFalse(ok)  # a key that worked starts strict again
+            self.assertIn("Question 1: evidence is not in the source", text)
 
     def _key_spec(self):
         (self.ws.root / "quiz.json").write_text(json.dumps({

@@ -2237,6 +2237,15 @@ def _page_list(pages: list[int]) -> str:
     return ", ".join(map(str, pages))
 
 
+# Fixing a worksheet JSON: on the phone a whole-file rewrite takes about 5 minutes, an edit
+# about one.
+_SAME_FIX_HINT = (" When several questions need the same change, make it with one edit_file "
+                  "call with replace_all: true. Rewrite the whole file with write_file only when "
+                  "most of it must change: a rewrite is slow.")
+_KEY_FIX_HINT = (" Evidence that cannot be copied word for word from the source may be deleted: "
+                 "the key works without it." + _SAME_FIX_HINT)
+
+
 def _handled(notes: list[str], json_kept: bool = True) -> str:
     """The line telling the model what was fixed for it, so it does not 'fix' it again."""
     if not notes:
@@ -2290,6 +2299,9 @@ class ToolBox:
         # Workspace files the last tool call created, changed or removed, when it can't be
         # read from the call itself: {"created": [...], "changed": [...], "removed": [...]}.
         self.last_files: dict[str, list[str]] | None = None
+        # Worksheet JSONs whose last answer key failed: the next try leaves out evidence that
+        # is still not in the source instead of failing again on a quote.
+        self.key_failed: set[Path] = set()
 
     def schemas(self) -> list[dict]:
         out = list(SKILL_TOOLS)
@@ -2807,14 +2819,18 @@ class ToolBox:
             raise ToolError(f"Invalid worksheet specification in {shown}: {exc} Fix that spot "
                             "with edit_file, then call render_answer_key again.") from None
         try:
-            document, audit = worksheet_key(spec)
+            document, audit = worksheet_key(spec, lenient=source in self.key_failed)
             key_spec = validate_spec(document)
         except DesignError as exc:
+            self.key_failed.add(source)
             raise ToolError(
                 f"The answer key is not ready: {exc}\n{shown} is worksheet JSON, so its key comes "
                 "from the choice and answer fields inside each of its questions: fix those with "
                 "edit_file, then call render_answer_key again. Do not write a separate key JSON "
-                "or an answers list for it.") from None
+                "or an answers list for it. If you change only choice, answer, explanation or "
+                "evidence, the student PDF stays the same: call only render_answer_key again."
+                + _KEY_FIX_HINT) from None
+        self.key_failed.discard(source)
         target = self.ws.resolve(path)
         if target == source.with_suffix(".pdf") and not _keyish(path):
             raise ToolError(f"{self.ws.display(target)} is the worksheet's own PDF name. Give the "
@@ -2896,10 +2912,8 @@ class ToolBox:
                     and data.keys() & {"answers", "source_path", "source_sha256"} else
                     " Fix the theme argument and render again." if change
                     and "theme" in str(exc).split("Allowed", 1)[0] else
-                    " Fix every problem listed, then render again. When the same fix is needed "
-                    "in several questions, rewrite the whole file once with write_file instead "
-                    "of one edit_file per question." if re.search(r"Questions \d|problems; fix",
-                                                                    str(exc)) else
+                    " Fix every problem listed, then render again." + _SAME_FIX_HINT
+                    if re.search(r"Questions \d|problems; fix", str(exc)) else
                     " Fix that spot with edit_file, then render again.")
             if twice:
                 hint += f" Also, {twice}."
@@ -2935,11 +2949,13 @@ class ToolBox:
                 raise ToolError("Use three different file names: the JSON, the student PDF and "
                                 "the answer-key PDF.")
             try:
-                document, key_audit = worksheet_key(spec)
+                document, key_audit = worksheet_key(spec, lenient=source in self.key_failed)
                 key_spec = validate_spec(document)
             except DesignError as exc:
-                raise ToolError(f"The answer key is not ready: {exc}"
+                self.key_failed.add(source)
+                raise ToolError(f"The answer key is not ready: {exc}" + _KEY_FIX_HINT
                                 + ("" if change else self._restyle_hint(source, data))) from None
+            self.key_failed.discard(source)
             adjusted += key_audit.pop("adjusted", [])
             jobs.append((key_target, answer_key_path, document, key_spec, "answer key"))
         extra = []

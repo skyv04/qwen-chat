@@ -38,8 +38,9 @@ IMAGE_TOKEN_BUDGET = 1536
 OVERHEAD_MARGIN = 256      # tokens kept free when the prompt's fixed part has been measured
 # A PDF that keeps failing in new ways (one fixed problem reveals the next) is a draft the
 # model cannot get right: after this many failed attempts in a row the turn stops, instead
-# of running to MAX_TOOL_ROUNDS (35 minutes once). From the second, it is told to fix all.
-PDF_FAIL_LIMIT = 4
+# of running to MAX_TOOL_ROUNDS (35 minutes once; 45 minutes at four attempts). From the
+# second, it is told to fix all.
+PDF_FAIL_LIMIT = 3
 MAX_ATTACHED_IMAGES = 4
 ATTACHED_READ_NOTE = ("[The app read this attached file just now: this is what it holds. Where an "
                       "earlier reply in this chat says otherwise, trust this read.]\n")
@@ -931,9 +932,10 @@ class Agent:
                                 "problem to the user. Do not resubmit unchanged content.]")
                     elif streak >= 2:
                         out += (f"\n[This PDF has now failed {streak} times in a row. Read the "
-                                "whole error: it lists every problem found. Fix them all in one "
-                                "step (when several questions need the same fix, rewrite the "
-                                "whole file once with write_file), then render again. After "
+                                "whole error: it lists every problem found. Fix them all (the "
+                                "same change in several questions: one edit_file with "
+                                "replace_all: true; write_file only when most of the file must "
+                                "change), then render again. After "
                                 f"{PDF_FAIL_LIMIT} failed attempts in a row the task stops.]")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name,
                                  "content": out,
