@@ -397,8 +397,75 @@ class CutOffToolCallTest(unittest.TestCase):
         (self.root / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
         messages = [{"role": "user", "content": "Describe it.\n\n" + agent.ATTACHED_LINE
                      + "`photo.png`"}]
-        with self.assertRaisesRegex(agent.LLMError, "Image understanding is not enabled"):
+        with self.assertRaisesRegex(agent.LLMError, r"Image understanding is not enabled.* Or "
+                                    r"reply \*\*continue\*\* to use only the words in it, read by OCR"):
             self._respond([_reply({"content": "unused"})], messages)
+
+    def test_a_continue_gets_the_picture_of_the_unfinished_request_again(self):
+        (self.root / "attachments").mkdir()
+        (self.root / "attachments/week.png").write_bytes(b"\x89PNG\r\n\x1a\nweek")
+        failed = {"role": "user", "content": "Make a weekly recap quiz from the attached.",
+                  "_meta": {"attachments": ["attachments/week.png"],
+                            "error": "Vision is off for this model."}}
+        # The same request sent before, with the wrong picture, and its answer drop out.
+        wrong = [{"role": "user", "content": failed["content"],
+                  "_meta": {"attachments": ["attachments/wrong.png"]}},
+                 {"role": "assistant", "content": "It shows a 4th Grade Math Class email."}]
+        # A Text model gets the words OCR reads in it.
+        messages = json.loads(json.dumps(wrong + [failed])) + [{"role": "user", "content": "continue"}]
+        with tempfile.TemporaryDirectory() as cache, \
+                mock.patch.dict("os.environ", {"XDG_CACHE_HOME": cache}), \
+                mock.patch("qwen_chat.tools.shutil.which", return_value="/usr/bin/tesseract"), \
+                mock.patch.object(self.box, "_ocr_picture", return_value="Person of the Week: Riley"):
+            self._respond([_reply({"content": "Here is the quiz."})], messages)
+        sent = self.payloads[0]["messages"]
+        self.assertIn("You can't see pictures in this request", sent[0]["content"])
+        self.assertEqual([m["role"] for m in sent], ["system", "user", "user", "assistant", "tool"])
+        self.assertEqual(json.loads(sent[3]["tool_calls"][0]["function"]["arguments"]),
+                         {"path": "attachments/week.png"})
+        self.assertTrue(sent[4]["content"].startswith(agent.EARLIER_PICTURE_NOTE))
+        self.assertIn("Person of the Week: Riley", sent[4]["content"])
+        self.assertNotIn("4th Grade", json.dumps(sent))
+        self.assertEqual(len(messages), 7)  # the saved chat keeps every message
+        # A Vision model sees it again, with a note saying why.
+        messages = [json.loads(json.dumps(failed)), {"role": "user", "content": "continue"}]
+        server = _Server()
+        server.vision_enabled = True
+        image = "data:image/jpeg;base64,ZmFrZQ=="
+        with mock.patch.object(agent, "data_url", return_value=image):
+            self._respond([_reply({"content": "Here is the quiz."})], messages, server=server)
+        sent = self.payloads[1]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["system", "user", "user"])
+        self.assertIsInstance(sent[1]["content"], str)
+        text, picture = sent[2]["content"]
+        self.assertTrue(text["text"].startswith("continue" + NOTE_SEP + NOTE_HEAD))
+        self.assertTrue(text["text"].endswith(agent.SHOWN_AGAIN_NOTE.format(names="week.png")))
+        self.assertEqual(picture, {"type": "image_url", "image_url": {"url": image}})
+
+    def test_reading_lines_still_in_view_again_is_refused_then_ends_the_turn(self):
+        (self.root / "grade4.txt").write_text("".join(f"Line {n}\n" for n in range(1, 6)))
+        read = lambda cid, start: _call(json.dumps({"path": "grade4.txt", "start_line": start}),
+                                        cid, "read_file")
+        replies = [_reply({"tool_calls": [read(f"c{i}", start)]})
+                   for i, start in enumerate((1, 2, 3, 4, 2))] + [_reply({"content": "unused"})]
+        messages = [{"role": "user", "content": "Make the quiz from grade4.txt."}]
+        self._respond(replies, messages)
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        self.assertTrue(results[1].startswith("grade4.txt (lines 2-5 of 5):"))  # once is let through
+        self.assertEqual(results[2], agent.REREAD_NOTE.format(path="grade4.txt"))
+        self.assertIn("Same error as before", results[3])
+        self.assertEqual(len(self.payloads), 5)
+        self.assertIn("same error repeated 3 times", messages[-1]["content"])
+        # Lines trimmed from the model's view, or a changed file, can be read again.
+        log, args = agent._ReadLog(self.box.ws), {"path": "grade4.txt"}
+        page = self.box.run("read_file", json.dumps(args))[1]
+        in_view = [{"role": "tool", "tool_call_id": "r1", "content": page}]
+        self.assertTrue(log.allow(args, page, "r1", []))
+        self.assertTrue(log.allow(args, page, "r2", in_view))
+        self.assertFalse(log.allow(args, page, "r3", in_view))
+        self.assertTrue(log.allow(args, page, "r4", [{**in_view[0], "content": agent.OLD_TOOL_STUB}]))
+        (self.root / "grade4.txt").write_text("Line 1\n")
+        self.assertTrue(log.allow(args, self.box.run("read_file", json.dumps(args))[1], "r5", in_view))
 
 
 class HistoryRepairTest(unittest.TestCase):

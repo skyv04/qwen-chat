@@ -9,7 +9,8 @@ import time
 import traceback
 from typing import Protocol
 
-from .history import NOTE_HEAD, NOTE_SEP, context_note, user_text
+from .history import (ATTACHED_LINE, NOTE_HEAD, NOTE_SEP, attached_files, context_note,
+                      continued_files, user_text, without_resent)
 from .images import ImageError, data_url, is_image
 from .llm import Cancelled, ChatStream, LLMError, ServerManager
 from .tools import ToolBox, ToolError, placeholder_note
@@ -34,9 +35,21 @@ CACHED_TOOLS = ("web_search", "fetch_url", "list_files", "read_file")
 ATTACHED_READ_CHARS = 12_500
 IMAGE_TOKEN_BUDGET = 1536
 MAX_ATTACHED_IMAGES = 4
-ATTACHED_LINE = "Attached files (in the workspace): "
 ATTACHED_READ_NOTE = ("[The app read this attached file just now: this is what it holds. Where an "
                       "earlier reply in this chat says otherwise, trust this read.]\n")
+# A message such as "continue" without files of its own gets the pictures of the unfinished
+# request it continues again: the turns that looked at them may have been trimmed away.
+EARLIER_PICTURE_NOTE = ("[The app read this picture again just now: it is attached to an earlier "
+                        "request in this chat that did not finish. You can't see pictures in this "
+                        "session, so these are the words OCR found in it. Where an earlier reply "
+                        "in this chat says otherwise, trust this read.]\n")
+SHOWN_AGAIN_NOTE = ("[The app is showing again the picture(s) attached to an earlier request in "
+                    "this chat that did not finish: {names}. Where an earlier reply in this chat "
+                    "says otherwise, trust what you see now.]")
+REREAD_NOTE = ("Error: read_file already showed these lines of '{path}' in this reply (they are "
+               "still above), and the file has not changed since. Reading them again shows "
+               "nothing new. Use what they say, or if what you need is not in this file, look "
+               "elsewhere or tell the user instead of reading it again.")
 # When history must shrink, shrink it to this share of the budget. The following rounds then
 # only append, so llama-server reuses its cache instead of re-reading the turn every round.
 TRIM_TARGET = 0.6
@@ -85,9 +98,10 @@ def system_prompt(toolbox: ToolBox, model_name: str, vision: bool = False) -> st
            "and layout yourself; never claim you cannot see them or substitute OCR unless the user "
            "asks for OCR."
            if vision else
-           "Native image understanding is unavailable in this session. If the user asks about an "
-           "image, say so plainly instead of guessing; the vision projector may need to be installed "
-           "and the model server restarted."))
+           "You can't see pictures in this request. read_file reads the words in a picture with "
+           "OCR: use them, but OCR can misread words and shows no drawings, colors or layout. If "
+           "the user needs those, say so plainly instead of guessing; they can choose a Vision "
+           "model from the Model menu and send the picture again."))
     parts.append(
         "\n## Reusable skills\n"
         "Use list_skills to discover relevant reusable skills, and load_skill to read the ones "
@@ -125,8 +139,7 @@ def system_prompt(toolbox: ToolBox, model_name: str, vision: bool = False) -> st
             "attached to a new message are read for you: the read_file result right after the "
             "message shows what they hold now. "
             + ("Image attachments are passed to you directly for visual inspection."
-               if vision else "Image attachments need the native vision projector and are not "
-               "read as text.")
+               if vision else "For a picture, read_file returns only the words OCR finds in it.")
             + " Use clear "
             "file names with the right extension (.md, .txt, .csv, .py, .html, ...). To change "
             "part of an existing file, use edit_file instead of rewriting the whole file. One tool "
@@ -154,8 +167,8 @@ def system_prompt(toolbox: ToolBox, model_name: str, vision: bool = False) -> st
             "user. Don't tell the user a task is "
             "impossible just because a tool is missing. If the user says no to a command or "
             "install, don't try a workaround: stop and ask what they'd like instead. "
-            "For a PDF, use read_file: it also reads the words in the PDF's "
-            "pictures with OCR, which pdftotext misses; tesseract cannot open a PDF. Never guess "
+            "To read a PDF or a picture, use read_file: it reads the words in pictures with OCR, "
+            "which pdftotext misses, so don't run tesseract on them yourself. Never guess "
             "the order or contents from file names. Commands get "
             "no keyboard input, so use non-interactive options, and keep files in the workspace. "
             "For a long script, save it with write_file, then run it with run_command; keep it "
@@ -348,7 +361,8 @@ def fit_context(messages: list[dict], budget_chars: int, target_chars: int | Non
     later = set()
     for m in reversed(msgs):
         if m["role"] == "tool" and len(m.get("content") or "") > 200:
-            content = m["content"].removesuffix(CACHE_NOTE).removeprefix(ATTACHED_READ_NOTE)
+            content = (m["content"].removesuffix(CACHE_NOTE).removeprefix(ATTACHED_READ_NOTE)
+                       .removeprefix(EARLIER_PICTURE_NOTE))
             seen = (m.get("name"), content)
             if seen in later:
                 m["content"] = REPEAT_STUB
@@ -482,18 +496,6 @@ def _drafting(name: str, chars: int) -> str:
     return f"{what}… {chars:,} characters" if chars >= 200 else f"{what}…"
 
 
-def attached_files(message: dict) -> list[str]:
-    """The workspace paths of the files attached to a user message (older chats saved them
-    only in the message text)."""
-    listed = (message.get("_meta") or {}).get("attachments")
-    if isinstance(listed, list):
-        return [p for p in listed if isinstance(p, str) and p.strip()]
-    content = message.get("content")
-    lines = [line for line in content.splitlines()
-             if line.startswith(ATTACHED_LINE)] if isinstance(content, str) else []
-    return re.findall(r"`([^`]+)`", lines[-1]) if lines else []
-
-
 def _broken_call_note(name: str, chars: int, cut_off: bool) -> str:
     """Tool result for a call whose arguments couldn't be read, telling the model how to recover."""
     if cut_off:
@@ -504,6 +506,57 @@ def _broken_call_note(name: str, chars: int, cut_off: bool) -> str:
                 "short with loops and helper functions.")
     return (f"Error: the {name} arguments were not valid JSON, so nothing was done. Try again with "
             "valid JSON (escape quotes, backslashes and newlines inside strings).")
+
+
+_READ_SPAN = re.compile(r".* \(lines (\d+)-(\d+) of \d+\):$")
+
+
+def _covered(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    line = start
+    for first, last in sorted(spans):
+        if first > line:
+            break
+        line = max(line, last + 1)
+    return line > end
+
+
+class _ReadLog:
+    """The lines of each file read_file showed in this reply. A small model may read the same
+    file over and over from different lines (one read a 142-line file 12 times) instead of using
+    what it already holds; such a read is turned into an error the second time, so the repeated
+    error ends the turn instead of running it to the round limit."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.spans: dict[tuple, list[tuple[int, int, str]]] = {}
+        self.reread: set[tuple] = set()
+
+    def _file(self, path) -> tuple | None:
+        try:
+            resolved = self.ws.resolve(path)
+            st = resolved.stat()
+        except (ToolError, OSError, ValueError, TypeError):
+            return None
+        return str(resolved), st.st_mtime_ns, st.st_size  # a changed file starts afresh
+
+    def allow(self, args: dict, out: str, call_id: str, history: list[dict]) -> bool:
+        """Records a read; False when the model just saw all its lines from earlier reads of the
+        unchanged file, still whole in its context, and was already let through once."""
+        span = _READ_SPAN.match(out.split("\n", 1)[0])
+        file = self._file(args.get("path")) if span else None
+        if file is None:
+            return True
+        start, end = int(span[1]), int(span[2])
+        whole = {m.get("tool_call_id") for m in history if m.get("role") == "tool"
+                 and isinstance(m.get("content"), str) and CUT_NOTE not in m["content"]
+                 and m["content"] not in (OLD_TOOL_STUB, REPEAT_STUB)}
+        earlier = [(first, last) for first, last, cid in self.spans.get(file, []) if cid in whole]
+        if _covered(earlier, start, end):
+            if file in self.reread:
+                return False
+            self.reread.add(file)
+        self.spans.setdefault(file, []).append((start, end, call_id))
+        return True
 
 
 class Agent:
@@ -533,36 +586,52 @@ class Agent:
         last["_meta"] = {**(last.get("_meta") or {}), "context": note}
 
     def _read_attachments(self, messages: list[dict], events: Events, cancel: threading.Event,
-                          seen: dict[str, str]) -> list[str]:
+                          seen: dict[str, str]) -> tuple[list[str], str]:
         """Reads the files attached to a new message before the first reply, saved in the chat as
         read_file calls. Otherwise the model may repeat an earlier reply about the same file
         (one made before OCR read a PDF's pictures called its questions a newsletter) instead
-        of looking again."""
+        of looking again. A message without files of its own ("continue") gets the pictures of
+        the unfinished request it continues again: shown to a vision model, otherwise read by
+        OCR. Returns the images for the payload and a note to send with them."""
         last = messages[-1] if messages else None
         if not last or last.get("role") != "user" or not self.toolbox.files:
-            return []
+            return [], ""
         reads, total = [], 0
-        images = []
+        images, shown = [], []
         vision_enabled = bool(getattr(self.server, "vision_enabled", False))
-        for path in dict.fromkeys(attached_files(last)):
+        paths = attached_files(last)
+        earlier = not paths
+        if earlier:
+            paths = continued_files(messages)
+        for path in dict.fromkeys(paths):
             if cancel.is_set():
                 raise Cancelled()
             try:
                 file_path = self.toolbox.ws.resolve(path)
             except (ToolError, OSError, ValueError):
                 file_path = None
-            if file_path is not None and file_path.is_file() and is_image(file_path):
+            picture = file_path is not None and file_path.is_file() and is_image(file_path)
+            if earlier and not picture:
+                continue  # the model reads the other files itself when it needs them
+            if picture and (vision_enabled or not earlier):
                 if not vision_enabled:
                     reason = getattr(self.server, "vision_error", "")
-                    raise LLMError(reason or "Image understanding is not enabled. Install the Qwen "
-                                   "vision projector and restart the model server, then send the image again.")
+                    raise LLMError((reason or "Image understanding is not enabled. Install the "
+                                    "Qwen vision projector and restart the model server, then send "
+                                    "the image again.") + " Or reply **continue** to use only the "
+                                   "words in it, read by OCR.")
                 if len(images) >= MAX_ATTACHED_IMAGES:
+                    if earlier:
+                        break
                     raise LLMError(f"Attach no more than {MAX_ATTACHED_IMAGES} images per message.")
                 events.status(f"Preparing image {file_path.name}…")
                 try:
                     images.append(data_url(file_path))
                 except ImageError as error:
+                    if earlier:
+                        continue
                     raise LLMError(str(error)) from error
+                shown.append(file_path.name)
                 continue
             events.status(f"Reading {path}…")
             args = {"path": path}
@@ -573,8 +642,9 @@ class Agent:
             if ok and total + len(out) <= ATTACHED_READ_CHARS:
                 total += len(out)
                 reads.append((args, out))
+        note = SHOWN_AGAIN_NOTE.format(names=", ".join(shown)) if earlier and shown else ""
         if not reads:
-            return images
+            return images, note
         stamp = time.time()
         calls = [{"id": f"attached-{int(stamp * 1000)}-{i}", "type": "function",
                   "function": {"name": "read_file", "arguments": json.dumps(args, ensure_ascii=False)}}
@@ -588,11 +658,11 @@ class Agent:
             seen["read_file:" + json.dumps(args, sort_keys=True)] = out
             events.tool_begin(call["id"], "read_file", args)
             # Earlier replies (and the context note quoting them) may describe the file wrongly.
-            out = ATTACHED_READ_NOTE + out
+            out = (EARLIER_PICTURE_NOTE if earlier else ATTACHED_READ_NOTE) + out
             messages.append({"role": "tool", "tool_call_id": call["id"], "name": "read_file",
                              "content": out, "_meta": {"ok": True}})
             events.tool_end(call["id"], "read_file", args, True, out)
-        return images
+        return images, note
 
     def respond(self, messages: list[dict], events: Events, cancel: threading.Event,
                 thinking: bool = False) -> None:
@@ -606,7 +676,8 @@ class Agent:
         self.toolbox.request_text = user_text(messages, last=REQUEST_TURNS)
         self._add_context_note(messages)
         seen: dict[str, str] = {}
-        images = self._read_attachments(messages, events, cancel, seen)
+        images, image_note = self._read_attachments(messages, events, cancel, seen)
+        reads = _ReadLog(self.toolbox.ws)
         tools = self.toolbox.schemas()
         sys_msg = {"role": "system", "content": system_prompt(
             self.toolbox, self.server.model_name, vision=bool(images))}
@@ -660,11 +731,11 @@ class Agent:
                 return
             rounds += 1
             use_tools = tools
-            history = self.fit(clean_for_api(messages), budget)
+            history = self.fit(clean_for_api(without_resent(messages)), budget)
             if images:
                 user = next((m for m in reversed(history) if m.get("role") == "user"), None)
                 if user is not None:
-                    text = user.get("content") or ""
+                    text = "\n\n".join(t for t in (user.get("content") or "", image_note) if t)
                     user["content"] = ([{"type": "text", "text": text}] if text else []) + [
                         {"type": "image_url", "image_url": {"url": image}} for image in images]
             payload = {
@@ -758,6 +829,8 @@ class Agent:
                         # Anything else may have changed workspace files: read them afresh.
                         for stale in [k for k in seen if k.startswith(("list_files:", "read_file:"))]:
                             del seen[stale]
+                if ok and name == "read_file" and not reads.allow(args, out, call["id"], history):
+                    ok, out = False, REREAD_NOTE.format(path=shown(args.get("path")))
                 action, outputs = "", [(args.get("path"), None)]
                 if name in ("render_worksheet", "render_answer_key"):
                     action, spec = "Create PDF", shown(args.get("spec_path"))

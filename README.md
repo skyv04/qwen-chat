@@ -93,7 +93,12 @@ started it.
 - Attach files with the paperclip button or drag and drop. They're copied into
   `workspace/attachments` and read for Qwen before it answers. With the optional vision
   projector installed, Qwen can inspect attached JPEG, PNG, HEIF/HEIC and other supported
-  images directly; PDF pictures are still read by OCR.
+  images directly; PDF pictures are still read by OCR. A Text model can't see an attached
+  image: the error says to choose a Vision model, or to reply **continue** to go on with the
+  words in it. `read_file` reads those words by OCR (cached), marked as OCR that misses
+  drawings, colors and layout. A message with no files of its own, such as **continue**,
+  after a request that didn't finish gets that request's pictures again: shown to a Vision
+  model, or read by OCR for a Text model.
 - Chats are saved, with a sidebar grouped by date (Today, Yesterday, …) to switch, delete
   and undo a delete. The pencil beside a chat renames it; for the current chat you can
   also use **F2** or menu → **Rename Chat...**. Renaming keeps its messages, settings
@@ -333,7 +338,10 @@ worksheet JSON, also under new file names (as after "use three different file na
 On reaching the 30-tool-round limit, the app pauses explicitly and
 keeps completed steps; reply **continue** to resume. It does not ask a tool-less model
 to print pretend commands. A second identical tool error tells Qwen its last change
-didn't fix it; a third stops the reply with the error, instead of looping. Rewriting
+didn't fix it; a third stops the reply with the error, instead of looping. Reading lines
+of an unchanged file that an earlier read in the same reply showed, and that are still
+in view, is let through once; after that it is an error saying the lines are still
+above, so reading the same file over and over ends the reply the same way. Rewriting
 a file with identical content is reported as "Unchanged". An edit whose `old_text`
 is not in the file changes nothing and shows the most similar text with its line
 number; it never guesses.
@@ -358,14 +366,18 @@ last three are dropped, so the latest requests stay in view. Each new message al
 carries a short note that the app writes once and saves. The note lists the last three
 requests, how each ended (answered, incomplete with its error, stopped), and the files
 this chat made, changed or read. Qwen is told the note isn't the user's words, and file
-tools refuse to copy it into a file.
+tools refuse to copy it into a file. A request sent again (with the right file attached
+this time, say) replaces its earlier copy and the replies to it, both in the note and in
+the history Qwen gets, so an answer about the wrong file can't steer the new attempt. The
+saved chat keeps every message.
 
-Each chat works with its own files. Files made in other chats are left out of
+Each chat works with its own files. Files made in other chats, or attached to their
+messages, are left out of
 `list_files`, which says how many were hidden and from which chat. File tools refuse
 to read, change, move or delete them, and won't move or delete a folder that holds
 them. A file becomes available again once the user names it, its folder path or the
-other chat's title. Generic words such as "homework" or "first grade" don't count.
-Files no chat made, such as your own, stay visible.
+other chat's title. Generic words such as "homework", "first grade" or "attachments"
+don't count. Files no chat made, such as your own, stay visible.
 
 Relaunch Qwen Chat after updating the application to load new tools and instructions.
 Existing conversations can use them; a new chat is not required.

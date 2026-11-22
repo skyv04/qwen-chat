@@ -1,13 +1,24 @@
 import json
 import os
+import struct
 import subprocess
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
 from qwen_chat import tools
 from qwen_chat.tools import ToolBox, ToolError, Workspace
+
+
+def _png(rgb=(255, 255, 255)) -> bytes:
+    """A one-pixel picture."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00" + bytes(rgb))) + chunk(b"IEND", b""))
 
 
 class WorkspaceSandboxTest(unittest.TestCase):
@@ -967,6 +978,31 @@ class ProgramToolsTest(unittest.TestCase):
                               "contain errors]\nMultiply:\n2 x 20 = __\n49\nx 84\n+ 36", text)
                 self.assertNotIn("|~", text)
         self.assertEqual(ran, ["pdftoppm", "tesseract"])  # the second read came from the cache
+
+    def test_a_picture_is_read_with_ocr_once_and_says_what_ocr_misses(self):
+        (self.ws.root / "week.png").write_bytes(_png())
+        (self.ws.root / "blank.png").write_bytes(_png((0, 0, 0)))
+        ran = []
+
+        def ocr(argv, *_args):
+            ran.append(argv[0])
+            words = ("Week in Review\n\nPerson of the Week: Riley\n|~\n"
+                     if argv[1].endswith("week.png") else "|~\n")
+            Path(argv[2] + ".txt").write_text(words)
+            return 0, "", ""
+
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp.name}), \
+                mock.patch.object(tools.shutil, "which", return_value="/usr/bin/found"), \
+                mock.patch.object(tools, "run_streaming", side_effect=ocr):
+            for _ in range(2):
+                ok, text = self.run_tool("read_file", path="week.png")
+                self.assertTrue(ok, text)
+                self.assertEqual(text, "week.png (lines 1-3 of 3):\n" + tools.PICTURE_NOTE
+                                 + "\nWeek in Review\nPerson of the Week: Riley")
+            self.assertEqual(ran, ["tesseract"])  # the second read came from the cache
+            ok, text = self.run_tool("read_file", path="blank.png")
+        self.assertFalse(ok)
+        self.assertIn("OCR found no words in the picture 'blank.png'. Do not guess", text)
 
     def test_text_layer_commands_point_to_read_file_for_pdf_pictures(self):
         (self.ws.root / "boost.pdf").write_bytes(b"%PDF-1.4 email with pasted screenshots")

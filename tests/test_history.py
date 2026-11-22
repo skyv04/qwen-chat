@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qwen_chat.history import NOTE_HEAD, Activity, ChatFiles, ChatScope, call_files, context_note
+from qwen_chat.history import (ATTACHED_LINE, NOTE_HEAD, Activity, ChatFiles, ChatScope, activity,
+                              call_files, context_note, continued_files)
 
 
 def _user(text):
@@ -86,6 +87,30 @@ class ContextNoteTest(unittest.TestCase):
                       'key." → answered: Here it is again.\n', context_note(again, self.root))
         self.assertNotIn("\n2. ", context_note(again, self.root))
 
+    def test_a_request_sent_again_replaces_the_one_about_the_wrong_picture(self):
+        attach = lambda name: "\n\n" + ATTACHED_LINE + f"`attachments/{name}`"
+        ask = "help generate a weekly recap practice quiz based on the attached"
+        messages = [
+            _user(ask + attach("IMG_1787.png")),
+            _answer("Here is a quiz from the 4th Grade Math Class email."),
+            {**_user("sorry about the confusion -- see attached the correct image"
+                     + attach("IMG_1788.png")), "_meta": {"error": "failed to process mtmd chunk"}},
+            _user(ask + attach("IMG_1788.png")),
+            _answer("**Task incomplete.** The following operations did not succeed; do not treat "
+                    "their drafts as finished or opened PDFs.\n\n- Create PDF "
+                    "`weekly-recap-key.pdf`: Error: Invalid worksheet specification."),
+            _user("continue"),
+        ]
+        note = context_note(messages, self.root)
+        self.assertNotIn("4th Grade", note)
+        self.assertEqual(note.count(ask), 1)
+        self.assertIn("→ failed with an error: failed to process mtmd chunk\n", note)
+        self.assertIn("→ ended incomplete: Create PDF weekly-recap-key.pdf", note)
+        # "continue" picks up the picture of the request it continues, not one answered since.
+        self.assertEqual(continued_files(messages), ["attachments/IMG_1788.png"])
+        self.assertEqual(continued_files(messages[:-1] + [_answer("Done."), _user("continue")]), [])
+        self.assertEqual(continued_files(messages[:-1] + [_user("this one" + attach("x.png"))]), [])
+
     def test_nothing_is_added_without_earlier_work_to_continue(self):
         self.assertEqual(context_note([_user("hi")], self.root), "")
         self.assertEqual(context_note([_user("hi"), _answer("Hello!"), _user("2+2?")], self.root), "")
@@ -130,6 +155,18 @@ class ChatScopeTest(unittest.TestCase):
                      _result("c1", "run_command", "(no output)",
                              files={"created": ["apples.png"], "changed": [], "removed": []})]
         self.assertNotIn("apples.png", self.foreign(made_here))
+
+    def test_files_attached_in_another_chat_are_that_chats(self):
+        attach = lambda *names: "\n\n" + ATTACHED_LINE + ", ".join(f"`{n}`" for n in names)
+        other = activity([_user("Make a quiz." + attach("attachments/grade4.pdf", "apples.png"))],
+                         self.root)
+        self.assertEqual(other.attached, {"attachments/grade4.pdf": 0})  # apples.png stays put
+        foreign = lambda text: set(ChatScope.build(self.root, [_user(text)],
+                                                   [("4th grade math", other)]).foreign)
+        self.assertEqual(foreign("Quiz me on it." + attach("attachments/IMG_1788.png")),
+                         {"attachments/grade4.pdf"})
+        self.assertEqual(foreign("Use grade4.pdf too."), set())
+        self.assertEqual(foreign("And this." + attach("attachments/grade4.pdf")), set())
 
     def test_a_folder_is_another_chats_only_when_all_its_files_are(self):
         scope = ChatScope(self.root, {rel: "grade1" for rel in self.grade1.created})
@@ -189,6 +226,9 @@ class ChatFilesTest(unittest.TestCase):
             self.assertIs(files.others("me", "/ws")[0][1], act)  # unchanged, so not read again
             save("other", "grade1", "carrots.png")
             self.assertEqual(list(files.others("me", "/ws")[0][1].created), ["carrots.png"])
+            (chats / "pics.json").write_text(json.dumps({"id": "pics", "title": "4th grade", "messages": [
+                _user("Quiz me.\n\n" + ATTACHED_LINE + "`attachments/grade4.pdf`")]}))
+            self.assertEqual(sorted(t for t, _ in files.others("me", "/ws")), ["4th grade", "grade1"])
 
 
 if __name__ == "__main__":

@@ -7,16 +7,32 @@ from pathlib import Path
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_IMAGE_PIXELS = 50_000_000
 MAX_IMAGE_SIDE = 1280
+OCR_MAX_SIDE = 4000  # a phone photo of a page; larger only slows OCR down
 
 _IMAGE_SUFFIXES = {".avif", ".bmp", ".gif", ".heic", ".heif", ".jfif", ".jpe",
                    ".jpeg", ".jpg", ".jxl", ".png", ".svg", ".tif", ".tiff", ".webp"}
 _IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a",
-                     b"BM", b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+                     b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+_BMP_HEADER_SIZES = {12, 16, 40, 52, 56, 64, 108, 124}
 _HEIF_BRANDS = (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1", b"avif", b"avis", b"jxl ")
+# What tesseract reads itself (GdkPixbuf format names).
+_OCR_FORMATS = {"png", "jpeg", "tiff", "gif", "bmp"}
 
 
 class ImageError(ValueError):
     """An attachment cannot be decoded into an image for the vision model."""
+
+
+def _raster(header: bytes) -> bool:
+    """Whether a file's first bytes are those of an image made of pixels."""
+    if header.startswith(_IMAGE_SIGNATURES):
+        return True
+    if header[:2] == b"BM" and int.from_bytes(header[14:18], "little") in _BMP_HEADER_SIZES:
+        return True
+    if len(header) >= 12 and header[4:8] == b"ftyp" and any(
+            brand in header[8:64] for brand in _HEIF_BRANDS):
+        return True
+    return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
 
 
 def is_image(path: Path) -> bool:
@@ -26,16 +42,64 @@ def is_image(path: Path) -> bool:
             header = source.read(64)
     except OSError:
         return path.suffix.lower() in _IMAGE_SUFFIXES
-    if header.startswith(_IMAGE_SIGNATURES):
-        return True
-    if len(header) >= 12 and header[4:8] == b"ftyp" and any(
-            brand in header[8:64] for brand in _HEIF_BRANDS):
-        return True
-    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+    if _raster(header):
         return True
     if header.lstrip().startswith((b"<svg", b"<?xml")):
         return b"<svg" in header.lower()
     return path.suffix.lower() in _IMAGE_SUFFIXES
+
+
+def is_picture(path: Path) -> bool:
+    """A photo, scan or screenshot, known by its first bytes. An SVG drawing is text, so it is
+    not one."""
+    try:
+        with path.open("rb") as source:
+            return _raster(source.read(64))
+    except OSError:
+        return False
+
+
+def ocr_source(path: Path, dest: Path) -> Path:
+    """The picture as tesseract should get it: upright (EXIF orientation applied), transparency
+    on white, at most OCR_MAX_SIDE pixels long. That is a PNG saved at `dest` when anything had
+    to change or tesseract can't read the format (HEIF, say); otherwise the original."""
+    try:
+        import gi
+
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+    except (ImportError, ValueError):
+        return path  # tesseract reads PNG, JPEG, TIFF, GIF, BMP and WebP itself
+    try:
+        fmt, width, height = GdkPixbuf.Pixbuf.get_file_info(str(path))
+    except Exception:
+        fmt = None
+    if fmt is None:
+        return path  # no loader here (WebP, say): tesseract may still read it
+    if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+        raise ImageError(f"{path.name} has unreasonable image dimensions ({width} × {height}).")
+    try:
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
+        upright = pixbuf.apply_embedded_orientation() or pixbuf
+        scale = min(1.0, OCR_MAX_SIDE / max(upright.get_width(), upright.get_height()))
+        if (upright is pixbuf and scale == 1.0 and not pixbuf.get_has_alpha()
+                and fmt.get_name() in _OCR_FORMATS):
+            return path
+        w = max(1, round(upright.get_width() * scale))
+        h = max(1, round(upright.get_height() * scale))
+        if upright.get_has_alpha():
+            ready = upright.composite_color_simple(w, h, GdkPixbuf.InterpType.BILINEAR,
+                                                   255, 64, 0xFFFFFF, 0xFFFFFF)
+        else:
+            ready = upright.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
+        if ready is None or not ready.savev(str(dest), "png", [], []):
+            raise ImageError(f"Could not prepare {path.name} for OCR.")
+        return dest
+    except ImageError:
+        raise
+    except Exception as error:
+        message = getattr(error, "message", None) or str(error)
+        raise ImageError(f"Could not decode {path.name}: {message[:300]}") from error
 
 
 def normalize(path: Path) -> tuple[str, bytes]:

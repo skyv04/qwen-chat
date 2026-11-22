@@ -17,7 +17,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from . import APP_ID, APP_NAME, models  # noqa: E402
 from .agent import ATTACHED_LINE, Agent, repair_history, salvage_args  # noqa: E402
-from .history import ChatFiles, ChatScope  # noqa: E402
+from .history import ATTACHMENTS_DIR, ChatFiles, ChatScope  # noqa: E402
 from .llm import (Cancelled, LLMError, ServerError, available_memory_mb,  # noqa: E402
                   gpu_busy_percent)
 from .skill_picker import SkillPicker  # noqa: E402
@@ -1283,7 +1283,7 @@ class ChatWindow(Adw.ApplicationWindow):
             if src_real == ws or ws in src_real.parents:
                 rel = src_real.relative_to(ws).as_posix()
             else:
-                dest_dir = ws / "attachments"
+                dest_dir = ws / ATTACHMENTS_DIR
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest = dest_dir / src.name
                 n = 2

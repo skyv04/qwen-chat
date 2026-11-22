@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Callable
 
 from .history import NOTE_HEAD, ChatScope, call_files
+from .images import ImageError, is_picture, ocr_source
 from .skills import SkillError, SkillRegistry, package_files, write_package
 from .worksheet_pdf import BACKGROUNDS, MOTIFS
 
@@ -712,6 +713,8 @@ OCR_MIN_AREA, OCR_MIN_SIDE = 40_000, 60
 # A page with this much text already has its words in the text layer.
 OCR_TEXT_PAGE = 2000
 OCR_MAX_PAGES = 20
+PICTURE_NOTE = ("[Picture: the words in it, read by OCR. OCR can misread words, and it does not "
+                "show the layout, drawings or colors.]")
 # Commands and libraries that read only a PDF's text layer, not the words in its pictures.
 PDF_TEXT_ONLY = re.compile(r"\b(pdftotext|pdf2txt|pdfplumber|pdfminer|pypdf\w*|fitz|pymupdf|"
                            r"extract_text|get_text)\b", re.I)
@@ -1885,7 +1888,8 @@ FILE_TOOLS = [
          "recursive": {"type": "boolean", "description": "Include subfolders"}}, []),
     _fn("read_file", "Read a text, code, Markdown, CSV or PDF file from the workspace. For a "
         "PDF, words in pictures (a scan, or questions pasted in as screenshots) are also read "
-        "with OCR and marked page by page.",
+        "with OCR and marked page by page. For a picture (photo, scan, screenshot), returns "
+        "the words OCR reads in it.",
         {"path": {**_S, "description": "File path relative to the workspace"},
          "start_line": {"type": "integer", "description": "Line to start from (default 1)"}}, ["path"]),
     _fn("read_quiz", "Read the actual quiz before making an answer key. Returns exact questions, "
@@ -2308,9 +2312,52 @@ class ToolBox:
 
     def read_file(self, path: str, start_line: int = 1) -> str:
         f = self.ws.resolve(path)
-        if f.suffix.lower() != ".pdf" or not f.is_file():
-            return self.ws.read_file(path, start_line)
-        return _text_page(self._pdf_text(f), self.ws.display(f), start_line)
+        if f.is_file() and f.suffix.lower() == ".pdf":
+            return _text_page(self._pdf_text(f), self.ws.display(f), start_line)
+        if f.is_file() and is_picture(f):
+            return _text_page(self._picture_text(f, path), self.ws.display(f), start_line)
+        return self.ws.read_file(path, start_line)
+
+    def _picture_text(self, f: Path, given: str) -> str:
+        """The words in a photo, scan or screenshot, read by OCR (cached by the file's hash)."""
+        if not shutil.which("tesseract"):
+            raise ToolError(f"'{given}' is a picture. Reading the words in it needs OCR "
+                            "(tesseract), which is not installed (Debian package tesseract-ocr). "
+                            "Do not guess what it says.")
+        cache = _ocr_cache() / f"{_file_sha256(f)}-picture.txt"
+        try:
+            text = cache.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            text = self._ocr_picture(f, given)
+            with contextlib.suppress(OSError):
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                _write_atomic(cache, text.encode("utf-8"))
+        text = _ocr_lines(text, "")
+        if not text:
+            raise ToolError(f"OCR found no words in the picture '{given}'. Do not guess what it "
+                            "shows; ask the user if you need to know.")
+        return PICTURE_NOTE + "\n" + text
+
+    def _ocr_picture(self, f: Path, given: str) -> str:
+        self.status(f"Reading the words in {f.name}…")
+        env = {**child_env(), "OMP_THREAD_LIMIT": "4"}
+        with tempfile.TemporaryDirectory(prefix="qwen-ocr-") as tmp:
+            try:
+                source = ocr_source(f, Path(tmp) / "picture.png")
+            except ImageError as error:
+                raise ToolError(f"OCR could not read the picture '{given}': {error}") from None
+            base = Path(tmp) / "text"
+            rc, _out, reason = run_streaming(["tesseract", str(source), str(base), "--psm", "3"],
+                                             tmp, env, 180, self.cancel)
+            if reason == "cancelled" or self._cancelled():
+                raise ToolError("Stopped by the user.")
+            try:
+                if rc != 0 or reason:
+                    raise OSError
+                return Path(f"{base}.txt").read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                raise ToolError(f"OCR could not read the picture '{given}'"
+                                + (f" ({reason})." if reason else ".")) from None
 
     def _pdf_text(self, f: Path) -> str:
         """A PDF's text, plus the words OCR reads in its pictures where the text layer lacks

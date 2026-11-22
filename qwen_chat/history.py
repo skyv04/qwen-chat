@@ -19,6 +19,12 @@ import re
 
 NOTE_HEAD = "Chat context (added by the app, not typed by the user):"
 NOTE_SEP = "\n\n---\n"
+# A message's attached files are listed in its text on this line (and in _meta.attachments).
+ATTACHED_LINE = "Attached files (in the workspace): "
+# Files from outside the workspace are attached as copies in this folder.
+ATTACHMENTS_DIR = "attachments"
+# Typed text at least this long, sent again later, is the same request sent again.
+RESENT_CHARS = 30
 SKIP_PARTS = ("__pycache__", "node_modules")
 # Words too common in file, folder and chat names to show which one the user means.
 GENERIC_WORDS = frozenset("""
@@ -29,7 +35,8 @@ GENERIC_WORDS = frozenset("""
     pdf json txt reading comprehension grade grades level first second third fourth fifth sixth
     seventh eighth 1st 2nd 3rd 4th 5th 6th kindergarten math english science homework practice
     assignment assignments exercise exercises lesson lessons class school work chat question
-    questions story stories book books spec project projects misc temp tmp
+    questions story stories book books spec project projects misc temp tmp attachment
+    attachments attached
 """.split())
 _AFFIRM = re.compile(r"(?:(?:yes|yeah|yep|yup|ok|okay|sure|please|go ahead|do it|correct|right|"
                      r"exactly|that one|those|use (?:it|that|them|those)|thanks|thank you)"
@@ -89,6 +96,18 @@ def _args(raw) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def attached_files(message: dict) -> list[str]:
+    """The workspace paths of the files attached to a user message (older chats saved them
+    only in the message text)."""
+    listed = (message.get("_meta") or {}).get("attachments")
+    if isinstance(listed, list):
+        return [p for p in listed if isinstance(p, str) and p.strip()]
+    content = message.get("content")
+    lines = [line for line in content.splitlines()
+             if line.startswith(ATTACHED_LINE)] if isinstance(content, str) else []
+    return re.findall(r"`([^`]+)`", lines[-1]) if lines else []
+
+
 def call_files(name: str, args: dict, content: str, ok: bool, meta: dict | None, root) -> dict:
     """The workspace files one tool call made, changed, read, removed or moved."""
     out: dict[str, list] = {"created": [], "changed": [], "read": [], "removed": [], "moved": []}
@@ -139,12 +158,19 @@ class Activity:
     created: dict[str, int] = field(default_factory=dict)
     touched: dict[str, int] = field(default_factory=dict)  # created or changed
     read: dict[str, int] = field(default_factory=dict)
+    attached: dict[str, int] = field(default_factory=dict)  # copied in for this chat's messages
 
 
 def activity(messages: list[dict], root) -> Activity:
     act = Activity()
     calls: dict[str, tuple[str, dict]] = {}
     for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            for path in attached_files(m):
+                rel = rel_path(path, root)
+                if rel and rel.startswith(ATTACHMENTS_DIR + "/"):
+                    act.attached[rel] = i
+            continue
         if m.get("role") == "assistant":
             for call in m.get("tool_calls") or []:
                 fn = call.get("function") or {}
@@ -158,11 +184,11 @@ def activity(messages: list[dict], root) -> Activity:
         ok = meta.get("ok", not content.startswith("Error"))
         found = call_files(name, args, content, bool(ok), meta, root)
         for gone in found["removed"]:
-            for book in (act.created, act.touched, act.read):
+            for book in (act.created, act.touched, act.read, act.attached):
                 for key in [k for k in book if k == gone or k.startswith(gone + "/")]:
                     del book[key]
         for source, dest in found["moved"]:
-            for book in (act.created, act.touched, act.read):
+            for book in (act.created, act.touched, act.read, act.attached):
                 for key in [k for k in book if k == source or k.startswith(source + "/")]:
                     del book[key]
                     book[dest + key[len(source):]] = i
@@ -225,6 +251,43 @@ def _turns(messages: list[dict]) -> list[list[dict]]:
     return [messages[s:e] for s, e in zip(starts, starts[1:] + [len(messages)])]
 
 
+def _typed(m: dict) -> str:
+    """What the user typed in a message, on one line, without the attached-files line."""
+    return " ".join(" ".join(line for line in _content(m).splitlines()
+                             if not line.startswith(ATTACHED_LINE)).split())
+
+
+def without_resent(messages: list[dict]) -> list[dict]:
+    """`messages` without the earlier copies of a request the user sent again (perhaps with the
+    right file attached this time) and the replies to them, so an answer about the wrong file
+    can't steer the new attempt."""
+    starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    later: set[str] = set()
+    dropped: set[int] = set()
+    for start, end in reversed(list(zip(starts, starts[1:] + [len(messages)]))):
+        words = _typed(messages[start])
+        if len(words) >= RESENT_CHARS:
+            if words in later:
+                dropped.update(range(start, end))
+            later.add(words)
+    return [m for i, m in enumerate(messages) if i not in dropped]
+
+
+def continued_files(messages: list[dict], limit: int = 4) -> list[str]:
+    """For a new message with no files of its own, the files attached to the unfinished request
+    it continues (a "continue" after a paused or failed turn): the first earlier turn, going
+    back, that has attached files, unless a turn on the way ended with an answer."""
+    turns = _turns(messages)
+    if not turns or attached_files(turns[-1][0]):
+        return []
+    for turn in reversed(turns[-1 - limit:-1]):
+        if outcome(turn).startswith("answered"):
+            return []
+        if (files := attached_files(turn[0])):
+            return files
+    return []
+
+
 def context_note(messages: list[dict], root=None, hidden=()) -> str:
     """A short summary of the chat before its last user message, or "" when there is nothing
     worth noting (a first message, or plain answers with no files)."""
@@ -232,11 +295,11 @@ def context_note(messages: list[dict], root=None, hidden=()) -> str:
     if not turns:
         return ""
     merged: list[list[dict]] = []
-    for turn in turns:  # the same message sent twice in a row is one request
-        if merged and " ".join(_content(merged[-1][0]).split()) == " ".join(_content(turn[0]).split()):
-            merged[-1] = turn
-        else:
-            merged.append(turn)
+    flat = lambda turn: " ".join(_content(turn[0]).split())
+    for turn in _turns(without_resent(messages))[:-1]:
+        if merged and flat(merged[-1]) == flat(turn):
+            merged.pop()  # a short message like "continue" sent twice in a row is one
+        merged.append(turn)
     recent = [(turn, outcome(turn)) for turn in merged[-3:]]
     made: list[str] = []
     read: list[str] = []
@@ -250,7 +313,8 @@ def context_note(messages: list[dict], root=None, hidden=()) -> str:
         crowded = {os.path.dirname(r) for r in hidden} - {""}
         text = user_text(messages)
         read = [r for r in newest(act.read) if r not in act.touched
-                and (os.path.dirname(r) not in crowded or mentions(r, text))][:3]
+                and (os.path.dirname(r) not in crowded or r in act.attached
+                     or mentions(r, text))][:3]
     if not made and not read and all(o.startswith("answered") for _, o in recent):
         return ""
     lines = [NOTE_HEAD, "Earlier requests in this chat, oldest first:"]
@@ -356,8 +420,9 @@ class ChatScope:
         for title, act in others:
             if names_chat(title, text):
                 continue
-            for rel in act.created:
-                if rel not in foreign and rel not in mine.touched and not mentions(rel, text):
+            for rel in [*act.created, *act.attached]:
+                if (rel not in foreign and rel not in mine.touched and rel not in mine.attached
+                        and not mentions(rel, text)):
                     foreign[rel] = title
         return cls(root, foreign)
 
@@ -433,6 +498,6 @@ class ChatFiles:
                     continue
                 hit = self._cache[key] = (stamp, str(chat.get("title") or f.stem),
                                           activity(chat["messages"], root))
-            if hit[2].created:
+            if hit[2].created or hit[2].attached:
                 out.append((hit[1], hit[2]))
         return out
